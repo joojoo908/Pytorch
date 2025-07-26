@@ -1,58 +1,92 @@
 import torch
 
-#텐서 연산
-import math
-a = torch.rand(1,2) *2 -1
-print(a)
-print(torch.abs(a)) # 절댓값
-print(torch.ceil(a)) # 올림
-print(torch.floor(a)) # 내림
-print(torch.clamp(a,-0.5,0.5)) # 최대치와 최소치 설정
-print()
+#텐서 조작
 
-print(a)
-print(torch.min(a))       # 최솟값
-print(torch.max(a))       # 최댓값
-print(torch.mean(a))      # 평균
-print(torch.std(a))       # 표준편차
-print(torch.prod(a))      # 모든 값의 곱
-print(torch.unique(torch.tensor([1,2,3,1,2,2])))  # 중복 제거된 유일한 값들
-print()
-
-x = torch.rand(2,2)
+x = torch.Tensor([[1,2],[3,4]])
 print(x)
-print(x.max(dim=0))
-print(x.max(dim=1))
-print()
 
-y = torch.rand(2,2)
+print(x[0,0])
+print(x[0,1])
+print(x[1,0])
+print(x[1,1])
+
+#슬라이싱
+print(x[:,0])
+print(x[:,1])
+print(x[0,:])
+print(x[1,:])
+
+x=torch.randn(4,5)
 print(x)
-print(y)
-print(torch.add(x,y)) # x+y
-result = torch.empty(2,2)
-torch.add(x,y,out=result)
-print(result)
-print()
-
-#in-place 방식
-y.add_(x) # y에 x를 더한 값을 y에 저장하여라
+y= x.view(20)
 print(y)
 print()
 
-#내적(dot product)
+#x.item() 값이 하나만 있을 때에 값을 가져옴
+tensor = torch.rand(1,3,3)
+print(tensor)
+print(tensor.shape)
+
+t = tensor.squeeze()
+print(t)
+print(t.shape)
+
+t.unsqueeze_(2)
+print(t)
+print(t.shape)
+print()
+
+#stack
+x= torch.FloatTensor([1,4])
 print(x)
+y= torch.FloatTensor([2,5])
 print(y)
-print(torch.matmul(x,y))
-z = torch.mm(x,y)
+z= torch.FloatTensor([3,6])
 print(z)
+print(torch.stack([x,y,z]))
+print()
 
-print(torch.svd(z)) # 행렬 분해 기법
+#cat
+a= torch.randn(1,3,3)
+b= torch.randn(1,3,3)
+c= torch.cat((a,b),dim=1)
+print(a)
+print(b)
+print(c.size())
 
+#chunk
+tensor = torch.rand(3,6)
+print(tensor)
+t1,t2,t3=torch.chunk(tensor,3,dim=1)
+print(t1)
+print(t2)
+print(t3)
+print()
 
+#split
+tensor = torch.rand(3,6)
+print(tensor)
+t1,t2,t3=torch.chunk(tensor,3,dim=1)
+print(t1)
+print(t2)
+print(t3)
 
+#numpy
 
+a = torch.ones(7)
+print(a)
+b = a.numpy()
+print(b)
 
+a.add_(1)
+print(a)
+print(b)
+print()
 
+import numpy as np
 
-
-
+a = np.ones(7)
+b = torch.from_numpy(a)
+np.add(a,1,out=a)
+print(a)
+print(b)
