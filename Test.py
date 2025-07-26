@@ -1,29 +1,33 @@
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision import datasets
 import torch
 
-#자동미분
-a = torch.randn(3, 3)  # 3x3 랜덤 텐서 생성
-a = a * 3              # 값들을 3배로 스케일링
-print(a)               # 텐서 출력
-print(a.requires_grad) # 현재 gradient 추적 여부 (False)
+#import matplotlib.pyplot as plt
 
-a.requires_grad_(True) # 이제부터 a에 대해 gradient 추적 활성화
-print(a.requires_grad) # True 출력
+def main():
+    mnist_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.5,), std=(1.0,))
+    ])
 
-b = (a * a).sum()      # b는 a^2 의 총합 (스칼라)
-print(b)               # b 값 출력
-print(b.grad_fn)       # b가 어떤 연산으로 만들어졌는지 추적함
-print()
+    trainset = datasets.MNIST(root='./', train=True, download=True, transform=mnist_transform)
+    testset = datasets.MNIST(root='./', train=False, download=True, transform=mnist_transform)
 
-#기울기
-x=torch.ones(3,3,requires_grad=True)
-print(x)
-y = x + 5
-print(y)
+    train_loader = DataLoader(trainset, batch_size=8, shuffle=True, num_workers=2) #멀티프로세싱
+    test_loader = DataLoader(testset, batch_size=8, shuffle=False, num_workers=2)
 
-z=y*y
-out = z.mean()
-print(z,out)
+    dataiter = iter(train_loader)
+    images, labels = next(dataiter)
 
-print(out)
-out.backward()
-print()
+    print(images.shape, labels.shape)
+
+    torch_image = torch.squeeze(images[0])
+    print(torch_image.shape)
+
+
+
+#메인을 따로 선언해주어 멀티프로세싱이 메인코드를 다시 실행하여 무한 재귀에 빠져드는 것을 방지함
+#데이터 로더가 전역에 있을 때에는 주의할 것
+if __name__ == '__main__':
+    main()
