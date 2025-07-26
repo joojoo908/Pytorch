@@ -1,33 +1,37 @@
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
-from torchvision import datasets
 import torch
 
-#import matplotlib.pyplot as plt
+import torch.nn as nn
+
+#신경망 구성
 
 def main():
-    mnist_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5,), std=(1.0,))
-    ])
+    #nn.Linear 계층
+    input = torch.randn(128,20)
+    print(input)
 
-    trainset = datasets.MNIST(root='./', train=True, download=True, transform=mnist_transform)
-    testset = datasets.MNIST(root='./', train=False, download=True, transform=mnist_transform)
+    m=nn.Linear(20,30)
+    print(m)
 
-    train_loader = DataLoader(trainset, batch_size=8, shuffle=True, num_workers=2) #멀티프로세싱
-    test_loader = DataLoader(testset, batch_size=8, shuffle=False, num_workers=2)
+    output = m(input)
+    print(output)
+    print(output.size())
+    print()
 
-    dataiter = iter(train_loader)
-    images, labels = next(dataiter)
+    #nn.conv2d 계층
+    input = torch.randn(20,16,50,100)
+    print(input.size())
+    m=nn.Conv2d(16,33,3,stride=2)
+    m=nn.Conv2d(16,33,(3,5),stride=(2,1),
+                padding=(4,2))
+    m = nn.Conv2d(16, 33, (3, 5), stride=(2, 1),
+                  padding=(4, 2), dilation=(3,1))
+    print(m)
+    output = m(input)
+    #print(output)
+    print(output.size())
+    print()
 
-    print(images.shape, labels.shape)
+    #컨볼루션 레이어
 
-    torch_image = torch.squeeze(images[0])
-    print(torch_image.shape)
-
-
-
-#메인을 따로 선언해주어 멀티프로세싱이 메인코드를 다시 실행하여 무한 재귀에 빠져드는 것을 방지함
-#데이터 로더가 전역에 있을 때에는 주의할 것
 if __name__ == '__main__':
     main()
