@@ -1,142 +1,208 @@
-import sys
-print("▶ PyCharm이 쓰는 Python:", sys.executable)
-
+import gymnasium as gym
 import numpy as np
+from gymnasium import spaces
+
+
+#환경 정의
+class Vector2DEnv(gym.Env):
+    def __init__(self):
+        super(Vector2DEnv, self).__init__()
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
+
+        self.max_steps = 100
+        self.threshold = 0.1  # 거리 임계값
+        self.reset()
+
+    def reset(self):
+        self.agent_pos = np.random.uniform(-1, 1, size=2)
+        self.goal_pos = np.random.uniform(-1, 1, size=2)
+        self.steps = 0
+        return self._get_state()
+
+    def _get_state(self):
+        return np.concatenate([self.agent_pos, self.goal_pos]).astype(np.float32)
+
+    def step(self, action):
+        self.agent_pos += np.clip(action, -0.1, 0.1)  # 이동 크기 제한
+        self.steps += 1
+
+        dist = np.linalg.norm(self.goal_pos - self.agent_pos)
+        done = dist < self.threshold or self.steps >= self.max_steps
+        reward = -dist if not done else 100.0
+
+        return self._get_state(), reward, done, {}
+
+    def render(self, mode='human'):
+        print(f"Agent: {self.agent_pos}, Goal: {self.goal_pos}")
+
+
+#sac 모델
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 import random
-import pygame
-import time
+from collections import deque
 
-# -----------------------------
-# 환경 설정
-GRID_SIZE = 10
-ACTIONS = ['UP', 'DOWN', 'LEFT', 'RIGHT']
-ACTION_TO_DELTA = {
-    'UP': (0, -1),
-    'DOWN': (0, 1),
-    'LEFT': (-1, 0),
-    'RIGHT': (1, 0)
-}
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# -----------------------------
-# 헬퍼 함수
-def move(pos, action):
-    dx, dy = ACTION_TO_DELTA[action]
-    x, y = pos[0] + dx, pos[1] + dy
-    x = max(0, min(GRID_SIZE - 1, x))
-    y = max(0, min(GRID_SIZE - 1, y))
-    return (x, y)
+# Actor (확률적 정책)
+class GaussianPolicy(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(GaussianPolicy, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+        )
+        self.mean = nn.Linear(128, action_dim)
+        self.log_std = nn.Linear(128, action_dim)
 
-def get_state(agent_pos, player_pos):
-    return (agent_pos[0], agent_pos[1], player_pos[0], player_pos[1])
+    def forward(self, x):
+        x = self.fc(x)
+        mean = self.mean(x)
+        log_std = self.log_std(x).clamp(-20, 2)
+        std = log_std.exp()
+        return mean, std
 
-def manhattan_dist(pos1, pos2):
-    return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
+    def sample(self, state):
+        mean, std = self.forward(state)
+        normal = torch.distributions.Normal(mean, std)
+        x_t = normal.rsample()  # reparameterization trick
+        y_t = torch.tanh(x_t)
+        action = y_t
 
-# -----------------------------
-# Q-learning 파라미터 및 함수
-Q = {}
-alpha = 0.5         # 학습률
-gamma = 0.9         # 할인율
-epsilon = 0.2       # 탐험률
+        # log_prob 계산
+        log_prob = normal.log_prob(x_t) - torch.log(1 - y_t.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=1, keepdim=True)
+        return action, log_prob
 
-def select_action(state):
-    if random.random() < epsilon or state not in Q:
-        return random.choice(ACTIONS)
-    return max(Q[state], key=Q[state].get)
+# Critic (Q-Value)
+class QNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(QNetwork, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(state_dim + action_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
 
-def update_q(state, action, reward, next_state):
-    if state not in Q:
-        Q[state] = {a: 0.0 for a in ACTIONS}
-    if next_state not in Q:
-        Q[next_state] = {a: 0.0 for a in ACTIONS}
+    def forward(self, state, action):
+        if action.dim() == 3:
+            action = action.squeeze(1)  # (batch, 1, dim) → (batch, dim)
+        return self.fc(torch.cat([state, action], dim=1))
 
-    max_future = max(Q[next_state].values())
-    Q[state][action] += alpha * (reward + gamma * max_future - Q[state][action])
+# 리플레이 버퍼
+class ReplayBuffer:
+    def __init__(self, size=100000):
+        self.buffer = deque(maxlen=size)
 
-# -----------------------------
-# 학습 루프
-EPISODES = 10000
-success_count = 0
+    def push(self, *args):
+        self.buffer.append(tuple(args))
 
-for episode in range(EPISODES):
-    agent_pos = (0, 0)
-    player_pos = (GRID_SIZE - 1, GRID_SIZE - 1)
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        return map(np.array, zip(*batch))
 
-    for step in range(100):
-        state = get_state(agent_pos, player_pos)
-        action = select_action(state)
-        next_agent_pos = move(agent_pos, action)
+    def __len__(self):
+        return len(self.buffer)
 
-        # 플레이어 무작위 이동
-        player_action = random.choice(ACTIONS)
-        player_pos = move(player_pos, player_action)
+# SAC 학습 함수
+def sac_train(env, episodes=500, batch_size=64, gamma=0.99, tau=0.005):
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
 
-        next_state = get_state(next_agent_pos, player_pos)
-        dist = manhattan_dist(next_agent_pos, player_pos)
-        reward = 1.0 if next_agent_pos == player_pos else -0.1 * dist / GRID_SIZE
+    actor = GaussianPolicy(state_dim, action_dim).to(device)
+    critic_1 = QNetwork(state_dim, action_dim).to(device)
+    critic_2 = QNetwork(state_dim, action_dim).to(device)
+    target_critic_1 = QNetwork(state_dim, action_dim).to(device)
+    target_critic_2 = QNetwork(state_dim, action_dim).to(device)
 
-        update_q(state, action, reward, next_state)
-        agent_pos = next_agent_pos
+    target_critic_1.load_state_dict(critic_1.state_dict())
+    target_critic_2.load_state_dict(critic_2.state_dict())
 
-        if agent_pos == player_pos:
-            success_count += 1
-            break
+    actor_opt = optim.Adam(actor.parameters(), lr=3e-4)
+    critic_1_opt = optim.Adam(critic_1.parameters(), lr=3e-4)
+    critic_2_opt = optim.Adam(critic_2.parameters(), lr=3e-4)
 
-    if (episode + 1) % 100 == 0:
-        print(f"Episode {episode+1}: Success rate (last 100) = {success_count}/100")
-        success_count = 0
+    buffer = ReplayBuffer()
+    alpha = 0.2  # 엔트로피 계수
 
-# -----------------------------
-# 시각화 (pygame)
-pygame.init()
-cell_size = 50
-screen = pygame.display.set_mode((GRID_SIZE * cell_size, GRID_SIZE * cell_size))
-pygame.display.set_caption("강화학습 기반 추적 AI")
-clock = pygame.time.Clock()
+    for ep in range(episodes):
+        state = env.reset()
+        state = torch.FloatTensor(state).to(device)
+        total_reward = 0
 
-def draw(agent_pos, player_pos):
-    screen.fill((255, 255, 255))
-    for y in range(GRID_SIZE):
-        for x in range(GRID_SIZE):
-            rect = pygame.Rect(x * cell_size, y * cell_size, cell_size, cell_size)
-            pygame.draw.rect(screen, (200, 200, 200), rect, 1)
+        for t in range(env.max_steps):
+            with torch.no_grad():
+                action, _ = actor.sample(state.unsqueeze(0))
+            next_state, reward, done, _ = env.step(action.cpu().numpy()[0])
+            buffer.push(state.cpu().numpy(), action.cpu().numpy(), reward, next_state, done)
 
-    # 플레이어 (빨간색)
-    pygame.draw.rect(screen, (255, 0, 0), (player_pos[0]*cell_size, player_pos[1]*cell_size, cell_size, cell_size))
-    # 에이전트 (파란색)
-    pygame.draw.rect(screen, (0, 0, 255), (agent_pos[0]*cell_size, agent_pos[1]*cell_size, cell_size, cell_size))
+            state = torch.FloatTensor(next_state).to(device)
+            total_reward += reward
 
-    pygame.display.flip()
+            if len(buffer) < batch_size:
+                continue
 
-def run_simulation():
-    agent_pos = (0, 0)
-    player_pos = (GRID_SIZE - 1, GRID_SIZE - 1)
+            # 샘플링
+            states, actions, rewards, next_states, dones = buffer.sample(batch_size)
+            states = torch.FloatTensor(states).to(device)
+            actions = torch.FloatTensor(actions).to(device)
+            rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)
+            next_states = torch.FloatTensor(next_states).to(device)
+            dones = torch.FloatTensor(dones).unsqueeze(1).to(device)
 
-    while True:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                sys.exit()
+            with torch.no_grad():
+                next_action, log_prob = actor.sample(next_states)
+                target_q1 = target_critic_1(next_states, next_action)
+                target_q2 = target_critic_2(next_states, next_action)
+                target_q = torch.min(target_q1, target_q2) - alpha * log_prob
+                target_value = rewards + gamma * (1 - dones) * target_q
 
-        # 에이전트 행동 (탐험 없음)
-        state = get_state(agent_pos, player_pos)
-        if state in Q:
-            action = max(Q[state], key=Q[state].get)
-        else:
-            action = random.choice(ACTIONS)
+            # critic 업데이트
+            q1 = critic_1(states, actions)
+            q2 = critic_2(states, actions)
+            critic_1_loss = F.mse_loss(q1, target_value)
+            critic_2_loss = F.mse_loss(q2, target_value)
+            critic_1_opt.zero_grad()
+            critic_1_loss.backward()
+            critic_1_opt.step()
 
-        agent_pos = move(agent_pos, action)
+            critic_2_opt.zero_grad()
+            critic_2_loss.backward()
+            critic_2_opt.step()
 
-        # 플레이어 무작위 이동
-        player_pos = move(player_pos, random.choice(ACTIONS))
+            # actor 업데이트
+            new_action, log_prob = actor.sample(states)
+            q1_new = critic_1(states, new_action)
+            q2_new = critic_2(states, new_action)
+            q_new = torch.min(q1_new, q2_new)
 
-        draw(agent_pos, player_pos)
-        clock.tick(5)
+            actor_loss = (alpha * log_prob - q_new).mean()
+            actor_opt.zero_grad()
+            actor_loss.backward()
+            actor_opt.step()
 
-        if agent_pos == player_pos:
-            print("🎯 잡았다!")
-            time.sleep(1)
-            agent_pos = (0, 0)
-            player_pos = (GRID_SIZE - 1, GRID_SIZE - 1)
+            # soft update
+            for target_param, param in zip(target_critic_1.parameters(), critic_1.parameters()):
+                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+            for target_param, param in zip(target_critic_2.parameters(), critic_2.parameters()):
+                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
-run_simulation()
+        print(f"[Episode {ep+1}] Total Reward: {total_reward:.2f}")
+
+    print("Training Complete")
+    return actor
+
+# env = Vector2DEnv()
+# actor = sac_train(env, episodes=1000)  # 약 1000 에피소드 학습
+#
+# torch.save(actor.state_dict(), "sac_actor.pth")
+# print("모델저장완료")
+
+
