@@ -7,7 +7,7 @@ import ENV
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def evaluate_with_pygame(env, actor, scale=300, wait=100):
+def evaluate_with_pygame(env, actor, scale=2.3, wait=10):
     pygame.init()
     size = (600, 600)
     screen = pygame.display.set_mode(size)
@@ -68,9 +68,9 @@ def evaluate_with_pygame(env, actor, scale=300, wait=100):
 
     pygame.quit()
 
-env = ENV.Vector2DEnv()
+env = ENV.Vector2DEnv(map_range=12.8, step_size=0.1)
 actor = Model.GaussianPolicy(state_dim=4, action_dim=2).to(device)
 actor.load_state_dict(torch.load("sac_actor.pth")) #모델 불러오기
 actor.eval()
 
-evaluate_with_pygame(env, actor)
+evaluate_with_pygame(env, actor,scale=20)

@@ -4,7 +4,7 @@ import Model
 import torch
 
 
-env = ENV.Vector2DEnv()
+env = ENV.Vector2DEnv(map_range=12.8, step_size=0.1)
 actor = Model.sac_train(env, episodes=1000)  # 약 1000 에피소드 학습
 
 torch.save(actor.state_dict(), "sac_actor.pth")
