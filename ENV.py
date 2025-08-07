@@ -10,7 +10,7 @@ class Vector2DEnv(gym.Env):
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
 
-        self.max_steps = 50
+        self.max_steps = 100
         self.threshold = 0.1  # 거리 임계값
         self.reset()
 
@@ -24,7 +24,12 @@ class Vector2DEnv(gym.Env):
         return np.concatenate([self.agent_pos, self.goal_pos]).astype(np.float32)
 
     def step(self, action):
-        self.agent_pos += np.clip(action, -0.1, 0.1)  # 이동 크기 제한
+        #self.agent_pos += np.clip(action, -0.1, 0.1)  # 이동 크기 제한
+        norm = np.linalg.norm(action)
+        if norm > 0.1:
+            action = (action / norm) * 0.1
+
+        self.agent_pos += action
         self.steps += 1
 
         dist = np.linalg.norm(self.goal_pos - self.agent_pos)
