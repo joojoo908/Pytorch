@@ -2,11 +2,12 @@ import pygame
 import numpy as np
 import torch
 
-import Test
+import Model
+import ENV
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def evaluate_with_pygame(env, actor, scale=300, wait=500):
+def evaluate_with_pygame(env, actor, scale=300, wait=100):
     pygame.init()
     size = (600, 600)
     screen = pygame.display.set_mode(size)
@@ -57,7 +58,7 @@ def evaluate_with_pygame(env, actor, scale=300, wait=500):
         pygame.draw.circle(screen, (0, 0, 255), world_to_screen(env.agent_pos), 6)
 
         pygame.display.flip()
-        #clock.tick(60)  # 60 FPS
+        clock.tick(60)  # 60 FPS
         pygame.time.delay(wait)
 
         if done:
@@ -67,9 +68,9 @@ def evaluate_with_pygame(env, actor, scale=300, wait=500):
 
     pygame.quit()
 
-env = Test.Vector2DEnv()
-actor = Test.GaussianPolicy(state_dim=4, action_dim=2).to(device)
-actor.load_state_dict(torch.load("sac_actor.pth"))
+env = ENV.Vector2DEnv()
+actor = Model.GaussianPolicy(state_dim=4, action_dim=2).to(device)
+actor.load_state_dict(torch.load("sac_actor.pth")) #모델 불러오기
 actor.eval()
 
 evaluate_with_pygame(env, actor)
