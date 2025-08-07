@@ -5,7 +5,7 @@ from gymnasium import spaces
 
 #환경 정의
 class Vector2DEnv(gym.Env):
-    def __init__(self, map_range=30.0, step_size=0.1, max_steps=300, threshold=0.1):
+    def __init__(self, map_range=12.8, step_size=0.1, max_steps=300, threshold=0.1):
         super(Vector2DEnv, self).__init__()
         self.map_range = map_range
         self.step_size = step_size

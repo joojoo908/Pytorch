@@ -80,19 +80,41 @@ class ReplayBuffer:
         return len(self.buffer)
 
 # SAC 학습 함수
-def sac_train(env, episodes=500, batch_size=64, gamma=0.99, tau=0.005):
+def sac_train(env, actor=None, critic_1=None, critic_2=None,
+              target_critic_1=None, target_critic_2=None,
+              episodes=500, batch_size=64, gamma=0.99, tau=0.005):
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
-    actor = GaussianPolicy(state_dim, action_dim).to(device)
-    critic_1 = QNetwork(state_dim, action_dim).to(device)
-    critic_2 = QNetwork(state_dim, action_dim).to(device)
-    target_critic_1 = QNetwork(state_dim, action_dim).to(device)
-    target_critic_2 = QNetwork(state_dim, action_dim).to(device)
+    # 모델 초기화 또는 외부에서 주입받은 모델 사용
+    if actor is None:
+        actor = GaussianPolicy(state_dim, action_dim).to(device)
+    else:
+        actor = actor.to(device)
 
-    target_critic_1.load_state_dict(critic_1.state_dict())
-    target_critic_2.load_state_dict(critic_2.state_dict())
+    if critic_1 is None:
+        critic_1 = QNetwork(state_dim, action_dim).to(device)
+    else:
+        critic_1 = critic_1.to(device)
 
+    if critic_2 is None:
+        critic_2 = QNetwork(state_dim, action_dim).to(device)
+    else:
+        critic_2 = critic_2.to(device)
+
+    if target_critic_1 is None:
+        target_critic_1 = QNetwork(state_dim, action_dim).to(device)
+        target_critic_1.load_state_dict(critic_1.state_dict())
+    else:
+        target_critic_1 = target_critic_1.to(device)
+
+    if target_critic_2 is None:
+        target_critic_2 = QNetwork(state_dim, action_dim).to(device)
+        target_critic_2.load_state_dict(critic_2.state_dict())
+    else:
+        target_critic_2 = target_critic_2.to(device)
+
+    # 옵티마이저
     actor_opt = optim.Adam(actor.parameters(), lr=3e-4)
     critic_1_opt = optim.Adam(critic_1.parameters(), lr=3e-4)
     critic_2_opt = optim.Adam(critic_2.parameters(), lr=3e-4)
@@ -107,10 +129,9 @@ def sac_train(env, episodes=500, batch_size=64, gamma=0.99, tau=0.005):
 
         for t in range(env.max_steps):
             with torch.no_grad():
-                action, _ = actor.sample(state.unsqueeze(0))  # (1, state_dim)
+                action, _ = actor.sample(state.unsqueeze(0))
             action_np = action.cpu().numpy()[0]
 
-            # Gymnasium-compatible step
             next_state, reward, terminated, truncated, _ = env.step(action_np)
             done = terminated or truncated
 
@@ -122,7 +143,7 @@ def sac_train(env, episodes=500, batch_size=64, gamma=0.99, tau=0.005):
             if len(buffer) < batch_size:
                 continue
 
-            # 샘플링
+            # 샘플링 및 업데이트 코드 (동일)
             states, actions, rewards, next_states, dones = buffer.sample(batch_size)
             states = torch.FloatTensor(states).to(device)
             actions = torch.FloatTensor(actions).to(device)
@@ -137,7 +158,6 @@ def sac_train(env, episodes=500, batch_size=64, gamma=0.99, tau=0.005):
                 target_q = torch.min(target_q1, target_q2) - alpha * log_prob
                 target_value = rewards + gamma * (1 - dones) * target_q
 
-            # critic 업데이트
             q1 = critic_1(states, actions)
             q2 = critic_2(states, actions)
             critic_1_loss = F.mse_loss(q1, target_value)
@@ -151,7 +171,6 @@ def sac_train(env, episodes=500, batch_size=64, gamma=0.99, tau=0.005):
             critic_2_loss.backward()
             critic_2_opt.step()
 
-            # actor 업데이트
             new_action, log_prob = actor.sample(states)
             q1_new = critic_1(states, new_action)
             q2_new = critic_2(states, new_action)
@@ -162,7 +181,6 @@ def sac_train(env, episodes=500, batch_size=64, gamma=0.99, tau=0.005):
             actor_loss.backward()
             actor_opt.step()
 
-            # soft update
             for target_param, param in zip(target_critic_1.parameters(), critic_1.parameters()):
                 target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
             for target_param, param in zip(target_critic_2.parameters(), critic_2.parameters()):
@@ -171,7 +189,7 @@ def sac_train(env, episodes=500, batch_size=64, gamma=0.99, tau=0.005):
             if done:
                 break
 
-        print(f"[Episode {ep+1}] Total Reward: {total_reward:.2f}")
+        print(f"[Episode {ep + 1}] Total Reward: {total_reward:.2f}")
 
     print("Training Complete")
     return actor

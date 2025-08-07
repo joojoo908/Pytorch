@@ -95,4 +95,4 @@ def run_multiple_evaluations(model_path="sac_actor.pth", episodes=10):
 
 if __name__ == "__main__":
     model_path = sys.argv[1] if len(sys.argv) > 1 else "sac_actor.pth"
-    run_multiple_evaluations(model_path=model_path, episodes=5)
+    run_multiple_evaluations(model_path=model_path, episodes=10)
