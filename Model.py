@@ -1,4 +1,4 @@
-#sac 모델
+# sac_model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,12 +36,11 @@ class GaussianPolicy(nn.Module):
         y_t = torch.tanh(x_t)
         action = y_t
 
-        # log_prob 계산
         log_prob = normal.log_prob(x_t) - torch.log(1 - y_t.pow(2) + 1e-6)
         log_prob = log_prob.sum(dim=1, keepdim=True)
         return action, log_prob
 
-# Critic (Q-Value)
+# Critic
 class QNetwork(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(QNetwork, self).__init__()
@@ -55,10 +54,10 @@ class QNetwork(nn.Module):
 
     def forward(self, state, action):
         if action.dim() == 3:
-            action = action.squeeze(1)  # (batch, 1, dim) → (batch, dim)
+            action = action.squeeze(1)
         return self.fc(torch.cat([state, action], dim=1))
 
-# 리플레이 버퍼
+# Replay Buffer
 class ReplayBuffer:
     def __init__(self, size=100000):
         self.buffer = deque(maxlen=size)
@@ -68,7 +67,14 @@ class ReplayBuffer:
 
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
-        return map(np.array, zip(*batch))
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return (
+            np.array(states),
+            np.array(actions),
+            np.array(rewards, dtype=np.float32),
+            np.array(next_states),
+            np.array(dones, dtype=np.float32)
+        )
 
     def __len__(self):
         return len(self.buffer)
@@ -92,20 +98,25 @@ def sac_train(env, episodes=500, batch_size=64, gamma=0.99, tau=0.005):
     critic_2_opt = optim.Adam(critic_2.parameters(), lr=3e-4)
 
     buffer = ReplayBuffer()
-    alpha = 0.2  # 엔트로피 계수
+    alpha = 0.2  # entropy coefficient
 
     for ep in range(episodes):
-        state = env.reset()
-        state = torch.FloatTensor(state).to(device)
+        state, _ = env.reset()
+        state = torch.FloatTensor(np.array(state)).to(device)
         total_reward = 0
 
         for t in range(env.max_steps):
             with torch.no_grad():
-                action, _ = actor.sample(state.unsqueeze(0))
-            next_state, reward, done, _ = env.step(action.cpu().numpy()[0])
-            buffer.push(state.cpu().numpy(), action.cpu().numpy(), reward, next_state, done)
+                action, _ = actor.sample(state.unsqueeze(0))  # (1, state_dim)
+            action_np = action.cpu().numpy()[0]
 
-            state = torch.FloatTensor(next_state).to(device)
+            # Gymnasium-compatible step
+            next_state, reward, terminated, truncated, _ = env.step(action_np)
+            done = terminated or truncated
+
+            buffer.push(state.cpu().numpy(), action_np, reward, next_state, done)
+
+            state = torch.FloatTensor(np.array(next_state)).to(device)
             total_reward += reward
 
             if len(buffer) < batch_size:
@@ -131,6 +142,7 @@ def sac_train(env, episodes=500, batch_size=64, gamma=0.99, tau=0.005):
             q2 = critic_2(states, actions)
             critic_1_loss = F.mse_loss(q1, target_value)
             critic_2_loss = F.mse_loss(q2, target_value)
+
             critic_1_opt.zero_grad()
             critic_1_loss.backward()
             critic_1_opt.step()
@@ -155,6 +167,9 @@ def sac_train(env, episodes=500, batch_size=64, gamma=0.99, tau=0.005):
                 target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
             for target_param, param in zip(target_critic_2.parameters(), critic_2.parameters()):
                 target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+
+            if done:
+                break
 
         print(f"[Episode {ep+1}] Total Reward: {total_reward:.2f}")
 
