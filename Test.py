@@ -1,12 +1,13 @@
+# --- Test.py ---
+
 import ENV
-import Model  # sac_model.py를 Model 모듈로 불러온다고 가정
-
+import Model
 import torch
+import os
 
+new = 1  # 1: 새 학습, 0: 이어 학습
+ckpt_path = "sac_checkpoint.pth"
 
-new = 0  # 1이면 새 학습, 0이면 이어 학습
-
-# 환경 생성
 env = ENV.Vector2DEnv(map_range=12.8, step_size=0.1)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("사용 디바이스:", device)
@@ -14,53 +15,42 @@ print("사용 디바이스:", device)
 state_dim = env.observation_space.shape[0]
 action_dim = env.action_space.shape[0]
 
-# 모델 생성
-actor = Model.GaussianPolicy(state_dim, action_dim).to(device)
-critic_1 = Model.QNetwork(state_dim, action_dim).to(device)
-critic_2 = Model.QNetwork(state_dim, action_dim).to(device)
-target_critic_1 = Model.QNetwork(state_dim, action_dim).to(device)
-target_critic_2 = Model.QNetwork(state_dim, action_dim).to(device)
+if new or not os.path.exists(ckpt_path):
+    print("▶ 새로 학습 시작")
+    bundle = Model.sac_train(env, episodes=100)
 
-if new:
-    # 초기 critic들도 target에 복사
-    target_critic_1.load_state_dict(critic_1.state_dict())
-    target_critic_2.load_state_dict(critic_2.state_dict())
-
-    # 학습 시작
-    actor = Model.sac_train(
-        env,
-        actor=actor,
-        critic_1=critic_1,
-        critic_2=critic_2,
-        target_critic_1=target_critic_1,
-        target_critic_2=target_critic_2,
-        episodes=1000
+    Model.save_sac_checkpoint(
+        ckpt_path,
+        bundle["actor"], bundle["critic_1"], bundle["critic_2"],
+        bundle["target_critic_1"], bundle["target_critic_2"],
+        bundle["actor_opt"], bundle["critic_1_opt"], bundle["critic_2_opt"],
+        replay_buffer=bundle["replay_buffer"]          # <<< 버퍼 저장
     )
-
-    # actor 저장
-    torch.save(actor.state_dict(), "sac_actor.pth")
-    print("모델 저장 완료")
+    print(f"체크포인트 저장 완료: {ckpt_path}")
 
 else:
-    # 기존 모델 로드
-    actor.load_state_dict(torch.load("sac_actor.pth", map_location=device))
-    print("모델 불러오기 완료")
+    print(f"▶ 체크포인트 로드 및 이어 학습: {ckpt_path}")
+    bundle = Model.load_sac_checkpoint(ckpt_path, state_dim, action_dim)
 
-    # target critic도 초기화
-    target_critic_1.load_state_dict(critic_1.state_dict())
-    target_critic_2.load_state_dict(critic_2.state_dict())
-
-    # 추가 학습
-    actor = Model.sac_train(
+    bundle = Model.sac_train(
         env,
-        actor=actor,
-        critic_1=critic_1,
-        critic_2=critic_2,
-        target_critic_1=target_critic_1,
-        target_critic_2=target_critic_2,
-        episodes=500
+        actor=bundle["actor"],
+        critic_1=bundle["critic_1"],
+        critic_2=bundle["critic_2"],
+        target_critic_1=bundle["target_critic_1"],
+        target_critic_2=bundle["target_critic_2"],
+        actor_opt=bundle["actor_opt"],
+        critic_1_opt=bundle["critic_1_opt"],
+        critic_2_opt=bundle["critic_2_opt"],
+        replay_buffer=bundle["replay_buffer"],        # <<< 버퍼 전달
+        episodes=100
     )
 
-    # 저장
-    torch.save(actor.state_dict(), "sac_actor.pth")
-    print("추가 학습 완료 및 모델 저장 완료")
+    Model.save_sac_checkpoint(
+        ckpt_path,
+        bundle["actor"], bundle["critic_1"], bundle["critic_2"],
+        bundle["target_critic_1"], bundle["target_critic_2"],
+        bundle["actor_opt"], bundle["critic_1_opt"], bundle["critic_2_opt"],
+        replay_buffer=bundle["replay_buffer"]          # <<< 버퍼 저장
+    )
+    print(f"추가 학습 후 체크포인트 저장 완료: {ckpt_path}")

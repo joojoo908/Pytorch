@@ -63,6 +63,7 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=size)
 
     def push(self, *args):
+        # tuple: (state, action, reward, next_state, done)
         self.buffer.append(tuple(args))
 
     def sample(self, batch_size):
@@ -79,28 +80,117 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-# SAC 학습 함수
-def sac_train(env, actor=None, critic_1=None, critic_2=None,
+    # ==== 추가: 직렬화 ====
+    def state_dict(self):
+        """전체 버퍼를 numpy 배열로 직렬화"""
+        if len(self.buffer) == 0:
+            return {
+                "maxlen": self.buffer.maxlen,
+                "length": 0,
+                "states": None, "actions": None, "rewards": None,
+                "next_states": None, "dones": None,
+            }
+        states, actions, rewards, next_states, dones = zip(*self.buffer)
+        return {
+            "maxlen": self.buffer.maxlen,
+            "length": len(self.buffer),
+            "states": np.array(states),
+            "actions": np.array(actions),
+            "rewards": np.array(rewards, dtype=np.float32),
+            "next_states": np.array(next_states),
+            "dones": np.array(dones, dtype=np.float32),
+        }
+
+    def load_state_dict(self, d):
+        """numpy 배열로부터 버퍼 복원"""
+        self.buffer = deque(maxlen=int(d.get("maxlen", 100000)))
+        length = int(d.get("length", 0))
+        if length == 0 or d.get("states") is None:
+            return
+        states = d["states"]
+        actions = d["actions"]
+        rewards = d["rewards"]
+        next_states = d["next_states"]
+        dones = d["dones"]
+        for i in range(length):
+            self.buffer.append((states[i], actions[i], float(rewards[i]), next_states[i], bool(dones[i])))
+
+
+def save_sac_checkpoint(path,
+                        actor, critic_1, critic_2,
+                        target_critic_1, target_critic_2,
+                        actor_opt, critic_1_opt, critic_2_opt,
+                        replay_buffer=None):
+    ckpt = {
+        "actor": actor.state_dict(),
+        "critic_1": critic_1.state_dict(),
+        "critic_2": critic_2.state_dict(),
+        "target_critic_1": target_critic_1.state_dict(),
+        "target_critic_2": target_critic_2.state_dict(),
+        "actor_opt": actor_opt.state_dict(),
+        "critic_1_opt": critic_1_opt.state_dict(),
+        "critic_2_opt": critic_2_opt.state_dict(),
+    }
+    if replay_buffer is not None:
+        ckpt["replay_buffer"] = replay_buffer.state_dict()
+    torch.save(ckpt, path)
+
+
+def load_sac_checkpoint(path, state_dim, action_dim):
+    actor = GaussianPolicy(state_dim, action_dim).to(device)
+    critic_1 = QNetwork(state_dim, action_dim).to(device)
+    critic_2 = QNetwork(state_dim, action_dim).to(device)
+    target_critic_1 = QNetwork(state_dim, action_dim).to(device)
+    target_critic_2 = QNetwork(state_dim, action_dim).to(device)
+
+    actor_opt = optim.Adam(actor.parameters(), lr=3e-4)
+    critic_1_opt = optim.Adam(critic_1.parameters(), lr=3e-4)
+    critic_2_opt = optim.Adam(critic_2.parameters(), lr=3e-4)
+
+    ckpt = torch.load(path, map_location=device)
+
+    actor.load_state_dict(ckpt["actor"])
+    critic_1.load_state_dict(ckpt["critic_1"])
+    critic_2.load_state_dict(ckpt["critic_2"])
+    target_critic_1.load_state_dict(ckpt["target_critic_1"])
+    target_critic_2.load_state_dict(ckpt["target_critic_2"])
+
+    actor_opt.load_state_dict(ckpt["actor_opt"])
+    critic_1_opt.load_state_dict(ckpt["critic_1_opt"])
+    critic_2_opt.load_state_dict(ckpt["critic_2_opt"])
+
+    # ==== 추가: 버퍼 복원 ====
+    replay_buffer = ReplayBuffer(size=ckpt.get("replay_buffer", {}).get("maxlen", 100000))
+    if "replay_buffer" in ckpt:
+        replay_buffer.load_state_dict(ckpt["replay_buffer"])
+
+    return {
+        "actor": actor,
+        "critic_1": critic_1,
+        "critic_2": critic_2,
+        "target_critic_1": target_critic_1,
+        "target_critic_2": target_critic_2,
+        "actor_opt": actor_opt,
+        "critic_1_opt": critic_1_opt,
+        "critic_2_opt": critic_2_opt,
+        "replay_buffer": replay_buffer,
+    }
+
+
+def sac_train(env,
+              actor=None,
+              critic_1=None, critic_2=None,
               target_critic_1=None, target_critic_2=None,
+              actor_opt=None, critic_1_opt=None, critic_2_opt=None,
+              replay_buffer=None,                     # <<< 추가
               episodes=500, batch_size=64, gamma=0.99, tau=0.005):
+
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
-    # 모델 초기화 또는 외부에서 주입받은 모델 사용
-    if actor is None:
-        actor = GaussianPolicy(state_dim, action_dim).to(device)
-    else:
-        actor = actor.to(device)
-
-    if critic_1 is None:
-        critic_1 = QNetwork(state_dim, action_dim).to(device)
-    else:
-        critic_1 = critic_1.to(device)
-
-    if critic_2 is None:
-        critic_2 = QNetwork(state_dim, action_dim).to(device)
-    else:
-        critic_2 = critic_2.to(device)
+    actor = (actor or GaussianPolicy(state_dim, action_dim)).to(device)
+    critic_1 = (critic_1 or QNetwork(state_dim, action_dim)).to(device)
+    critic_2 = (critic_2 or QNetwork(state_dim, action_dim)).to(device)
 
     if target_critic_1 is None:
         target_critic_1 = QNetwork(state_dim, action_dim).to(device)
@@ -114,20 +204,21 @@ def sac_train(env, actor=None, critic_1=None, critic_2=None,
     else:
         target_critic_2 = target_critic_2.to(device)
 
-    # 옵티마이저
-    actor_opt = optim.Adam(actor.parameters(), lr=3e-4)
-    critic_1_opt = optim.Adam(critic_1.parameters(), lr=3e-4)
-    critic_2_opt = optim.Adam(critic_2.parameters(), lr=3e-4)
+    actor_opt = actor_opt or optim.Adam(actor.parameters(), lr=3e-4)
+    critic_1_opt = critic_1_opt or optim.Adam(critic_1.parameters(), lr=3e-4)
+    critic_2_opt = critic_2_opt or optim.Adam(critic_2.parameters(), lr=3e-4)
 
-    buffer = ReplayBuffer()
-    alpha = 0.2  # entropy coefficient
+    # ==== 추가: 외부 버퍼 사용, 없으면 새로 ====
+    buffer = replay_buffer if (replay_buffer is not None) else ReplayBuffer()
+
+    alpha = 0.2
 
     for ep in range(episodes):
         state, _ = env.reset()
         state = torch.FloatTensor(np.array(state)).to(device)
         total_reward = 0
 
-        for t in range(env.max_steps):
+        for _ in range(env.max_steps):
             with torch.no_grad():
                 action, _ = actor.sample(state.unsqueeze(0))
             action_np = action.cpu().numpy()[0]
@@ -141,9 +232,11 @@ def sac_train(env, actor=None, critic_1=None, critic_2=None,
             total_reward += reward
 
             if len(buffer) < batch_size:
+                if done:
+                    break
                 continue
 
-            # 샘플링 및 업데이트 코드 (동일)
+            # --- 학습 ---
             states, actions, rewards, next_states, dones = buffer.sample(batch_size)
             states = torch.FloatTensor(states).to(device)
             actions = torch.FloatTensor(actions).to(device)
@@ -181,15 +274,26 @@ def sac_train(env, actor=None, critic_1=None, critic_2=None,
             actor_loss.backward()
             actor_opt.step()
 
-            for target_param, param in zip(target_critic_1.parameters(), critic_1.parameters()):
-                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-            for target_param, param in zip(target_critic_2.parameters(), critic_2.parameters()):
-                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+            for tp, p in zip(target_critic_1.parameters(), critic_1.parameters()):
+                tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
+            for tp, p in zip(target_critic_2.parameters(), critic_2.parameters()):
+                tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
 
             if done:
                 break
 
-        print(f"[Episode {ep + 1}] Total Reward: {total_reward:.2f}")
+        print(f"[Episode {ep+1}] Total Reward: {total_reward:.2f}")
 
     print("Training Complete")
-    return actor
+
+    return {
+        "actor": actor,
+        "critic_1": critic_1,
+        "critic_2": critic_2,
+        "target_critic_1": target_critic_1,
+        "target_critic_2": target_critic_2,
+        "actor_opt": actor_opt,
+        "critic_1_opt": critic_1_opt,
+        "critic_2_opt": critic_2_opt,
+        "replay_buffer": buffer,          # <<< 함께 반환
+    }
