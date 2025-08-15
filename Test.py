@@ -8,7 +8,7 @@ import os
 new = 1  # 1: 새 학습, 0: 이어 학습
 ckpt_path = "sac_checkpoint.pth"
 
-env = ENV.Vector2DEnv(map_range=12.8, step_size=0.1)
+env = ENV.Vector2DEnv(map_range=12.8, step_size=0.1, num_obstacles=5, obstacle_radius=0.5)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("사용 디바이스:", device)
 
