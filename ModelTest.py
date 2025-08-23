@@ -267,7 +267,7 @@ if __name__ == "__main__":
         import ENV
 
         env = ENV.Vector2DEnv(
-            maze_cells=(15, 15),
+            maze_cells=(5, 5),
             step_size=0.1,
             on_collision="deflect",
             R_SUCCESS=500.0,
