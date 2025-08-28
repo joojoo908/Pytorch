@@ -9,15 +9,13 @@ new = 1  # 1: 새 학습, 0: 이어 학습
 ckpt_path = "sac_checkpoint.pth"
 
 env = ENV.Vector2DEnv(
-    maze_cells=(5, 5),
     step_size=0.1,
-    on_collision="deflect",
-    R_SUCCESS=500.0,
-    # A* 셀 길이 보상(새로 추가된 옵션)
-    astar_shaping_scale=2.0,
-    astar_shaping_clip=5.0,
-    astar_grid=(256,256),           # 전역 A* 격자 해상도
-    astar_replan_steps=1            # A* 재계획 주기(스텝)
+    astar_grid=(256,256),
+    astar_replan_steps=8,        # 게이팅
+    replan_cte_threshold_frac=0.5,
+    on_collision="slide",        # 정책이 회전 학습하게 유지
+    # 보상 기본값은 이미 재밸런스됨(필요시 조절)
+    # obs_with_extras=False 로 체크포인트와 입력차원 동일 유지
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -28,7 +26,7 @@ action_dim = env.action_space.shape[0]
 
 if new or not os.path.exists(ckpt_path):
     print("▶ 새로 학습 시작")
-    bundle = Model.sac_train(env, episodes=1000)
+    bundle = Model.sac_train(env, episodes=100)
 
     Model.save_sac_checkpoint(
         ckpt_path,
