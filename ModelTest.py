@@ -1,12 +1,11 @@
 # --- ModelTest.py ---
 # 시각화/평가 유틸: Gymnasium ENV + (학습된) Actor
-# - 미로 격자 A*와 전역(128x128 등) A* 모두 지원
-# - A* 경로가 None이어도 안전하게 처리 (이전 경로 유지 가정)
+# - A* 관련 코드 제거 (ENV가 A*를 사용하지 않음)
 # - pygame 설치 없어도 headless로 동작
+# - 여러 에피소드를 연속 실행 가능
 
 import sys
 import time
-import math
 import numpy as np
 
 try:
@@ -49,17 +48,12 @@ def make_world_to_screen(map_range, scale):
     H = int(2 * map_range * scale)
 
     def world_to_screen(p):
-        # p: [x, y]
         x, y = float(p[0]), float(p[1])
         sx = int((x + map_range) * scale)
         sy = int((map_range - y) * scale)  # y-축 반전
         return sx, sy
 
     def rect_world_to_screen(center, half):
-        """
-        center: [cx, cy], half: [hx, hy]  (월드 단위)
-        pygame.Rect에 넣을 top-left(x,y)와 width,height(픽셀) 반환
-        """
         cx, cy = float(center[0]), float(center[1])
         hx, hy = float(half[0]),   float(half[1])
         minx = cx - hx
@@ -68,9 +62,7 @@ def make_world_to_screen(map_range, scale):
         h = 2.0 * hy
 
         sx = int((minx + map_range) * scale)
-        # top-left y = (map_range - top_y)*scale, top_y = miny + h
-        sy = int((map_range - (miny + h)) * scale)
-
+        sy = int((map_range - (miny + h)) * scale)  # top-left
         sw = max(1, int(w * scale))
         sh = max(1, int(h * scale))
         return pygame.Rect(sx, sy, sw, sh)
@@ -79,80 +71,23 @@ def make_world_to_screen(map_range, scale):
 
 
 # -------------------------------
-# A* 경로(world 좌표 리스트) 추출
-# -------------------------------
-def astar_points_world(env):
-    """
-    env._astar_path 가 있을 때, 각 (r,c)을 월드좌표로 변환하여 리스트로 반환.
-    - 전역 A*: _astar_origin + c*size, r*size
-    - 미로 A*: _maze_origin  + c*size, r*size
-    - 헬퍼 메서드가 있으면 우선 사용: _astar_cell_center_world, _cell_center_world
-    """
-    pts = []
-    path = getattr(env, "_astar_path", None)
-    if not path:
-        return pts
-
-    # 1) 전역 A* 헬퍼 메서드
-    if hasattr(env, "_astar_cell_center_world") and callable(getattr(env, "_astar_cell_center_world")):
-        for (r, c) in path:
-            wp = env._astar_cell_center_world(r, c)
-            pts.append((float(wp[0]), float(wp[1])))
-        return pts
-
-    # 2) 미로 A* 헬퍼 메서드
-    if hasattr(env, "_cell_center_world") and callable(getattr(env, "_cell_center_world")):
-        for (r, c) in path:
-            wp = env._cell_center_world(r, c)
-            pts.append((float(wp[0]), float(wp[1])))
-        return pts
-
-    # 3) 전역 A* 원시 파라미터
-    if hasattr(env, "_astar_origin") and hasattr(env, "_astar_cell_size"):
-        origin = np.array(env._astar_origin, dtype=np.float32)
-        cell   = float(env._astar_cell_size)
-        for (r, c) in path:
-            wp = origin + np.array([c * cell, r * cell], dtype=np.float32)
-            pts.append((float(wp[0]), float(wp[1])))
-        return pts
-
-    # 4) 미로 A* 원시 파라미터
-    if hasattr(env, "_maze_origin") and hasattr(env, "_maze_cell_size"):
-        origin = np.array(env._maze_origin, dtype=np.float32)
-        cell   = float(env._maze_cell_size)
-        for (r, c) in path:
-            wp = origin + np.array([c * cell, r * cell], dtype=np.float32)
-            pts.append((float(wp[0]), float(wp[1])))
-        return pts
-
-    # 실패 시 빈 리스트
-    return pts
-
-
-# -------------------------------
-# 평가/시각화 루프
+# 단일 에피소드 평가/시각화 (창 재사용 지원)
 # -------------------------------
 def evaluate_once(env,
                   actor: nn.Module,
                   max_steps: int = None,
                   scale: int = 20,
-                  wait: int = 10,
-                  visualize: bool = True,
-                  auto_quit: bool = True):
+                  screen_bundle=None,   # (screen, clock, font, world_to_screen, rect_world_to_screen)
+                  visualize: bool = True):
     """
     - env: Gymnasium 호환 ENV
     - actor: nn.Module, 입력 shape=[1, obs_dim] -> 출력 shape=[1, action_dim], 범위 [-1,1]
     - max_steps: None이면 env.max_steps 또는 300
     - scale: 화면 배율(픽셀/월드단위)
-    - wait: 종료 전 대기 프레임(시각화만)
+    - screen_bundle: 외부에서 만든 pygame 화면 리소스를 재사용
     - visualize: False면 headless로 평가
-    - auto_quit: True면 에피소드 끝나면 창 자동 종료
     """
-    assert hasattr(env, "map_range"), "env.map_range 가 필요합니다."
-
     obs, info = env.reset()
-    obs_dim = int(env.observation_space.shape[0])
-    action_dim = int(env.action_space.shape[0])
 
     # 안전 체크
     if isinstance(actor, nn.Module):
@@ -161,27 +96,29 @@ def evaluate_once(env,
     if max_steps is None:
         max_steps = getattr(env, "max_steps", 300)
 
-    # pygame 준비
+    # pygame 준비/재사용
+    screen = clock = font = None
+    world_to_screen = lambda p: (0, 0)
+    rect_world_to_screen = None
+
     if visualize and HAS_PYGAME:
-        pygame.init()
-        W, H, world_to_screen, rect_world_to_screen = make_world_to_screen(env.map_range, scale)
-        screen = pygame.display.set_mode((W, H))
-        pygame.display.set_caption("ModelTest - A* Path Visualization")
-        clock = pygame.time.Clock()
-        font = pygame.font.SysFont("consolas", 16)
-    else:
-        world_to_screen = lambda p: (0, 0)
-        rect_world_to_screen = None
-        screen = None
-        clock = None
-        font = None
+        if screen_bundle is None:
+            pygame.init()
+            W, H, world_to_screen, rect_world_to_screen = make_world_to_screen(env.map_range, scale)
+            screen = pygame.display.set_mode((W, H))
+            pygame.display.set_caption("ModelTest - Visualization")
+            clock = pygame.time.Clock()
+            font = pygame.font.SysFont("consolas", 16)
+            screen_bundle = (screen, clock, font, world_to_screen, rect_world_to_screen)
+        else:
+            screen, clock, font, world_to_screen, rect_world_to_screen = screen_bundle
 
     ep_ret = 0.0
     done = False
 
     for step in range(max_steps):
         # 이벤트 처리(ESC 종료)
-        if visualize and HAS_PYGAME:
+        if visualize and HAS_PYGAME and screen is not None:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     done = True
@@ -194,7 +131,6 @@ def evaluate_once(env,
                 x = torch.from_numpy(obs).float().unsqueeze(0)
                 a = actor(x).squeeze(0).cpu().numpy()
         else:
-            # 콜러블 함수 지원
             a = np.asarray(actor(obs), dtype=np.float32)
 
         # 스텝
@@ -203,7 +139,7 @@ def evaluate_once(env,
         done = done or terminated or truncated
 
         # 시각화
-        if visualize and HAS_PYGAME:
+        if visualize and HAS_PYGAME and screen is not None:
             screen.fill((18, 18, 18))
 
             # 벽(사각형들)
@@ -213,12 +149,6 @@ def evaluate_once(env,
                 for i in range(wall_centers.shape[0]):
                     rect = rect_world_to_screen(wall_centers[i], wall_halves[i])
                     pygame.draw.rect(screen, (70, 70, 70), rect)
-
-            # A* 경로 (연결선)
-            pts_world = astar_points_world(env)
-            if len(pts_world) >= 2:
-                pts_screen = [world_to_screen(p) for p in pts_world]
-                pygame.draw.lines(screen, (120, 220, 120), False, pts_screen, 2)
 
             # 목표/에이전트
             ag = np.array(getattr(env, "agent_pos"), dtype=np.float32)
@@ -241,21 +171,59 @@ def evaluate_once(env,
         if done:
             break
 
-    # 에피소드 종료 후 대기
-    if visualize and HAS_PYGAME and wait > 0:
-        t0 = time.time()
-        while time.time() - t0 < wait / 30.0:  # 대충 프레임 환산
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    t0 = 1e9
-                    break
-            pygame.time.delay(10)
+    return ep_ret, screen_bundle
 
-    if visualize and HAS_PYGAME:
-        if auto_quit:
-            pygame.quit()
 
-    return ep_ret
+# -------------------------------
+# 여러 에피소드 연속 평가 (창 1개 재사용)
+# -------------------------------
+def run_multiple_evaluations(env,
+                             actor: nn.Module,
+                             episodes: int = 5,
+                             max_steps: int = None,
+                             scale: int = 20,
+                             visualize: bool = True,
+                             visualize_every: int = 1,  # n 에피소드마다 1번 시각화
+                             wait: int = 20,            # 에피소드 사이/끝 대기 프레임(시각화 모드에서만)
+                             auto_quit: bool = True):
+    """
+    - visualize_every: 1이면 모든 에피소드 시각화, 2면 2개마다 1번만 시각화 등
+    - wait: 한 에피소드 끝나고 다음 에피소드 시작 전 짧게 기다림 (시각화 보기 좋게)
+    """
+    returns = []
+    screen_bundle = None
+
+    for ep in range(episodes):
+        vis = visualize and ((ep % visualize_every) == 0)
+        ret, screen_bundle = evaluate_once(
+            env, actor,
+            max_steps=max_steps,
+            scale=scale,
+            screen_bundle=screen_bundle if vis else None,
+            visualize=vis
+        )
+        returns.append(ret)
+        print(f"[Episode {ep+1}/{episodes}] return = {ret:.3f}")
+
+        # 에피소드 사이 짧은 대기 (시각화일 때만)
+        if vis and HAS_PYGAME and wait > 0 and screen_bundle is not None:
+            screen, clock, font, world_to_screen, rect_world_to_screen = screen_bundle
+            t0 = time.time()
+            while time.time() - t0 < wait / 60.0:  # 대충 프레임 환산
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        t0 = 1e9
+                        break
+                pygame.time.delay(10)
+
+    # 종료 정리
+    if visualize and HAS_PYGAME and screen_bundle is not None and auto_quit:
+        pygame.quit()
+
+    if len(returns) > 0:
+        avg = sum(returns) / len(returns)
+        print(f"[Summary] episodes={episodes}, avg_return={avg:.3f}, min={min(returns):.3f}, max={max(returns):.3f}")
+    return returns
 
 
 # -------------------------------
@@ -265,20 +233,27 @@ if __name__ == "__main__":
     # ENV와 연결 테스트용 (실제 사용에선 외부에서 env/actor 주입)
     try:
         import ENV
-
-        env = ENV.Vector2DEnv(
-            step_size=0.1,
-            astar_grid=(256, 256),
-            astar_replan_steps=8,  # 게이팅
-            replan_cte_threshold_frac=0.5,
-            on_collision="slide",  # 정책이 회전 학습하게 유지
-            # 보상 기본값은 이미 재밸런스됨(필요시 조절)
-            # obs_with_extras=False 로 체크포인트와 입력차원 동일 유지
-        )
+        # 맵은 고정, 시작/목표는 매 에피소드 랜덤
+        env = ENV.Vector2DEnv(seed=42, fixed_maze=True, fixed_agent_goal=False)
     except Exception as e:
         print("[WARN] ENV 로드 실패 또는 생성 실패:", e)
         sys.exit(0)
 
     actor = DummyActor(env.observation_space.shape[0], env.action_space.shape[0]).eval()
-    ret = evaluate_once(env, actor, scale=22, wait=30, visualize=HAS_PYGAME, auto_quit=True)
-    print(f"Episode return: {ret:.3f}")
+
+    # 여러 번 실행: 모든 에피소드 시각화(visualize_every=1), 에피소드 사이 20프레임 대기
+    returns = run_multiple_evaluations(
+        env, actor,
+        episodes=5,
+        scale=22,
+        visualize=HAS_PYGAME,
+        visualize_every=1,
+        wait=20,
+        auto_quit=True
+    )
+
+    # headless로 빠르게만 보고 싶다면:
+    # returns = run_multiple_evaluations(env, actor, episodes=20, visualize=False)
+
+    # 단일 에피소드만 돌리고 싶다면:
+    # ret, _ = evaluate_once(env, actor, scale=22, visualize=HAS_PYGAME)
