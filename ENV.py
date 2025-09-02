@@ -1,11 +1,15 @@
-# ENV.py — Geodesic shaping + Near-wall penalty (INF-safe)
+# ENV.py — No Slide Collision, Geodesic shaping + Near-wall penalty (Angle+Speed action)
+# Actions:
+#   action[0] in [-1,1] -> angle θ in [-pi, pi]
+#   action[1] in [-1,1] -> speed s in [0, step_size]
+#
 # Rewards:
 #   (1) Terminal success bonus
 #   (2) Geodesic progress shaping  (from_start | delta)
 #   (3) Near-wall penalty          reward -= proximity_coef * max(0, threshold - clearance)
 #
-# Movement/Collision: maze grid (e.g., 25x25)
-# Geodesic distance: separate grid (default 128x128), walls rasterized (optionally dilated by player size)
+# Movement/Collision: maze grid (e.g., 15x15)
+# Geodesic distance: separate grid (default 256x256), walls rasterized (optionally dilated by player size)
 
 import gymnasium as gym
 import numpy as np
@@ -21,32 +25,31 @@ class Vector2DEnv(gym.Env):
                  # === World / motion ===
                  map_range=12.8,
                  step_size=0.1,
-                 max_steps=300,
+                 max_steps=1000,
                  success_radius=0.10,
                  player_size=(0.1, 0.1),
 
                  # === Maze (movement/collision) ===
-                 maze_cells=(7, 7),
+                 maze_cells=(11, 11),
                  maze_margin=0.2,
                  maze_variable_bars=False,
                  maze_bar_max_len=6,
 
                  # === Collision ===
-                 on_collision="slide",            # "slide" | "none"
-                 collision_terminate=False,       # 기본: 충돌로 종료하지 않음
+                 collision_terminate=True,       # True면 충돌시 에피소드 종료
 
                  # === Observation ===
-                 obs_max_walls=256,
-                 obs_with_extras=False,           # True면 last_action/recent_vel 등 포함
+                 obs_max_walls=100,
+                 obs_with_extras=False,           # True면 추가 항목 포함(아래 참고)
 
                  # === Terminal reward ===
                  R_SUCCESS=500.0,
 
                  # === Geodesic (distance/shaping) ===
-                 geodesic_grid=(128, 128),        # geodesic-only grid resolution
+                 geodesic_grid=(256, 256),        # geodesic-only grid resolution
                  geodesic_shaping=True,           # enable shaping
                  geodesic_coef=1.0,               # shaping scale
-                 geodesic_positive_only=False,     # True: never penalize for getting farther
+                 geodesic_positive_only=False,    # True: never penalize for getting farther
                  geodesic_clip=0.0,               # per-step clip for shaping increment (0=off)
                  geodesic_dilate_player=True,     # dilate walls by player half-size when rasterizing
                  geodesic_progress_mode="delta",  # "from_start" | "delta"
@@ -86,7 +89,6 @@ class Vector2DEnv(gym.Env):
         self.maze_bar_max_len = int(max(1, maze_bar_max_len))
 
         # Collision
-        self.on_collision = "slide" if str(on_collision).lower() == "slide" else "none"
         self.collision_terminate = bool(collision_terminate)
 
         # Observation
@@ -131,26 +133,36 @@ class Vector2DEnv(gym.Env):
         self._maze_origin = None
 
         # Geodesic cache/meta
-        self._geo_map = None                  # float [geo_rows, geo_cols]
-        self._geo_prev = None                 # last step distance
-        self._geo_init = None                 # distance at episode start
-        self._geo_progress_given = 0.0        # cumulative progress already rewarded (from_start mode)
-        self._geo_origin = None               # world origin of first cell center
-        self._geo_cell_size = None            # (cw, ch)
-        self._geo_goal_rc = None              # (r,c) in geodesic grid
+        self._geo_map = None
+        self._geo_prev = None
+        self._geo_init = None
+        self._geo_progress_given = 0.0
+        self._geo_origin = None
+        self._geo_cell_size = None
+        self._geo_goal_rc = None
 
-        self._last_action = np.zeros(2, dtype=np.float32)
+        # NOTE: (angle, speed) 기록 + dx,dy도 호환용으로 남김
+        self._last_action = np.zeros(2, dtype=np.float32)          # (dx, dy) of last step
+        self._last_angle_speed = np.zeros(2, dtype=np.float32)     # (theta, speed)
         self._recent_vel = np.zeros(2, dtype=np.float32)
-        self.steps = 0
 
-        # reseed guard
+        self.steps = 0
         self._ever_reset = False
 
-        # Observation space
-        base_dim = 6 + 6 * self.obs_max_walls
+        # ---------- Observation space ----------
+        # 제거된 항목:
+        #  - goal_rel (목표 상대 벡터)
+        #  - obs_d    (벽까지 스칼라 거리)
+        #
+        # 구성:
+        #  agent_pos(2) + goal_pos(2)  +  per-wall[rel(2), half(2), mask(1)] * N
+        base_dim = 4 + 5 * self.obs_max_walls
+        # extras: last (angle, speed_norm), recent_vel(2), placeholder next_dir(2), zeros(2) = 8
         extra_dim = 8 if self.obs_with_extras else 0
         self._obs_dim = base_dim + extra_dim
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self._obs_dim,), dtype=np.float32)
+
+        # 액션은 각도/속도 해석용 2D [-1,1]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
     # ---------- Maze helpers ----------
@@ -271,7 +283,7 @@ class Vector2DEnv(gym.Env):
 
     def _compute_geodesic_map_on_geo_grid(self, occ, goal_rc):
         rows, cols = occ.shape
-        INF = np.inf                              # ★ INF는 np.inf로
+        INF = np.inf
         dist = np.full((rows, cols), INF, dtype=float)
         gr, gc = goal_rc
         if not (0 <= gr < rows and 0 <= gc < cols) or occ[gr, gc] == 1:
@@ -295,7 +307,6 @@ class Vector2DEnv(gym.Env):
 
     # ---------- Collision / distances ----------
     def _collides(self, new_center):
-        """Axis-aligned rectangle overlap test (agent AABB vs walls)."""
         if self._wall_centers is None or self._wall_centers.shape[0] == 0:
             return False
         dx = np.abs(new_center[0] - self._wall_centers[:, 0]) <= (self.player_half[0] + self._wall_halves[:, 0])
@@ -303,10 +314,6 @@ class Vector2DEnv(gym.Env):
         return bool(np.any(dx & dy))
 
     def _nearest_wall_clearance(self, center):
-        """
-        Minimum Euclidean distance between the agent AABB and all wall AABBs.
-        Returns 0 if touching/overlapping. If no walls, returns +inf.
-        """
         if self._wall_centers is None or self._wall_centers.shape[0] == 0:
             return float("inf")
         ax, ay = float(center[0]), float(center[1])
@@ -319,67 +326,63 @@ class Vector2DEnv(gym.Env):
         d = np.hypot(dx, dy)
         return float(np.min(d)) if d.size > 0 else float("inf")
 
-    def _resolve_movement(self, pos, action):
-        dx, dy = float(action[0]), float(action[1])
+    def _resolve_movement(self, pos, action_vec):
+        """
+        No slide: try full move; if collides, cancel the move.
+        Returns: (new_pos, collided_flag)
+        """
+        dx, dy = float(action_vec[0]), float(action_vec[1])
         tried = pos + np.array([dx, dy], dtype=np.float32)
         if not self._collides(tried):
             return tried, False
-        if self.on_collision == "slide":
-            tried_x = pos + np.array([dx, 0.0], dtype=np.float32)
-            if not self._collides(tried_x):
-                return tried_x, True
-            tried_y = pos + np.array([0.0, dy], dtype=np.float32)
-            if not self._collides(tried_y):
-                return tried_y, True
+        # Collision -> stay put (no sliding)
         return pos.copy(), True
 
     # ---------- Observation ----------
     def _pack_observation(self):
         s = self.map_range
+
+        # 벽 상대좌표 rel, half(크기)만 사용. 거리(obs_d)는 제거.
         if self._wall_centers is None or self._wall_centers.shape[0] == 0:
             rel = np.zeros((0, 2), np.float32)
             hal = np.zeros((0, 2), np.float32)
-            distv = np.zeros((0,), np.float32)
         else:
             rel_all = self._wall_centers - self.agent_pos[None, :]
+            # 정렬에는 거리(norm)를 사용하지만, 관측에는 포함하지 않음
             dist_all = np.linalg.norm(rel_all, axis=1)
             idx = np.argsort(dist_all)[:self.obs_max_walls]
             rel = rel_all[idx]
             hal = self._wall_halves[idx]
-            distv = dist_all[idx]
 
         K = rel.shape[0]
         obs_rel = np.zeros((self.obs_max_walls, 2), np.float32)
         obs_hal = np.zeros((self.obs_max_walls, 2), np.float32)
-        obs_d   = np.zeros((self.obs_max_walls,), np.float32)
-        mask    = np.zeros((self.obs_max_walls,), np.float32)
+        mask    = np.zeros((self.obs_max_walls,),   np.float32)
         if K > 0:
             obs_rel[:K] = rel
             obs_hal[:K] = hal
-            obs_d[:K]   = distv
             mask[:K]    = 1.0
 
-        goal_rel = (self.goal_pos - self.agent_pos) / s
-
         parts = [
-            (self.agent_pos / s),
-            (self.goal_pos / s),
-            goal_rel,
-            (obs_rel.flatten() / s),
-            (obs_hal.flatten() / s),
-            (obs_d / s),
-            mask
+            (self.agent_pos / s),           # 2
+            (self.goal_pos  / s),           # 2
+            (obs_rel.flatten() / s),        # 2*N
+            (obs_hal.flatten() / s),        # 2*N
+            mask                            # 1*N
         ]
 
         if self.obs_with_extras:
-            next_dir = np.zeros(2, dtype=np.float32)  # no A* in obs
-            parts += [self._last_action, self._recent_vel, next_dir, np.array([0.0, 0.0], dtype=np.float32)]
+            # last angle, speed normalized to [0,1] by dividing step_size
+            ang = float(self._last_angle_speed[0])
+            spd = float(self._last_angle_speed[1] / max(1e-9, self.step_size))
+            last_ang_spd = np.array([ang, spd], dtype=np.float32)
+            next_dir = np.zeros(2, dtype=np.float32)  # placeholder
+            parts += [last_ang_spd, self._recent_vel, next_dir, np.array([0.0, 0.0], dtype=np.float32)]
 
         return np.concatenate(parts).astype(np.float32)
 
     # ---------- Geodesic validity guard ----------
     def _geo_valid(self, d):
-        """Return True iff geodesic distance is finite and in a sane range."""
         return (d is not None) and np.isfinite(d) and (d < 1e17)
 
     # ---------- Gym API ----------
@@ -435,7 +438,7 @@ class Vector2DEnv(gym.Env):
         self._geo_goal_rc = self._pos_to_geo_rc(self.goal_pos)
         occ = self._rasterize_walls_to_geo_grid()
 
-        # 목표/에이전트 셀 강제 개방(래스터 오차/팽창으로 막히는 것 방지)
+        # 목표/에이전트 셀 강제 개방
         gr, gc = self._geo_goal_rc
         ar, ac = self._pos_to_geo_rc(self.agent_pos)
         if 0 <= gr < self.geo_rows and 0 <= gc < self.geo_cols:
@@ -459,6 +462,7 @@ class Vector2DEnv(gym.Env):
 
         # Motion state
         self._last_action[:] = 0.0
+        self._last_angle_speed[:] = 0.0
         self._recent_vel[:] = 0.0
         self.steps = 0
         self._ever_reset = True
@@ -466,23 +470,32 @@ class Vector2DEnv(gym.Env):
         return self._pack_observation(), {}
 
     def step(self, action):
-        # Normalize action to step_size
-        norm = float(np.linalg.norm(action))
-        if norm > 0:
-            action = (action / norm) * min(norm, self.step_size)
-        else:
-            action = np.zeros(2, dtype=np.float32)
+        """
+        Interpret action as (angle, speed):
+          angle in [-pi, pi], speed in [0, step_size]
+        """
+        a = np.asarray(action, dtype=np.float32).reshape(-1)
+        if a.shape[0] != 2:
+            a = np.zeros(2, dtype=np.float32)
+
+        # map to angle/speed
+        theta = float(np.pi * np.clip(a[0], -1.0, 1.0))
+        speed = float(((np.clip(a[1], -1.0, 1.0) + 1.0) * 0.5) * self.step_size)
+
+        dx = speed * np.cos(theta)
+        dy = speed * np.sin(theta)
 
         old_pos = self.agent_pos.copy()
 
-        # Move with collision
-        new_pos, collided = self._resolve_movement(old_pos, action)
+        # Move with collision (no slide)
+        new_pos, collided = self._resolve_movement(old_pos, np.array([dx, dy], dtype=np.float32))
         self.agent_pos = new_pos
         self.steps += 1
 
         # Kinematics
         self._recent_vel = (self.agent_pos - old_pos)
-        self._last_action = np.array(action, dtype=np.float32)
+        self._last_action = np.array([dx, dy], dtype=np.float32)
+        self._last_angle_speed = np.array([theta, speed], dtype=np.float32)
 
         # Termination
         dist_to_goal = float(np.linalg.norm(self.goal_pos - self.agent_pos))

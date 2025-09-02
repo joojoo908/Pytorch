@@ -1,4 +1,4 @@
-# sac_model.py
+# Model.py — SAC (actor outputs in [-1,1]^2)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,7 +34,7 @@ class GaussianPolicy(nn.Module):
         normal = torch.distributions.Normal(mean, std)
         x_t = normal.rsample()  # reparameterization trick
         y_t = torch.tanh(x_t)
-        action = y_t
+        action = y_t  # [-1,1] 범위: ENV가 (θ, s)로 해석
 
         log_prob = normal.log_prob(x_t) - torch.log(1 - y_t.pow(2) + 1e-6)
         log_prob = log_prob.sum(dim=1, keepdim=True)
@@ -63,7 +63,6 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=size)
 
     def push(self, *args):
-        # tuple: (state, action, reward, next_state, done)
         self.buffer.append(tuple(args))
 
     def sample(self, batch_size):
@@ -80,9 +79,8 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-    # ==== 추가: 직렬화 ====
+    # ==== 직렬화 지원 ====
     def state_dict(self):
-        """전체 버퍼를 numpy 배열로 직렬화"""
         if len(self.buffer) == 0:
             return {
                 "maxlen": self.buffer.maxlen,
@@ -102,7 +100,6 @@ class ReplayBuffer:
         }
 
     def load_state_dict(self, d):
-        """numpy 배열로부터 버퍼 복원"""
         self.buffer = deque(maxlen=int(d.get("maxlen", 100000)))
         length = int(d.get("length", 0))
         if length == 0 or d.get("states") is None:
@@ -159,7 +156,6 @@ def load_sac_checkpoint(path, state_dim, action_dim):
     critic_1_opt.load_state_dict(ckpt["critic_1_opt"])
     critic_2_opt.load_state_dict(ckpt["critic_2_opt"])
 
-    # ==== 추가: 버퍼 복원 ====
     replay_buffer = ReplayBuffer(size=ckpt.get("replay_buffer", {}).get("maxlen", 100000))
     if "replay_buffer" in ckpt:
         replay_buffer.load_state_dict(ckpt["replay_buffer"])
@@ -182,7 +178,7 @@ def sac_train(env,
               critic_1=None, critic_2=None,
               target_critic_1=None, target_critic_2=None,
               actor_opt=None, critic_1_opt=None, critic_2_opt=None,
-              replay_buffer=None,                     # <<< 추가
+              replay_buffer=None,
               episodes=500, batch_size=64, gamma=0.99, tau=0.005):
 
     state_dim = env.observation_space.shape[0]
@@ -208,17 +204,16 @@ def sac_train(env,
     critic_1_opt = critic_1_opt or optim.Adam(critic_1.parameters(), lr=3e-4)
     critic_2_opt = critic_2_opt or optim.Adam(critic_2.parameters(), lr=3e-4)
 
-    # ==== 추가: 외부 버퍼 사용, 없으면 새로 ====
     buffer = replay_buffer if (replay_buffer is not None) else ReplayBuffer()
 
-    alpha = 0.2
+    alpha = 0.2  # 필요하면 자동 튜닝 추가 가능
 
     for ep in range(episodes):
         state, _ = env.reset()
         state = torch.FloatTensor(np.array(state)).to(device)
         total_reward = 0
 
-        for _ in range(env.max_steps):
+        for _ in range(getattr(env, "max_steps", 300)):
             with torch.no_grad():
                 action, _ = actor.sample(state.unsqueeze(0))
             action_np = action.cpu().numpy()[0]
@@ -236,7 +231,6 @@ def sac_train(env,
                     break
                 continue
 
-            # --- 학습 ---
             states, actions, rewards, next_states, dones = buffer.sample(batch_size)
             states = torch.FloatTensor(states).to(device)
             actions = torch.FloatTensor(actions).to(device)
@@ -295,5 +289,5 @@ def sac_train(env,
         "actor_opt": actor_opt,
         "critic_1_opt": critic_1_opt,
         "critic_2_opt": critic_2_opt,
-        "replay_buffer": buffer,          # <<< 함께 반환
+        "replay_buffer": buffer,
     }
