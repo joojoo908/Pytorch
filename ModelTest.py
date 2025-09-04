@@ -198,10 +198,15 @@ def evaluate_once(env, actor, max_steps=None, scale=20,
 
             # === 남은 스텝 & 거리 표시 ===
             remaining = max_steps - step
-            dist_to_goal = float(np.linalg.norm(env.goal_pos - env.agent_pos))
+
+            # 지오데식 거리 가져오기 (없으면 fallback으로 유클리드)
+            dist_to_goal = get_geodesic_distance(env)
+            if dist_to_goal is None:
+                dist_to_goal = float(np.linalg.norm(env.goal_pos - env.agent_pos))
+
             info_lines = [
                 f"Step: {step}/{max_steps} (남은 {remaining})",
-                f"Dist to Goal: {dist_to_goal:.3f}"
+                f"Geodesic Dist: {dist_to_goal:.3f}"
             ]
             y = 5
             for line in info_lines:

@@ -1,4 +1,4 @@
-# ENV.py — No Slide Collision, Geodesic shaping + Near-wall penalty (Angle+Speed action)
+# ENV.py — No Slide Collision, Geodesic shaping + Near-wall penalty + Anti-stall (Angle+Speed action)
 # Actions:
 #   action[0] in [-1,1] -> angle θ in [-pi, pi]
 #   action[1] in [-1,1] -> speed s in [0, step_size]
@@ -7,6 +7,7 @@
 #   (1) Terminal success bonus
 #   (2) Geodesic progress shaping  (from_start | delta)
 #   (3) Near-wall penalty          reward -= proximity_coef * max(0, threshold - clearance)
+#   (4) Anti-stall penalty         if no best-distance update for >= patience steps
 #
 # Movement/Collision: maze grid (e.g., 15x15)
 # Geodesic distance: separate grid (default 256x256), walls rasterized (optionally dilated by player size)
@@ -25,7 +26,7 @@ class Vector2DEnv(gym.Env):
                  # === World / motion ===
                  map_range=12.8,
                  step_size=0.1,
-                 max_steps=500,
+                 max_steps=1000,
                  success_radius=0.10,
                  player_size=(0.1, 0.1),
 
@@ -52,13 +53,20 @@ class Vector2DEnv(gym.Env):
                  geodesic_positive_only=False,    # True: never penalize for getting farther
                  geodesic_clip=0.0,               # per-step clip for shaping increment (0=off)
                  geodesic_dilate_player=True,     # dilate walls by player half-size when rasterizing
-                 geodesic_progress_mode="from_start",  # "from_start" | "delta"
+                 geodesic_progress_mode="delta",  # "from_start" | "delta"
 
                  # === Near-wall penalty ===
                  proximity_penalty=True,          # 켬/끔
                  proximity_threshold=0.20,        # 월드 단위 임계거리
                  proximity_coef=0.3,              # 패널티 세기
                  proximity_clip=0.0,              # 0이면 클립 없음
+
+                 # === Anti-stall (no-progress penalty) ===
+                 stall_penalty_use=True,       # 정체 패널티 켬/끔
+                 stall_patience=40,            # 갱신 없을 때 허용 스텝 수
+                 stall_penalty_per_step=0.5,   # patience 이후 매 스텝 감점
+                 stall_improve_eps=1e-3,       # "개선"으로 인정할 최소 개선 폭
+                 stall_use_geodesic=True,      # 가능한 경우 지오데식 거리로 측정
 
                  # === Fixed map / start-goal ===
                  fixed_maze=True,
@@ -115,6 +123,13 @@ class Vector2DEnv(gym.Env):
         self.prox_coef = float(proximity_coef)
         self.prox_clip = float(proximity_clip)
 
+        # Anti-stall config
+        self.stall_use = bool(stall_penalty_use)
+        self.stall_patience = int(stall_patience)
+        self.stall_penalty_per_step = float(stall_penalty_per_step)
+        self.stall_eps = float(stall_improve_eps)
+        self.stall_use_geodesic = bool(stall_use_geodesic)
+
         # Fixed map / start-goal
         self.fixed_maze = bool(fixed_maze)
         self.fixed_agent_goal = bool(fixed_agent_goal)
@@ -149,11 +164,11 @@ class Vector2DEnv(gym.Env):
         self.steps = 0
         self._ever_reset = False
 
+        # Anti-stall runtime
+        self._stall_best = None   # float: 관측된 최소 진행거리
+        self._stall_wait = 0      # int: 갱신 없는 연속 스텝 수
+
         # ---------- Observation space ----------
-        # 제거된 항목:
-        #  - goal_rel (목표 상대 벡터)
-        #  - obs_d    (벽까지 스칼라 거리)
-        #
         # 구성:
         #  agent_pos(2) + goal_pos(2)  +  per-wall[rel(2), half(2), mask(1)] * N
         base_dim = 4 + 5 * self.obs_max_walls
@@ -338,6 +353,23 @@ class Vector2DEnv(gym.Env):
         # Collision -> stay put (no sliding)
         return pos.copy(), True
 
+    # ---------- Progress metric helper ----------
+    def _progress_metric(self):
+        """
+        가능한 경우 지오데식 거리를 사용(더 '길 인식'에 맞음).
+        지오데식이 불가/무효이면 유클리드 거리로 대체.
+        값이 작을수록 목표에 가깝다.
+        """
+        use_geo = self.stall_use_geodesic and self.geo_use and (self._geo_map is not None)
+        if use_geo:
+            ar, ac = self._pos_to_geo_rc(self.agent_pos)
+            if 0 <= ar < self.geo_rows and 0 <= ac < self.geo_cols:
+                d = float(self._geo_map[ar, ac])
+                if self._geo_valid(d):
+                    return d
+        # fallback: Euclidean
+        return float(np.linalg.norm(self.goal_pos - self.agent_pos))
+
     # ---------- Observation ----------
     def _pack_observation(self):
         s = self.map_range
@@ -467,6 +499,11 @@ class Vector2DEnv(gym.Env):
         self.steps = 0
         self._ever_reset = True
 
+        # Anti-stall init
+        cur = self._progress_metric()
+        self._stall_best = float(cur)
+        self._stall_wait = 0
+
         return self._pack_observation(), {}
 
     def step(self, action):
@@ -551,6 +588,21 @@ class Vector2DEnv(gym.Env):
             terms["near_wall_penalty"] = -penalty
             terms["min_clearance"] = float(min_clear)
 
+        # ---------- Anti-stall: no-progress penalty ----------
+        if self.stall_use:
+            cur = self._progress_metric()  # 작을수록 좋음(목표에 가까움)
+            if (self._stall_best is None) or (cur < self._stall_best - self.stall_eps):
+                self._stall_best = float(cur)
+                self._stall_wait = 0
+            else:
+                self._stall_wait += 1
+                if self._stall_wait >= self.stall_patience:
+                    reward -= self.stall_penalty_per_step
+                    terms["stall_penalty"] = terms.get("stall_penalty", 0.0) - self.stall_penalty_per_step
+                    terms["stall_wait"] = int(self._stall_wait)
+                    terms["stall_best"] = float(self._stall_best)
+                    terms["stall_cur"] = float(cur)
+
         # Optional: end episode on collision
         if collided and self.collision_terminate:
             terminated = True
@@ -562,6 +614,9 @@ class Vector2DEnv(gym.Env):
             terms["success"] = self._R_SUCCESS
             if self.goal_snap_on_success:
                 self.agent_pos = self.goal_pos.copy()
+            # 성공 시 정체 상태 리셋(의미상)
+            self._stall_best = 0.0
+            self._stall_wait = 0
 
         info = {
             "dist_to_goal": dist_to_goal,
