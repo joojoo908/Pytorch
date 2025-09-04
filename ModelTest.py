@@ -1,4 +1,4 @@
-# --- ModelTest.py (deterministic eval, actor 전용 + 장애물 + 최단경로 표시) ---
+# --- ModelTest.py (deterministic eval, actor 전용 + 장애물 + 최단경로 + 남은 스텝/거리 표시) ---
 
 import sys
 import time
@@ -13,7 +13,6 @@ except Exception:
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # ============================================================
@@ -196,6 +195,19 @@ def evaluate_once(env, actor, max_steps=None, scale=20,
             ag=np.array(env.agent_pos); gl=np.array(env.goal_pos)
             pygame.draw.circle(screen,(230,90,90),world_to_screen(gl),5)
             pygame.draw.circle(screen,(80,180,250),world_to_screen(ag),4)
+
+            # === 남은 스텝 & 거리 표시 ===
+            remaining = max_steps - step
+            dist_to_goal = float(np.linalg.norm(env.goal_pos - env.agent_pos))
+            info_lines = [
+                f"Step: {step}/{max_steps} (남은 {remaining})",
+                f"Dist to Goal: {dist_to_goal:.3f}"
+            ]
+            y = 5
+            for line in info_lines:
+                surf = font.render(line, True, (220,220,220))
+                screen.blit(surf, (5, y))
+                y += 18
 
             pygame.display.flip(); clock.tick(60)
 

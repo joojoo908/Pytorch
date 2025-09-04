@@ -25,7 +25,7 @@ class Vector2DEnv(gym.Env):
                  # === World / motion ===
                  map_range=12.8,
                  step_size=0.1,
-                 max_steps=1000,
+                 max_steps=500,
                  success_radius=0.10,
                  player_size=(0.1, 0.1),
 
@@ -52,7 +52,7 @@ class Vector2DEnv(gym.Env):
                  geodesic_positive_only=False,    # True: never penalize for getting farther
                  geodesic_clip=0.0,               # per-step clip for shaping increment (0=off)
                  geodesic_dilate_player=True,     # dilate walls by player half-size when rasterizing
-                 geodesic_progress_mode="delta",  # "from_start" | "delta"
+                 geodesic_progress_mode="from_start",  # "from_start" | "delta"
 
                  # === Near-wall penalty ===
                  proximity_penalty=True,          # 켬/끔

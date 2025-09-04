@@ -144,7 +144,7 @@ def load_sac_checkpoint(path, state_dim, action_dim):
     critic_1_opt = optim.Adam(critic_1.parameters(), lr=3e-4)
     critic_2_opt = optim.Adam(critic_2.parameters(), lr=3e-4)
 
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device,weights_only=False)
 
     actor.load_state_dict(ckpt["actor"])
     critic_1.load_state_dict(ckpt["critic_1"])

@@ -21,7 +21,7 @@ action_dim = env.action_space.shape[0]
 
 if new or not os.path.exists(ckpt_path):
     print("▶ 새로 학습 시작")
-    bundle = Model.sac_train(env, episodes=100)
+    bundle = Model.sac_train(env, episodes=2000)
 
     # 전체 체크포인트 저장
     Model.save_sac_checkpoint(
