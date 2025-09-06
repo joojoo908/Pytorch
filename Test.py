@@ -5,7 +5,7 @@ import Model
 import torch
 import os
 
-new = 1  # 1: 새 학습, 0: 이어 학습
+new = 0  # 1: 새 학습, 0: 이어 학습
 ckpt_path = "sac_checkpoint.pth"
 actor_path = "sac_actor.pth"   # ✅ actor만 저장할 파일
 
@@ -52,7 +52,7 @@ else:
         critic_1_opt=bundle["critic_1_opt"],
         critic_2_opt=bundle["critic_2_opt"],
         replay_buffer=bundle["replay_buffer"],
-        episodes=2000
+        episodes=1000
     )
 
     # 전체 체크포인트 저장

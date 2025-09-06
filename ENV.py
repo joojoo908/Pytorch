@@ -26,7 +26,7 @@ class Vector2DEnv(gym.Env):
                  # === World / motion ===
                  map_range=12.8,
                  step_size=0.1,
-                 max_steps=1000,
+                 max_steps=700,
                  success_radius=0.10,
                  player_size=(0.1, 0.1),
 
@@ -37,7 +37,7 @@ class Vector2DEnv(gym.Env):
                  maze_bar_max_len=6,
 
                  # === Collision ===
-                 collision_terminate=True,       # True면 충돌시 에피소드 종료
+                 collision_terminate=False,       # True면 충돌시 에피소드 종료
 
                  # === Observation ===
                  obs_max_walls=100,
@@ -47,7 +47,7 @@ class Vector2DEnv(gym.Env):
                  R_SUCCESS=500.0,
 
                  # === Geodesic (distance/shaping) ===
-                 geodesic_grid=(256, 256),        # geodesic-only grid resolution
+                 geodesic_grid=(512, 512),        # geodesic-only grid resolution
                  geodesic_shaping=True,           # enable shaping
                  geodesic_coef=1.0,               # shaping scale
                  geodesic_positive_only=False,    # True: never penalize for getting farther
@@ -56,14 +56,14 @@ class Vector2DEnv(gym.Env):
                  geodesic_progress_mode="delta",  # "from_start" | "delta"
 
                  # === Near-wall penalty ===
-                 proximity_penalty=True,          # 켬/끔
-                 proximity_threshold=0.20,        # 월드 단위 임계거리
-                 proximity_coef=0.3,              # 패널티 세기
+                 proximity_penalty=False,          # 켬/끔
+                 proximity_threshold=0.0,        # 월드 단위 임계거리
+                 proximity_coef=0.0,              # 패널티 세기
                  proximity_clip=0.0,              # 0이면 클립 없음
 
                  # === Anti-stall (no-progress penalty) ===
                  stall_penalty_use=True,       # 정체 패널티 켬/끔
-                 stall_patience=40,            # 갱신 없을 때 허용 스텝 수
+                 stall_patience=10,            # 갱신 없을 때 허용 스텝 수
                  stall_penalty_per_step=0.5,   # patience 이후 매 스텝 감점
                  stall_improve_eps=1e-3,       # "개선"으로 인정할 최소 개선 폭
                  stall_use_geodesic=True,      # 가능한 경우 지오데식 거리로 측정
@@ -343,15 +343,55 @@ class Vector2DEnv(gym.Env):
 
     def _resolve_movement(self, pos, action_vec):
         """
-        No slide: try full move; if collides, cancel the move.
-        Returns: (new_pos, collided_flag)
+        Sliding collision:
+          1) 전체 이동 시도
+          2) 막히면 축 분해(x-only, y-only)로 각각 시도
+          3) x→y, y→x 두 순서를 모두 시험해 더 많이 전진한 쪽을 채택
+        Returns: (new_pos, blocked_flag)
+          - blocked_flag=True면 축 분해로도 한 발짝도 못 움직였다는 뜻
         """
         dx, dy = float(action_vec[0]), float(action_vec[1])
-        tried = pos + np.array([dx, dy], dtype=np.float32)
-        if not self._collides(tried):
-            return tried, False
-        # Collision -> stay put (no sliding)
-        return pos.copy(), True
+        full_try = pos + np.array([dx, dy], dtype=np.float32)
+
+        # 1) 전체 이동이 가능하면 그대로 이동
+        if not self._collides(full_try):
+            return full_try, False
+
+        # 2) 축 분해: (x 후 y) 경로
+        cand_xy = pos.copy()
+        moved_xy = False
+        try_x = pos + np.array([dx, 0.0], dtype=np.float32)
+        if not self._collides(try_x):
+            cand_xy = try_x
+            moved_xy = True
+        try_xy = cand_xy + np.array([0.0, dy], dtype=np.float32)
+        if not self._collides(try_xy):
+            cand_xy = try_xy
+            moved_xy = True
+
+        # 3) 축 분해: (y 후 x) 경로
+        cand_yx = pos.copy()
+        moved_yx = False
+        try_y = pos + np.array([0.0, dy], dtype=np.float32)
+        if not self._collides(try_y):
+            cand_yx = try_y
+            moved_yx = True
+        try_yx = cand_yx + np.array([dx, 0.0], dtype=np.float32)
+        if not self._collides(try_yx):
+            cand_yx = try_yx
+            moved_yx = True
+
+        # 4) 더 멀리 이동한 후보를 채택(거리 기준)
+        dist_xy = float(np.linalg.norm(cand_xy - pos))
+        dist_yx = float(np.linalg.norm(cand_yx - pos))
+        if dist_xy >= dist_yx:
+            best = cand_xy
+            moved = moved_xy
+        else:
+            best = cand_yx
+            moved = moved_yx
+
+        return (best if moved else pos.copy()), (not moved)
 
     # ---------- Progress metric helper ----------
     def _progress_metric(self):
