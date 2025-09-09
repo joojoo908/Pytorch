@@ -208,75 +208,100 @@ def sac_train(env,
 
     alpha = 0.2  # 필요하면 자동 튜닝 추가 가능
 
+    success_count = 0  # 누적 성공 수
+
     for ep in range(episodes):
         state, _ = env.reset()
         state = torch.FloatTensor(np.array(state)).to(device)
-        total_reward = 0
+        total_reward = 0.0
+
+        episode_success = False
+        last_truncated = False
+        last_reason = None  # "success" | "collision" | "timeout" | None
 
         for _ in range(getattr(env, "max_steps", 300)):
             with torch.no_grad():
                 action, _ = actor.sample(state.unsqueeze(0))
             action_np = action.cpu().numpy()[0]
 
-            next_state, reward, terminated, truncated, _ = env.step(action_np)
+            next_state, reward, terminated, truncated, info = env.step(action_np)
             done = terminated or truncated
+
+            # 에피소드 종료 원인 추적
+            if isinstance(info, dict):
+                terms = info.get("reward_terms") or {}
+                if "success" in terms:
+                    episode_success = True
+                    last_reason = "success"
+                elif terms.get("collision_reset", False):
+                    last_reason = "collision"
 
             buffer.push(state.cpu().numpy(), action_np, reward, next_state, done)
 
             state = torch.FloatTensor(np.array(next_state)).to(device)
-            total_reward += reward
+            total_reward += float(reward)
 
-            if len(buffer) < batch_size:
-                if done:
-                    break
-                continue
+            if len(buffer) >= batch_size:
+                states, actions, rewards, next_states, dones = buffer.sample(batch_size)
+                states = torch.FloatTensor(states).to(device)
+                actions = torch.FloatTensor(actions).to(device)
+                rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)
+                next_states = torch.FloatTensor(next_states).to(device)
+                dones = torch.FloatTensor(dones).unsqueeze(1).to(device)
 
-            states, actions, rewards, next_states, dones = buffer.sample(batch_size)
-            states = torch.FloatTensor(states).to(device)
-            actions = torch.FloatTensor(actions).to(device)
-            rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)
-            next_states = torch.FloatTensor(next_states).to(device)
-            dones = torch.FloatTensor(dones).unsqueeze(1).to(device)
+                with torch.no_grad():
+                    next_action, log_prob = actor.sample(next_states)
+                    target_q1 = target_critic_1(next_states, next_action)
+                    target_q2 = target_critic_2(next_states, next_action)
+                    target_q = torch.min(target_q1, target_q2) - alpha * log_prob
+                    target_value = rewards + gamma * (1 - dones) * target_q
 
-            with torch.no_grad():
-                next_action, log_prob = actor.sample(next_states)
-                target_q1 = target_critic_1(next_states, next_action)
-                target_q2 = target_critic_2(next_states, next_action)
-                target_q = torch.min(target_q1, target_q2) - alpha * log_prob
-                target_value = rewards + gamma * (1 - dones) * target_q
+                q1 = critic_1(states, actions)
+                q2 = critic_2(states, actions)
+                critic_1_loss = F.mse_loss(q1, target_value)
+                critic_2_loss = F.mse_loss(q2, target_value)
 
-            q1 = critic_1(states, actions)
-            q2 = critic_2(states, actions)
-            critic_1_loss = F.mse_loss(q1, target_value)
-            critic_2_loss = F.mse_loss(q2, target_value)
+                critic_1_opt.zero_grad()
+                critic_1_loss.backward()
+                critic_1_opt.step()
 
-            critic_1_opt.zero_grad()
-            critic_1_loss.backward()
-            critic_1_opt.step()
+                critic_2_opt.zero_grad()
+                critic_2_loss.backward()
+                critic_2_opt.step()
 
-            critic_2_opt.zero_grad()
-            critic_2_loss.backward()
-            critic_2_opt.step()
+                new_action, log_prob = actor.sample(states)
+                q1_new = critic_1(states, new_action)
+                q2_new = critic_2(states, new_action)
+                q_new = torch.min(q1_new, q2_new)
 
-            new_action, log_prob = actor.sample(states)
-            q1_new = critic_1(states, new_action)
-            q2_new = critic_2(states, new_action)
-            q_new = torch.min(q1_new, q2_new)
+                actor_loss = (alpha * log_prob - q_new).mean()
+                actor_opt.zero_grad()
+                actor_loss.backward()
+                actor_opt.step()
 
-            actor_loss = (alpha * log_prob - q_new).mean()
-            actor_opt.zero_grad()
-            actor_loss.backward()
-            actor_opt.step()
-
-            for tp, p in zip(target_critic_1.parameters(), critic_1.parameters()):
-                tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
-            for tp, p in zip(target_critic_2.parameters(), critic_2.parameters()):
-                tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
+                for tp, p in zip(target_critic_1.parameters(), critic_1.parameters()):
+                    tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
+                for tp, p in zip(target_critic_2.parameters(), critic_2.parameters()):
+                    tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
 
             if done:
+                last_truncated = bool(truncated)
                 break
 
-        print(f"[Episode {ep+1}] Total Reward: {total_reward:.2f}")
+        # 에피소드 종료 상태 메시지
+        if episode_success:
+            status = "성공"
+            success_count += 1
+        else:
+            if last_reason == "collision":
+                status = "실패(충돌)"
+            elif last_truncated:
+                status = "실패(시간초과)"
+            else:
+                status = "실패"
+
+        success_rate = 100.0 * (success_count / float(ep + 1))
+        print(f"[Episode {ep+1}] {status} | Return: {total_reward:.2f} | 성공률: {success_rate:.1f}%")
 
     print("Training Complete")
 
@@ -291,3 +316,4 @@ def sac_train(env,
         "critic_2_opt": critic_2_opt,
         "replay_buffer": buffer,
     }
+

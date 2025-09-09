@@ -64,13 +64,13 @@ class Vector2DEnv(gym.Env):
                  # === Anti-stall (no-progress penalty) ===
                  stall_penalty_use=True,       # 정체 패널티 켬/끔
                  stall_patience=10,            # 갱신 없을 때 허용 스텝 수
-                 stall_penalty_per_step=0.5,   # patience 이후 매 스텝 감점
-                 stall_improve_eps=1e-3,       # "개선"으로 인정할 최소 개선 폭
+                 stall_penalty_per_step=1.0,   # patience 이후 매 스텝 감점
+                 stall_improve_eps=0.3,       # "개선"으로 인정할 최소 개선 폭
                  stall_use_geodesic=True,      # 가능한 경우 지오데식 거리로 측정
 
                  # === Fixed map / start-goal ===
                  fixed_maze=True,
-                 fixed_agent_goal=True,
+                 fixed_agent_goal=False,
 
                  # === Seed ===
                  seed=None,
@@ -395,20 +395,13 @@ class Vector2DEnv(gym.Env):
 
     # ---------- Progress metric helper ----------
     def _progress_metric(self):
-        """
-        가능한 경우 지오데식 거리를 사용(더 '길 인식'에 맞음).
-        지오데식이 불가/무효이면 유클리드 거리로 대체.
-        값이 작을수록 목표에 가깝다.
-        """
         use_geo = self.stall_use_geodesic and self.geo_use and (self._geo_map is not None)
         if use_geo:
-            ar, ac = self._pos_to_geo_rc(self.agent_pos)
-            if 0 <= ar < self.geo_rows and 0 <= ac < self.geo_cols:
-                d = float(self._geo_map[ar, ac])
-                if self._geo_valid(d):
-                    return d
-        # fallback: Euclidean
-        return float(np.linalg.norm(self.goal_pos - self.agent_pos))
+            d = self._geo_distance_robust(self.agent_pos)
+            if d is not None:
+                return d
+
+        return self._geo_prev if self._geo_prev is not None else float(np.linalg.norm(self.goal_pos - self.agent_pos))
 
     # ---------- Observation ----------
     def _pack_observation(self):
@@ -457,6 +450,33 @@ class Vector2DEnv(gym.Env):
     def _geo_valid(self, d):
         return (d is not None) and np.isfinite(d) and (d < 1e17)
 
+    def _geo_distance_robust(self, p, max_search=2):
+        """
+        현재 위치 p에서 지오데식 값을 읽되, 현재 셀이 벽으로 간주되면
+        반경 max_search 내에서 가장 가까운(값이 가장 작은) 유효 셀의
+        지오데식 값을 반환. 없으면 None.
+        """
+        if self._geo_map is None:
+            return None
+        r, c = self._pos_to_geo_rc(p)
+        rows, cols = self.geo_rows, self.geo_cols
+
+        best = None
+        for rad in range(0, max_search + 1):
+            r0 = max(0, r - rad);
+            r1 = min(rows - 1, r + rad)
+            c0 = max(0, c - rad);
+            c1 = min(cols - 1, c + rad)
+            for rr in range(r0, r1 + 1):
+                for cc in range(c0, c1 + 1):
+                    d = float(self._geo_map[rr, cc])
+                    if self._geo_valid(d):
+                        if (best is None) or (d < best):
+                            best = d
+            if best is not None:
+                break
+        return best
+
     # ---------- Gym API ----------
     def reset(self, seed=None, options=None):
         options = options or {}
@@ -494,13 +514,19 @@ class Vector2DEnv(gym.Env):
                 self.goal_pos = maze_origin.copy()
             else:
                 gr, gc = free[self.rng.randrange(len(free))]
-                self.goal_pos = maze_origin + np.array([gc * maze_cell, gr * maze_cell], dtype=np.float32)
+                #self.goal_pos = maze_origin + np.array([gc * maze_cell, gr * maze_cell], dtype=np.float32)
+                goal_center = maze_origin + np.array([gc * maze_cell, gr * maze_cell], dtype=np.float32)
+                self.goal_pos = goal_center + (self.nprng.random(2) - 0.5) * maze_cell * 0.9
+
                 ar, ac = free[self.rng.randrange(len(free))]
                 tries = 0
                 while (ar == gr and ac == gc) and tries < 20:
                     ar, ac = free[self.rng.randrange(len(free))]
                     tries += 1
-                self.agent_pos = maze_origin + np.array([ac * maze_cell, ar * maze_cell], dtype=np.float32)
+                #self.agent_pos = maze_origin + np.array([ac * maze_cell, ar * maze_cell], dtype=np.float32)
+
+                agent_center = maze_origin + np.array([ac * maze_cell, ar * maze_cell], dtype=np.float32)
+                self.agent_pos = agent_center + (self.nprng.random(2) - 0.5) * maze_cell * 0.9
             if self.fixed_agent_goal:
                 self._fixed_agent_pos = self.agent_pos.copy()
                 self._fixed_goal_pos = self.goal_pos.copy()
@@ -585,8 +611,11 @@ class Vector2DEnv(gym.Env):
 
         # Geodesic shaping
         if self.geo_use and (self._geo_map is not None):
-            ar, ac = self._pos_to_geo_rc(self.agent_pos)
-            d_now = float(self._geo_map[ar, ac])
+            d_now = self._geo_distance_robust(self.agent_pos)
+            if d_now is None:
+                # 현재 셀이 벽으로 간주되어 유효한 값을 못 찾은 경우:
+                # 보상에 '점프'가 생기지 않도록 이전 값 유지(진행 없음으로 처리)
+                d_now = self._geo_prev
 
             if self._geo_valid(d_now):
                 if self.geo_mode == "from_start":
