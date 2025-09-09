@@ -9,7 +9,7 @@ new = 1  # 1: 새 학습, 0: 이어 학습
 ckpt_path = "sac_checkpoint.pth"
 actor_path = "sac_actor.pth"   # ✅ actor만 저장할 파일
 
-env = ENV.Vector2DEnv(collision_terminate=True,
+env = ENV.Vector2DEnv(collision_terminate=False,
             seed=1
         )
 
@@ -22,7 +22,7 @@ action_dim = env.action_space.shape[0]
 
 if new or not os.path.exists(ckpt_path):
     print("▶ 새로 학습 시작")
-    bundle = Model.sac_train(env, episodes=5000)
+    bundle = Model.sac_train(env, episodes=100)
 
     # 전체 체크포인트 저장
     Model.save_sac_checkpoint(
@@ -53,7 +53,7 @@ else:
         critic_1_opt=bundle["critic_1_opt"],
         critic_2_opt=bundle["critic_2_opt"],
         replay_buffer=bundle["replay_buffer"],
-        episodes=5000
+        episodes=10000
     )
 
     # 전체 체크포인트 저장

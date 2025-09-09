@@ -306,7 +306,7 @@ if __name__ == "__main__":
     from Model import GaussianPolicy, device
 
     actor_path = "sac_actor.pth"
-    env = ENV.Vector2DEnv(collision_terminate=True,seed=1)  # 필요 시 파라미터 조정
+    env = ENV.Vector2DEnv(collision_terminate=False,seed=1)  # 필요 시 파라미터 조정
 
     if not os.path.exists(actor_path):
         print(f"[WARN] {actor_path} 없음. 먼저 Test.py로 학습 후 저장하세요.")
