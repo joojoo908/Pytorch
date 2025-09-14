@@ -317,3 +317,85 @@ def sac_train(env,
         "replay_buffer": buffer,
     }
 
+
+# ====== BC(Behavior Cloning) utilities ======
+
+# import numpy as np
+# import torch
+# import torch.nn.functional as F
+# from torch import optim
+
+def expert_action_geodesic(env, speed_gain=0.8):
+    """
+    지오데식 맵을 내려가는 '전문가' 행동을 [-1,1]^2 액션으로 반환.
+    실패 시(맵 없음/INF)엔 목표 방향으로 fallback.
+    """
+    geo = getattr(env, "_geo_map", None)
+    if geo is None or not np.isfinite(geo).any():
+        vec = env.goal_pos - env.agent_pos
+    else:
+        r, c = env._pos_to_geo_rc(env.agent_pos)
+        rows, cols = geo.shape
+        best = (float(geo[r, c]) if np.isfinite(geo[r, c]) else np.inf, None)
+        N8 = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
+        for dr, dc in N8:
+            nr, nc = r+dr, c+dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                v = float(geo[nr, nc])
+                if np.isfinite(v) and v + 1e-6 < best[0]:
+                    best = (v, (nr, nc))
+        if best[1] is None:
+            vec = env.goal_pos - env.agent_pos
+        else:
+            nxt = env._geo_rc_to_world_center(best[1][0], best[1][1])
+            vec = nxt - env.agent_pos
+
+    ang = np.arctan2(vec[1], vec[0])            # [-pi, pi]
+    dist = np.linalg.norm(vec)
+    speed_norm = np.clip(speed_gain * dist / max(env.step_size, 1e-6), 0.0, 1.0)
+    a0 = np.clip(ang / np.pi, -1.0, 1.0)        # 각도 [-1,1]
+    a1 = 2.0 * speed_norm - 1.0                 # 속도 [-1,1]
+    return np.array([a0, a1], np.float32)
+
+def collect_bc_dataset(env, episodes=300, noise_std=0.05, max_steps=None):
+    """
+    전문가 정책으로 (obs, action) 쌍을 수집.
+    """
+    Xs, Ys = [], []
+    steps_limit = max_steps or getattr(env, "max_steps", 300)
+    for _ in range(episodes):
+        obs, _ = env.reset()
+        for _ in range(steps_limit):
+            a = expert_action_geodesic(env)
+            Xs.append(obs.astype(np.float32))
+            if noise_std > 0.0:
+                a = np.clip(a + np.random.normal(0, noise_std, size=a.shape), -1.0, 1.0)
+            Ys.append(a.astype(np.float32))
+            obs, _, term, trunc, _ = env.step(a)
+            if term or trunc:
+                break
+    return np.stack(Xs), np.stack(Ys)
+
+def bc_pretrain_actor(env, actor, dataset=None, epochs=10, batch_size=256, lr=3e-4):
+    """
+    actor의 mean을 tanh로 [-1,1]^2로 스케일한 후 MSE로 데모액션에 맞춤.
+    """
+    if dataset is None:
+        X, Y = collect_bc_dataset(env, episodes=300, noise_std=0.05)
+    else:
+        X, Y = dataset
+    actor.train()
+    opt = optim.Adam(actor.parameters(), lr=lr)
+    N = X.shape[0]
+    for _ in range(epochs):
+        perm = np.random.permutation(N)
+        for i in range(0, N, batch_size):
+            idx = perm[i:i+batch_size]
+            xb = torch.from_numpy(X[idx]).float().to(device)
+            yb = torch.from_numpy(Y[idx]).float().to(device)
+            out = actor.forward(xb)                  # (mean, std)
+            mean = out[0]
+            pred = torch.tanh(mean)                  # [-1,1]^2 (ENV 해석과 일치)
+            loss = F.mse_loss(pred, yb)
+            opt.zero_grad(); loss.backward(); opt.step()
+    return actor

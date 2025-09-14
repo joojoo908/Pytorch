@@ -306,7 +306,7 @@ if __name__ == "__main__":
     from Model import GaussianPolicy, device
 
     actor_path = "sac_actor.pth"
-    env = ENV.Vector2DEnv(collision_terminate=False,seed=1)  # 필요 시 파라미터 조정
+    env = ENV.Vector2DEnv(seed=1)  # 필요 시 파라미터 조정
 
     if not os.path.exists(actor_path):
         print(f"[WARN] {actor_path} 없음. 먼저 Test.py로 학습 후 저장하세요.")
@@ -321,7 +321,7 @@ if __name__ == "__main__":
 
     returns = run_multiple_evaluations(
         env, actor,
-        episodes=3, scale=22,
+        episodes=10, scale=22,
         visualize=HAS_PYGAME,
         visualize_every=1,
         wait=20, auto_quit=True,

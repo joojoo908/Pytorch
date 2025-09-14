@@ -5,11 +5,11 @@ import Model
 import torch
 import os
 
-new = 1  # 1: 새 학습, 0: 이어 학습
+new = 0  # 1: 새 학습, 0: 이어 학습
 ckpt_path = "sac_checkpoint.pth"
 actor_path = "sac_actor.pth"   # ✅ actor만 저장할 파일
 
-env = ENV.Vector2DEnv(collision_terminate=False,
+env = ENV.Vector2DEnv(
             seed=1
         )
 
@@ -19,10 +19,19 @@ print("사용 디바이스:", device)
 state_dim = env.observation_space.shape[0]
 action_dim = env.action_space.shape[0]
 
+env_bc = ENV.Vector2DEnv(
+    seed=1,
+    fixed_maze=True,            # 목표 분포에 맞춰 선택 (랜덤 맵이면 False)
+    collision_mode="revert",
+    collision_terminate=False,
+    geodesic_shaping=True, geodesic_grid=(512,512)
+)
+
+
 
 if new or not os.path.exists(ckpt_path):
     print("▶ 새로 학습 시작")
-    bundle = Model.sac_train(env, episodes=100)
+    bundle = Model.sac_train(env, episodes=300)
 
     # 전체 체크포인트 저장
     Model.save_sac_checkpoint(

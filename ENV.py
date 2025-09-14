@@ -33,7 +33,7 @@ class Vector2DEnv(gym.Env):
                  # === World / motion ===
                  map_range=12.8,
                  step_size=0.1,
-                 max_steps=700,
+                 max_steps=500,
                  success_radius=0.10,
                  player_size=(0.1, 0.1),
 
@@ -44,8 +44,8 @@ class Vector2DEnv(gym.Env):
                  maze_bar_max_len=6,
 
                  # === Collision ===
-                 collision_terminate=False,       # True면 충돌시 에피소드 종료
-                 collision_mode="revert",          # "slide" | "revert"
+                 collision_terminate=True,       # True면 충돌시 에피소드 종료
+                 collision_mode="slide",          # "slide" | "revert"
                  collision_penalty=0.3,           # 충돌(비종료) 시 즉시 감점
 
                  # === Observation ===
@@ -79,7 +79,7 @@ class Vector2DEnv(gym.Env):
 
                  # === Fixed map / start-goal ===
                  fixed_maze=True,
-                 fixed_agent_goal=True,
+                 fixed_agent_goal=False,
 
                  # === Seed ===
                  seed=None,
