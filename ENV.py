@@ -33,7 +33,7 @@ class Vector2DEnv(gym.Env):
                  # === World / motion ===
                  map_range=12.8,
                  step_size=0.1,
-                 max_steps=500,
+                 max_steps=700,
                  success_radius=0.10,
                  player_size=(0.1, 0.1),
 

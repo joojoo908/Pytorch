@@ -306,7 +306,22 @@ if __name__ == "__main__":
     from Model import GaussianPolicy, device
 
     actor_path = "sac_actor.pth"
-    env = ENV.Vector2DEnv(seed=1)  # 필요 시 파라미터 조정
+    env = ENV.Vector2DEnv(
+        seed=1,
+        fixed_maze=True,          # True: 고정 맵, False: 매 에피소드 새 맵
+        fixed_agent_goal=True,
+        geodesic_shaping=True,
+        geodesic_grid=(512, 512),
+        proximity_penalty=False,         # 벽 근접 억제
+        proximity_threshold=0.15,
+        proximity_coef=0.5,
+        stall_penalty_use=True,         # 정체 억제
+        stall_patience=8,
+        stall_penalty_per_step=1.0,
+        # 충돌 즉시 종료를 원치 않으면 False 유지
+        collision_terminate=False,
+        # ENV.py 현재 버전은 slide 기본 구현(축 분해)입니다.
+    )
 
     if not os.path.exists(actor_path):
         print(f"[WARN] {actor_path} 없음. 먼저 Test.py로 학습 후 저장하세요.")
