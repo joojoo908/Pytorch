@@ -120,17 +120,17 @@ def make_env(seed=1, fixed_maze=True):
     return ENV.Vector2DEnv(
         seed=seed,
         fixed_maze=fixed_maze,          # True: 고정 맵, False: 매 에피소드 새 맵
-        fixed_agent_goal=True,
+        fixed_agent_goal=False,
         geodesic_shaping=True,
         geodesic_grid=(512, 512),
         proximity_penalty=False,         # 벽 근접 억제
         proximity_threshold=0.15,
         proximity_coef=0.5,
         stall_penalty_use=True,         # 정체 억제
-        stall_patience=8,
+        stall_patience=5,
         stall_penalty_per_step=1.0,
         # 충돌 즉시 종료를 원치 않으면 False 유지
-        collision_terminate=False,
+        collision_terminate=True,
         # ENV.py 현재 버전은 slide 기본 구현(축 분해)입니다.
     )
 
@@ -142,10 +142,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--random-maps", action="store_true", help="랜덤 맵 분포에서 학습/데이터수집")
-    parser.add_argument("--bc-episodes", type=int, default=100, help="BC 데이터 수집 에피소드 수")
-    parser.add_argument("--bc-epochs", type=int, default=10, help="BC 사전학습 에폭 수")
+    parser.add_argument("--bc-episodes", type=int, default=2000, help="BC 데이터 수집 에피소드 수")
+    parser.add_argument("--bc-epochs", type=int, default=30, help="BC 사전학습 에폭 수")
     parser.add_argument("--bc-noise", type=float, default=0.05, help="BC 레이블 노이즈 표준편차")
-    parser.add_argument("--rl-episodes", type=int, default=200, help="SAC 학습 에피소드 수")
+    parser.add_argument("--rl-episodes", type=int, default=30000, help="SAC 학습 에피소드 수")
     parser.add_argument("--resume", action="store_true", help="체크포인트 이어 학습 (BC 건너뜀)")
     parser.add_argument("--ckpt-path", type=str, default="sac_checkpoint.pth")
     parser.add_argument("--actor-path", type=str, default="sac_actor.pth")
@@ -158,7 +158,7 @@ def main():
     # -----------------
     # 이어 학습 모드
     # -----------------
-    if 0 and os.path.exists(args.ckpt_path):
+    if 1 and os.path.exists(args.ckpt_path):
         print(f"[Resume] 체크포인트에서 이어 학습: {args.ckpt_path}")
         env = make_env(seed=args.seed, fixed_maze=fixed_maze)
 

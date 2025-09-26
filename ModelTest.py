@@ -309,7 +309,7 @@ if __name__ == "__main__":
     env = ENV.Vector2DEnv(
         seed=1,
         fixed_maze=True,          # True: 고정 맵, False: 매 에피소드 새 맵
-        fixed_agent_goal=True,
+        fixed_agent_goal=False,
         geodesic_shaping=True,
         geodesic_grid=(512, 512),
         proximity_penalty=False,         # 벽 근접 억제
@@ -319,7 +319,7 @@ if __name__ == "__main__":
         stall_patience=8,
         stall_penalty_per_step=1.0,
         # 충돌 즉시 종료를 원치 않으면 False 유지
-        collision_terminate=False,
+        collision_terminate=True,
         # ENV.py 현재 버전은 slide 기본 구현(축 분해)입니다.
     )
 
@@ -336,7 +336,7 @@ if __name__ == "__main__":
 
     returns = run_multiple_evaluations(
         env, actor,
-        episodes=10, scale=22,
+        episodes=3, scale=22,
         visualize=HAS_PYGAME,
         visualize_every=1,
         wait=20, auto_quit=True,

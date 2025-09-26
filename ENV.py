@@ -33,12 +33,12 @@ class Vector2DEnv(gym.Env):
                  # === World / motion ===
                  map_range=12.8,
                  step_size=0.1,
-                 max_steps=700,
+                 max_steps=1000,
                  success_radius=0.10,
                  player_size=(0.1, 0.1),
 
                  # === Maze (movement/collision) ===
-                 maze_cells=(11, 11),
+                 maze_cells=(7, 7),
                  maze_margin=0.2,
                  maze_variable_bars=False,
                  maze_bar_max_len=6,
@@ -49,7 +49,7 @@ class Vector2DEnv(gym.Env):
                  collision_penalty=0.3,           # 충돌(비종료) 시 즉시 감점
 
                  # === Observation ===
-                 obs_max_walls=100,
+                 obs_max_walls=30,
                  obs_with_extras=False,           # True면 추가 항목 포함(아래 참고)
 
                  # === Terminal reward ===
@@ -58,7 +58,7 @@ class Vector2DEnv(gym.Env):
                  # === Geodesic (distance/shaping) ===
                  geodesic_grid=(512, 512),        # geodesic-only grid resolution
                  geodesic_shaping=True,           # enable shaping
-                 geodesic_coef=1.0,               # shaping scale
+                 geodesic_coef=3.0,               # shaping scale
                  geodesic_positive_only=False,    # True: never penalize for getting farther
                  geodesic_clip=0.0,               # per-step clip for shaping increment (0=off)
                  geodesic_dilate_player=True,     # dilate walls by player half-size when rasterizing
