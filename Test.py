@@ -1,4 +1,4 @@
-# Test.py — BC(모방학습) 사전학습 + SAC 파인튜닝 + 이어학습(옵션)
+# Test.py — BC(모방학습) 사전학습 + SAC 파인튜닝 + 이어학습(α 자동튜닝 포함)
 # 사용 예시:
 #   1) BC 사전학습 후 RL 파인튜닝(고정 맵):
 #      python Test.py --bc-episodes 400 --bc-epochs 10 --rl-episodes 10000
@@ -129,9 +129,7 @@ def make_env(seed=1, fixed_maze=True):
         stall_penalty_use=True,         # 정체 억제
         stall_patience=5,
         stall_penalty_per_step=1.0,
-        # 충돌 즉시 종료를 원치 않으면 False 유지
         collision_terminate=True,
-        # ENV.py 현재 버전은 slide 기본 구현(축 분해)입니다.
     )
 
 # =========================
@@ -142,7 +140,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--random-maps", action="store_true", help="랜덤 맵 분포에서 학습/데이터수집")
-    parser.add_argument("--bc-episodes", type=int, default=2000, help="BC 데이터 수집 에피소드 수")
+    parser.add_argument("--bc-episodes", type=int, default=5000, help="BC 데이터 수집 에피소드 수")
     parser.add_argument("--bc-epochs", type=int, default=30, help="BC 사전학습 에폭 수")
     parser.add_argument("--bc-noise", type=float, default=0.05, help="BC 레이블 노이즈 표준편차")
     parser.add_argument("--rl-episodes", type=int, default=30000, help="SAC 학습 에피소드 수")
@@ -158,7 +156,7 @@ def main():
     # -----------------
     # 이어 학습 모드
     # -----------------
-    if 1 and os.path.exists(args.ckpt_path):
+    if 0 and os.path.exists(args.ckpt_path):
         print(f"[Resume] 체크포인트에서 이어 학습: {args.ckpt_path}")
         env = make_env(seed=args.seed, fixed_maze=fixed_maze)
 
@@ -166,7 +164,7 @@ def main():
         action_dim = env.action_space.shape[0]
         bundle = Model.load_sac_checkpoint(args.ckpt_path, state_dim, action_dim)
 
-        # 동일 분포의 환경으로 RL 진행
+        # 동일 분포의 환경으로 RL 진행 (+ α 상태 주입)
         bundle = Model.sac_train(
             env,
             actor=bundle["actor"],
@@ -177,17 +175,23 @@ def main():
             actor_opt=bundle["actor_opt"],
             critic_1_opt=bundle["critic_1_opt"],
             critic_2_opt=bundle["critic_2_opt"],
-            replay_buffer=bundle["replay_buffer"],   # 환경 규칙을 바꿨다면 버퍼는 새로 만드는 걸 권장
-            episodes=args.rl_episodes
+            replay_buffer=bundle["replay_buffer"],
+            episodes=args.rl_episodes,
+            log_alpha=bundle["log_alpha"],
+            alpha_opt=bundle["alpha_opt"],
+            target_entropy=bundle.get("target_entropy", -float(action_dim)),
         )
 
-        # 저장
+        # 저장 (α 상태 포함)
         Model.save_sac_checkpoint(
             args.ckpt_path,
             bundle["actor"], bundle["critic_1"], bundle["critic_2"],
             bundle["target_critic_1"], bundle["target_critic_2"],
             bundle["actor_opt"], bundle["critic_1_opt"], bundle["critic_2_opt"],
-            replay_buffer=bundle["replay_buffer"]
+            replay_buffer=bundle["replay_buffer"],
+            log_alpha=bundle["log_alpha"],
+            alpha_opt_state=bundle["alpha_opt"].state_dict(),
+            target_entropy=bundle.get("target_entropy", -float(action_dim)),
         )
         torch.save(bundle["actor"].state_dict(), args.actor_path)
         print(f"[Resume] 저장 완료: ckpt={args.ckpt_path}, actor={args.actor_path}")
@@ -196,7 +200,6 @@ def main():
     # -----------------
     # 신규: BC 사전학습 → SAC 파인튜닝
     # -----------------
-    # 1) 환경(분포 통일)
     env = make_env(seed=args.seed, fixed_maze=fixed_maze)
 
     # 2) (선택) 데모 로드 또는 수집
@@ -218,13 +221,16 @@ def main():
     # 4) RL 파인튜닝 (리플레이 버퍼는 새로 시작)
     bundle = Model.sac_train(env, actor=actor, episodes=args.rl_episodes)
 
-    # 5) 저장(전체 ckpt + actor만)
+    # 5) 저장(전체 ckpt + actor만) — α 상태 포함
     Model.save_sac_checkpoint(
         args.ckpt_path,
         bundle["actor"], bundle["critic_1"], bundle["critic_2"],
         bundle["target_critic_1"], bundle["target_critic_2"],
         bundle["actor_opt"], bundle["critic_1_opt"], bundle["critic_2_opt"],
-        replay_buffer=bundle["replay_buffer"]
+        replay_buffer=bundle["replay_buffer"],
+        log_alpha=bundle["log_alpha"],
+        alpha_opt_state=bundle["alpha_opt"].state_dict(),
+        target_entropy=bundle["target_entropy"],
     )
     torch.save(bundle["actor"].state_dict(), args.actor_path)
     print(f"[Done] 저장 완료: ckpt={args.ckpt_path}, actor={args.actor_path}")

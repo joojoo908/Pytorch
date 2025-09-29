@@ -1,4 +1,4 @@
-# Model.py — SAC (actor outputs in [-1,1]^2)
+# Model.py — SAC (actor outputs in [-1,1]^2) + Alpha Autotuning + CKPT compat
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -117,7 +117,11 @@ def save_sac_checkpoint(path,
                         actor, critic_1, critic_2,
                         target_critic_1, target_critic_2,
                         actor_opt, critic_1_opt, critic_2_opt,
-                        replay_buffer=None):
+                        replay_buffer=None,
+                        # === α 자동튜닝 상태(선택 저장, 하위호환) ===
+                        log_alpha=None,
+                        alpha_opt_state=None,
+                        target_entropy=None):
     ckpt = {
         "actor": actor.state_dict(),
         "critic_1": critic_1.state_dict(),
@@ -130,6 +134,27 @@ def save_sac_checkpoint(path,
     }
     if replay_buffer is not None:
         ckpt["replay_buffer"] = replay_buffer.state_dict()
+
+    # === 추가: α 상태 저장(있을 때만) ===
+    if log_alpha is not None:
+        try:
+            val = float(getattr(log_alpha, "detach", lambda: log_alpha)().cpu().item())  # tensor or scalar
+        except Exception:
+            # Fallback for plain float
+            try:
+                val = float(log_alpha)
+            except Exception:
+                val = None
+        if val is not None:
+            ckpt["log_alpha"] = val
+    if alpha_opt_state is not None:
+        ckpt["alpha_opt"] = alpha_opt_state
+    if target_entropy is not None:
+        try:
+            ckpt["target_entropy"] = float(target_entropy)
+        except Exception:
+            pass
+
     torch.save(ckpt, path)
 
 
@@ -144,7 +169,7 @@ def load_sac_checkpoint(path, state_dim, action_dim):
     critic_1_opt = optim.Adam(critic_1.parameters(), lr=3e-4)
     critic_2_opt = optim.Adam(critic_2.parameters(), lr=3e-4)
 
-    ckpt = torch.load(path, map_location=device,weights_only=False)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
 
     actor.load_state_dict(ckpt["actor"])
     critic_1.load_state_dict(ckpt["critic_1"])
@@ -160,6 +185,21 @@ def load_sac_checkpoint(path, state_dim, action_dim):
     if "replay_buffer" in ckpt:
         replay_buffer.load_state_dict(ckpt["replay_buffer"])
 
+    # === α 상태 복원(없으면 기본값) ===
+    if "log_alpha" in ckpt:
+        log_alpha = torch.tensor(float(ckpt["log_alpha"]), device=device, requires_grad=True)
+    else:
+        log_alpha = torch.tensor(np.log(0.2), device=device, requires_grad=True)
+
+    alpha_opt = optim.Adam([log_alpha], lr=3e-4)
+    if "alpha_opt" in ckpt:
+        try:
+            alpha_opt.load_state_dict(ckpt["alpha_opt"])
+        except Exception:
+            pass
+
+    target_entropy = ckpt.get("target_entropy", -float(action_dim))
+
     return {
         "actor": actor,
         "critic_1": critic_1,
@@ -170,6 +210,10 @@ def load_sac_checkpoint(path, state_dim, action_dim):
         "critic_1_opt": critic_1_opt,
         "critic_2_opt": critic_2_opt,
         "replay_buffer": replay_buffer,
+        # α
+        "log_alpha": log_alpha,
+        "alpha_opt": alpha_opt,
+        "target_entropy": target_entropy,
     }
 
 
@@ -179,7 +223,9 @@ def sac_train(env,
               target_critic_1=None, target_critic_2=None,
               actor_opt=None, critic_1_opt=None, critic_2_opt=None,
               replay_buffer=None,
-              episodes=500, batch_size=64, gamma=0.99, tau=0.005):
+              episodes=500, batch_size=64, gamma=0.99, tau=0.005,
+              # α 자동튜닝 상태 주입/생성
+              log_alpha=None, alpha_opt=None, target_entropy=None):
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -206,9 +252,16 @@ def sac_train(env,
 
     buffer = replay_buffer if (replay_buffer is not None) else ReplayBuffer()
 
-    alpha = 0.2  # 필요하면 자동 튜닝 추가 가능
+    # === α 자동튜닝 초기화 ===
+    if target_entropy is None:
+        target_entropy = -float(action_dim)
+    if log_alpha is None:
+        log_alpha = torch.tensor(np.log(0.2), device=device, requires_grad=True)
+    if alpha_opt is None:
+        alpha_opt = optim.Adam([log_alpha], lr=3e-4)
 
     success_count = 0  # 누적 성공 수
+    recent = deque(maxlen=100)
 
     for ep in range(episodes):
         state, _ = env.reset()
@@ -249,11 +302,13 @@ def sac_train(env,
                 next_states = torch.FloatTensor(next_states).to(device)
                 dones = torch.FloatTensor(dones).unsqueeze(1).to(device)
 
+                # ---------- Critic update ----------
                 with torch.no_grad():
-                    next_action, log_prob = actor.sample(next_states)
+                    next_action, log_prob_next = actor.sample(next_states)
                     target_q1 = target_critic_1(next_states, next_action)
                     target_q2 = target_critic_2(next_states, next_action)
-                    target_q = torch.min(target_q1, target_q2) - alpha * log_prob
+                    alpha_t = log_alpha.exp().detach()                   # 스칼라 텐서
+                    target_q = torch.min(target_q1, target_q2) - alpha_t * log_prob_next
                     target_value = rewards + gamma * (1 - dones) * target_q
 
                 q1 = critic_1(states, actions)
@@ -269,16 +324,26 @@ def sac_train(env,
                 critic_2_loss.backward()
                 critic_2_opt.step()
 
+                # ---------- Actor update ----------
                 new_action, log_prob = actor.sample(states)
                 q1_new = critic_1(states, new_action)
                 q2_new = critic_2(states, new_action)
                 q_new = torch.min(q1_new, q2_new)
 
-                actor_loss = (alpha * log_prob - q_new).mean()
+                alpha_now = log_alpha.exp().detach()
+                actor_loss = (alpha_now * log_prob - q_new).mean()
                 actor_opt.zero_grad()
                 actor_loss.backward()
                 actor_opt.step()
 
+                # ---------- α(temperature) update ----------
+                # J(α) = E[ α * (-logπ(a|s) - H_target) ]
+                alpha_loss = (log_alpha.exp() * (-log_prob - target_entropy).detach()).mean()
+                alpha_opt.zero_grad()
+                alpha_loss.backward()
+                alpha_opt.step()
+
+                # ---------- Soft target update ----------
                 for tp, p in zip(target_critic_1.parameters(), critic_1.parameters()):
                     tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
                 for tp, p in zip(target_critic_2.parameters(), critic_2.parameters()):
@@ -301,7 +366,17 @@ def sac_train(env,
                 status = "실패"
 
         success_rate = 100.0 * (success_count / float(ep + 1))
-        print(f"[Episode {ep+1}] {status} | Return: {total_reward:.2f} | 성공률: {success_rate:.1f}%")
+        try:
+            alpha_print = float(log_alpha.exp().detach().cpu().item())
+        except Exception:
+            alpha_print = float(np.exp(float(log_alpha)))
+        #print(f"[Episode {ep+1}] {status} | Return: {total_reward:.2f} | 성공률: {success_rate:.1f}% | alpha={alpha_print:.4f}")
+        recent.append(1 if episode_success else 0)
+        recent_rate = 100.0 * (sum(recent) / len(recent))
+
+        print(f"[Episode {ep + 1}] {status} | Return: {total_reward:.2f} "
+              f"| 누적성공률: {success_rate:.1f}% | 최근100: {recent_rate:.1f}% "
+              f"| alpha={log_alpha.exp().item():.4f}")
 
     print("Training Complete")
 
@@ -315,15 +390,14 @@ def sac_train(env,
         "critic_1_opt": critic_1_opt,
         "critic_2_opt": critic_2_opt,
         "replay_buffer": buffer,
+        # α 상태 반환
+        "log_alpha": log_alpha,
+        "alpha_opt": alpha_opt,
+        "target_entropy": target_entropy,
     }
 
 
 # ====== BC(Behavior Cloning) utilities ======
-
-# import numpy as np
-# import torch
-# import torch.nn.functional as F
-# from torch import optim
 
 def expert_action_geodesic(env, speed_gain=0.8):
     """
