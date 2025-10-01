@@ -124,8 +124,8 @@ def make_env(seed=1, fixed_maze=True):
         geodesic_shaping=True,
         geodesic_grid=(512, 512),
         proximity_penalty=False,         # 벽 근접 억제
-        proximity_threshold=0.15,
-        proximity_coef=0.5,
+        proximity_threshold=0.0,
+        proximity_coef=0.0,
         stall_penalty_use=True,         # 정체 억제
         stall_patience=5,
         stall_penalty_per_step=1.0,
@@ -140,10 +140,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--random-maps", action="store_true", help="랜덤 맵 분포에서 학습/데이터수집")
-    parser.add_argument("--bc-episodes", type=int, default=5000, help="BC 데이터 수집 에피소드 수")
-    parser.add_argument("--bc-epochs", type=int, default=30, help="BC 사전학습 에폭 수")
+    parser.add_argument("--bc-episodes", type=int, default=1000, help="BC 데이터 수집 에피소드 수")
+    parser.add_argument("--bc-epochs", type=int, default=15, help="BC 사전학습 에폭 수")
     parser.add_argument("--bc-noise", type=float, default=0.05, help="BC 레이블 노이즈 표준편차")
-    parser.add_argument("--rl-episodes", type=int, default=30000, help="SAC 학습 에피소드 수")
+    parser.add_argument("--rl-episodes", type=int, default=3000, help="SAC 학습 에피소드 수")
     parser.add_argument("--resume", action="store_true", help="체크포인트 이어 학습 (BC 건너뜀)")
     parser.add_argument("--ckpt-path", type=str, default="sac_checkpoint.pth")
     parser.add_argument("--actor-path", type=str, default="sac_actor.pth")
@@ -156,7 +156,7 @@ def main():
     # -----------------
     # 이어 학습 모드
     # -----------------
-    if 0 and os.path.exists(args.ckpt_path):
+    if 1 and os.path.exists(args.ckpt_path):
         print(f"[Resume] 체크포인트에서 이어 학습: {args.ckpt_path}")
         env = make_env(seed=args.seed, fixed_maze=fixed_maze)
 
@@ -200,7 +200,7 @@ def main():
     # -----------------
     # 신규: BC 사전학습 → SAC 파인튜닝
     # -----------------
-    env = make_env(seed=args.seed, fixed_maze=fixed_maze)
+    env = make_env(seed=args.seed, fixed_maze=fixed_maze,)
 
     # 2) (선택) 데모 로드 또는 수집
     if args.load_demo and os.path.exists(args.load_demo):
@@ -219,7 +219,7 @@ def main():
     actor = bc_pretrain_actor(env, actor, dataset=(X_demo, A_demo), epochs=args.bc_epochs, batch_size=256)
 
     # 4) RL 파인튜닝 (리플레이 버퍼는 새로 시작)
-    bundle = Model.sac_train(env, actor=actor, episodes=args.rl_episodes)
+    bundle = Model.sac_train(env, actor=actor, episodes=args.rl_episodes,start_steps=0,target_entropy=-1.0)
 
     # 5) 저장(전체 ckpt + actor만) — α 상태 포함
     Model.save_sac_checkpoint(

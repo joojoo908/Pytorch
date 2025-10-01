@@ -173,6 +173,9 @@ def evaluate_once(env, actor, max_steps=None, scale=20,
     obs, info = env.reset()
     actor.eval()
 
+    start_pos = np.array(env.agent_pos, dtype=np.float32).copy()
+    goal_pos = np.array(env.goal_pos, dtype=np.float32).copy()
+
     if max_steps is None:
         max_steps = getattr(env, "max_steps", 300)
 
@@ -252,6 +255,7 @@ def evaluate_once(env, actor, max_steps=None, scale=20,
 
             lines = [
                 f"Step: {step}/{max_steps} (남은 {remaining})",
+                f"Start: ({start_pos[0]:.3f}, {start_pos[1]:.3f})   Goal: ({goal_pos[0]:.3f}, {goal_pos[1]:.3f})",
                 f"Dist: {dist_to_goal:.3f}  (Yellow=descent hint, Green=agent path)"
             ]
             y = 5
@@ -273,8 +277,21 @@ def evaluate_once(env, actor, max_steps=None, scale=20,
         except Exception as e:
             print(f"[Warn] Failed to save trajectory: {e}")
 
-    print(f"[Eval] ep_ret={ep_ret:.3f}")
-    return ep_ret, screen_bundle
+    succ = bool(info.get("reward_terms", {}).get("success", 0))
+
+    # 보조 판정(시간초과/충돌/기타)
+    if succ:
+        outcome = "성공"
+    else:
+        if "truncated" in locals() and truncated:
+            outcome = "실패(시간초과)"
+        elif bool(info.get("collided", False)):
+            outcome = "실패(충돌)"
+        else:
+            outcome = "실패"
+
+    print(f"[Eval] {outcome} | ep_ret={ep_ret:.3f}")
+    return ep_ret, succ, outcome, screen_bundle
 
 
 def run_multiple_evaluations(env, actor, episodes=5,
@@ -285,15 +302,26 @@ def run_multiple_evaluations(env, actor, episodes=5,
     for ep in range(episodes):
         vis = visualize and ((ep % visualize_every) == 0)
         save_csv = (save_last_csv if (ep == episodes - 1) else None)
-        ret, screen_bundle = evaluate_once(
+
+        ret, succ, outcome, screen_bundle = evaluate_once(
             env, actor, max_steps=max_steps, scale=scale,
             screen_bundle=screen_bundle if vis else None,
             visualize=vis, save_csv_path=save_csv
         )
         returns.append(ret)
+        successes = successes + int(succ) if "successes" in locals() else int(succ)
         print(f"[Episode {ep+1}/{episodes}] return={ret:.3f}")
     if visualize and HAS_PYGAME and screen_bundle and auto_quit:
         import pygame; pygame.quit()
+
+    try:
+        avg_ret = float(np.mean(returns)) if len(returns) else 0.0
+    except Exception:
+        avg_ret = 0.0
+    total_succ = successes if "successes" in locals() else 0
+    print(
+        f"[Summary] Episodes={episodes}  Success={total_succ} ({100.0 * total_succ / max(1, episodes):.1f}%)  AvgReturn={avg_ret:.3f}")
+
     return returns
 
 
@@ -307,7 +335,7 @@ if __name__ == "__main__":
 
     actor_path = "sac_actor.pth"
     env = ENV.Vector2DEnv(
-        seed=1,
+        seed=0,success_radius=0.2,
         fixed_maze=True,          # True: 고정 맵, False: 매 에피소드 새 맵
         fixed_agent_goal=False,
         geodesic_shaping=True,
@@ -336,7 +364,7 @@ if __name__ == "__main__":
 
     returns = run_multiple_evaluations(
         env, actor,
-        episodes=3, scale=22,
+        episodes=30, scale=22,
         visualize=HAS_PYGAME,
         visualize_every=1,
         wait=20, auto_quit=True,
