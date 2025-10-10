@@ -1,134 +1,177 @@
-# Model.py — SAC + Alpha control (auto/fixed/clamp/freeze) + BC utils + CKPT compat
+# Model.py — SAC (+BC 사전학습 연동) with 성공률 기반 target_entropy 보정 & Early-Stop
+import os
+import math
+import random
+from collections import deque
+from typing import Optional, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-import random
-from collections import deque
-import numpy as np
+from torch import optim
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# =====================
-# Actor (Gaussian policy)
-# =====================
+
+# ======================================
+# 기본 네트워크
+# ======================================
+def mlp(sizes, act=nn.ReLU, out_act=None):
+    layers = []
+    for i in range(len(sizes) - 1):
+        layers += [nn.Linear(sizes[i], sizes[i + 1])]
+        if i < len(sizes) - 2:
+            layers += [act()]
+        elif out_act is not None:
+            layers += [out_act()]
+    return nn.Sequential(*layers)
+
+
 class GaussianPolicy(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    """
+    tanh-가우시안 정책.
+    sample(states) -> (action in [-1,1], log_prob (B,1))
+    forward(states) -> (mean, log_std)
+    """
+    def __init__(self, state_dim: int, action_dim: int, hidden=(256, 256)):
         super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(state_dim, 128), nn.ReLU(),
-            nn.Linear(128, 128), nn.ReLU(),
-        )
-        self.mean = nn.Linear(128, action_dim)
-        self.log_std = nn.Linear(128, action_dim)
+        self.net = mlp([state_dim] + list(hidden), nn.ReLU)
+        self.mu = nn.Linear(hidden[-1], action_dim)
+        self.log_std = nn.Linear(hidden[-1], action_dim)
+        self.LOG_STD_MIN = -20.0
+        self.LOG_STD_MAX = 2.0
 
-    def forward(self, x):
-        x = self.fc(x)
-        mean = self.mean(x)
-        log_std = self.log_std(x).clamp(-20, 2)
-        std = log_std.exp()
-        return mean, std
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.net(x)
+        mu = self.mu(h)
+        log_std = torch.clamp(self.log_std(h), self.LOG_STD_MIN, self.LOG_STD_MAX)
+        return mu, log_std
 
-    def sample(self, state):
-        mean, std = self.forward(state)
-        normal = torch.distributions.Normal(mean, std)
-        x_t = normal.rsample()  # reparameterization
-        y_t = torch.tanh(x_t)
-        action = y_t  # [-1,1]^2  (ENV 해석: angle, speed)
-        log_prob = normal.log_prob(x_t) - torch.log(1 - y_t.pow(2) + 1e-6)
-        log_prob = log_prob.sum(dim=1, keepdim=True)
-        return action, log_prob
+    @torch.no_grad()
+    def act(self, x: torch.Tensor) -> np.ndarray:
+        a, _ = self.sample(x.unsqueeze(0))
+        return a.cpu().numpy()[0]
 
-# =============
-# Critic (Twin)
-# =============
+    def sample(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        mu, log_std = self.forward(x)
+        std = torch.exp(log_std)
+        # reparameterization
+        eps = torch.randn_like(std)
+        pre_tanh = mu + eps * std
+        a = torch.tanh(pre_tanh)
+
+        # log_prob for tanh-squashed Gaussian (stable)
+        # log_prob(u) - sum(log(1 - tanh(u)^2))
+        log_prob_u = (-0.5 * ((pre_tanh - mu) / (std + 1e-8)) ** 2
+                      - log_std
+                      - 0.5 * math.log(2 * math.pi))
+        log_prob_u = log_prob_u.sum(dim=-1, keepdim=True)
+
+        # stable: log(1 - tanh(u)^2) = 2*(log(2) - u - softplus(-2u))
+        correction = 2.0 * (math.log(2.0) - pre_tanh - F.softplus(-2.0 * pre_tanh))
+        correction = correction.sum(dim=-1, keepdim=True)
+        log_prob = log_prob_u - correction
+        return a, log_prob
+
+
 class QNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    """Q(s,a)"""
+    def __init__(self, state_dim: int, action_dim: int, hidden=(256, 256)):
         super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(state_dim + action_dim, 128), nn.ReLU(),
-            nn.Linear(128, 128), nn.ReLU(),
-            nn.Linear(128, 1),
-        )
+        self.net = mlp([state_dim + action_dim] + list(hidden) + [1], nn.ReLU)
 
-    def forward(self, state, action):
-        if action.dim() == 3:
-            action = action.squeeze(1)
-        return self.fc(torch.cat([state, action], dim=1))
+    def forward(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([s, a], dim=-1)
+        return self.net(x)
 
-# =================
-# Replay Buffer (+ckpt)
-# =================
+
+# ======================================
+# 리플레이 버퍼
+# ======================================
 class ReplayBuffer:
-    def __init__(self, size=100000):
-        self.buffer = deque(maxlen=size)
+    def __init__(self, capacity: int = 1_000_000):
+        self.capacity = int(capacity)
+        self.ptr = 0
+        self.size = 0
+        self.s = []
+        self.a = []
+        self.r = []
+        self.ns = []
+        self.d = []
 
-    def push(self, *args):
-        self.buffer.append(tuple(args))
-
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-        return (
-            np.array(states),
-            np.array(actions),
-            np.array(rewards, dtype=np.float32),
-            np.array(next_states),
-            np.array(dones, dtype=np.float32),
-        )
+    def push(self, s, a, r, ns, done):
+        if self.size < self.capacity:
+            self.s.append(s)
+            self.a.append(a)
+            self.r.append(r)
+            self.ns.append(ns)
+            self.d.append(done)
+            self.size += 1
+        else:
+            i = self.ptr
+            self.s[i] = s
+            self.a[i] = a
+            self.r[i] = r
+            self.ns[i] = ns
+            self.d[i] = done
+        self.ptr = (self.ptr + 1) % self.capacity
 
     def __len__(self):
-        return len(self.buffer)
+        return self.size
 
-    # ---- serialization ----
-    def state_dict(self):
-        if len(self.buffer) == 0:
-            return {
-                "maxlen": self.buffer.maxlen,
-                "length": 0,
-                "states": None, "actions": None, "rewards": None,
-                "next_states": None, "dones": None,
-            }
-        states, actions, rewards, next_states, dones = zip(*self.buffer)
-        return {
-            "maxlen": self.buffer.maxlen,
-            "length": len(self.buffer),
-            "states": np.array(states),
-            "actions": np.array(actions),
-            "rewards": np.array(rewards, dtype=np.float32),
-            "next_states": np.array(next_states),
-            "dones": np.array(dones, dtype=np.float32),
-        }
+    def sample(self, batch: int):
+        idx = np.random.randint(0, self.size, size=batch)
+        s = np.array([self.s[i] for i in idx], dtype=np.float32)
+        a = np.array([self.a[i] for i in idx], dtype=np.float32)
+        r = np.array([self.r[i] for i in idx], dtype=np.float32)
+        ns = np.array([self.ns[i] for i in idx], dtype=np.float32)
+        d = np.array([self.d[i] for i in idx], dtype=np.float32)
+        return s, a, r, ns, d
 
-    def load_state_dict(self, d):
-        self.buffer = deque(maxlen=int(d.get("maxlen", 100000)))
-        length = int(d.get("length", 0))
-        if length == 0 or d.get("states") is None:
-            return
-        states = d["states"]
-        actions = d["actions"]
-        rewards = d["rewards"]
-        next_states = d["next_states"]
-        dones = d["dones"]
-        for i in range(length):
-            self.buffer.append((states[i], actions[i], float(rewards[i]), next_states[i], bool(dones[i])))
+    # ---- 직렬화/역직렬화 ----
+    def to_numpy_dict(self, limit: int = 200_000):
+        n = min(self.size, limit)
+        start = max(0, self.size - n)
+        return dict(
+            s=np.array(self.s[start:self.size], dtype=np.float32),
+            a=np.array(self.a[start:self.size], dtype=np.float32),
+            r=np.array(self.r[start:self.size], dtype=np.float32),
+            ns=np.array(self.ns[start:self.size], dtype=np.float32),
+            d=np.array(self.d[start:self.size], dtype=np.float32),
+        )
 
-# =====================
-# Checkpoint helpers
-# =====================
+    @staticmethod
+    def load_from_numpy_dict(data: dict, capacity: int = 1_000_000):
+        buf = ReplayBuffer(capacity)
+        if data is None:
+            return buf
+        S = data.get("s", None)
+        if S is None:
+            return buf
+        n = len(S)
+        for i in range(n):
+            buf.push(data["s"][i], data["a"][i], float(data["r"][i]), data["ns"][i], bool(data["d"][i]))
+        return buf
 
-def save_sac_checkpoint(path,
-                        actor, critic_1, critic_2,
-                        target_critic_1, target_critic_2,
-                        actor_opt, critic_1_opt, critic_2_opt,
-                        replay_buffer=None,
-                        # α 상태 (옵션)
-                        log_alpha=None,
-                        alpha_opt_state=None,
-                        target_entropy=None,
-                        alpha_mode=None,           # 'auto' | 'fixed'
-                        fixed_alpha=None):
-    ckpt = {
+
+# ======================================
+# 체크포인트 저장/로드
+# ======================================
+def save_sac_checkpoint(path: str,
+                        actor: nn.Module,
+                        critic_1: nn.Module, critic_2: nn.Module,
+                        target_critic_1: nn.Module, target_critic_2: nn.Module,
+                        actor_opt: optim.Optimizer,
+                        critic_1_opt: optim.Optimizer, critic_2_opt: optim.Optimizer,
+                        replay_buffer: Optional[ReplayBuffer] = None,
+                        log_alpha: Optional[torch.Tensor] = None,
+                        alpha_opt_state: Optional[dict] = None,
+                        target_entropy: Optional[float] = None,
+                        alpha_mode: Optional[str] = None,
+                        fixed_alpha: Optional[float] = None):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save({
         "actor": actor.state_dict(),
         "critic_1": critic_1.state_dict(),
         "critic_2": critic_2.state_dict(),
@@ -137,48 +180,22 @@ def save_sac_checkpoint(path,
         "actor_opt": actor_opt.state_dict(),
         "critic_1_opt": critic_1_opt.state_dict(),
         "critic_2_opt": critic_2_opt.state_dict(),
-    }
-    if replay_buffer is not None:
-        ckpt["replay_buffer"] = replay_buffer.state_dict()
-
-    # α 관련 (존재 시에만 저장 → 하위호환)
-    if log_alpha is not None:
-        try:
-            val = float(getattr(log_alpha, "detach", lambda: log_alpha)().cpu().item())
-        except Exception:
-            try:
-                val = float(log_alpha)
-            except Exception:
-                val = None
-        if val is not None:
-            ckpt["log_alpha"] = val
-    if alpha_opt_state is not None:
-        ckpt["alpha_opt"] = alpha_opt_state
-    if target_entropy is not None:
-        try:
-            ckpt["target_entropy"] = float(target_entropy)
-        except Exception:
-            pass
-    if alpha_mode is not None:
-        ckpt["alpha_mode"] = str(alpha_mode)
-    if fixed_alpha is not None:
-        ckpt["fixed_alpha"] = float(fixed_alpha)
-
-    torch.save(ckpt, path)
+        "replay": (replay_buffer.to_numpy_dict() if replay_buffer is not None else None),
+        "log_alpha": (float(log_alpha.detach().cpu().item()) if log_alpha is not None else None),
+        "alpha_opt": alpha_opt_state,
+        "target_entropy": (float(target_entropy) if target_entropy is not None else None),
+        "alpha_mode": alpha_mode,
+        "fixed_alpha": (None if fixed_alpha is None else float(fixed_alpha)),
+    }, path)
 
 
-def load_sac_checkpoint(path, state_dim, action_dim):
+def load_sac_checkpoint(path: str, state_dim: int, action_dim: int):
+    ckpt = torch.load(path, map_location=device)
     actor = GaussianPolicy(state_dim, action_dim).to(device)
     critic_1 = QNetwork(state_dim, action_dim).to(device)
     critic_2 = QNetwork(state_dim, action_dim).to(device)
     target_critic_1 = QNetwork(state_dim, action_dim).to(device)
     target_critic_2 = QNetwork(state_dim, action_dim).to(device)
-
-    actor_opt = optim.Adam(actor.parameters(), lr=3e-4)
-    critic_1_opt = optim.Adam(critic_1.parameters(), lr=3e-4)
-    critic_2_opt = optim.Adam(critic_2.parameters(), lr=3e-4)
-
-    ckpt = torch.load(path, map_location=device, weights_only=False)
 
     actor.load_state_dict(ckpt["actor"])
     critic_1.load_state_dict(ckpt["critic_1"])
@@ -186,28 +203,29 @@ def load_sac_checkpoint(path, state_dim, action_dim):
     target_critic_1.load_state_dict(ckpt["target_critic_1"])
     target_critic_2.load_state_dict(ckpt["target_critic_2"])
 
-    actor_opt.load_state_dict(ckpt["actor_opt"])
-    critic_1_opt.load_state_dict(ckpt["critic_1_opt"])
-    critic_2_opt.load_state_dict(ckpt["critic_2_opt"])
+    actor_opt = optim.Adam(actor.parameters(), lr=3e-4)
+    critic_1_opt = optim.Adam(critic_1.parameters(), lr=3e-4)
+    critic_2_opt = optim.Adam(critic_2.parameters(), lr=3e-4)
+    if ckpt.get("actor_opt") is not None:
+        actor_opt.load_state_dict(ckpt["actor_opt"])
+    if ckpt.get("critic_1_opt") is not None:
+        critic_1_opt.load_state_dict(ckpt["critic_1_opt"])
+    if ckpt.get("critic_2_opt") is not None:
+        critic_2_opt.load_state_dict(ckpt["critic_2_opt"])
 
-    replay_buffer = ReplayBuffer(size=ckpt.get("replay_buffer", {}).get("maxlen", 100000))
-    if "replay_buffer" in ckpt:
-        replay_buffer.load_state_dict(ckpt["replay_buffer"])
+    replay = ReplayBuffer.load_from_numpy_dict(ckpt.get("replay"))
 
-    # α 복원(없으면 기본)
-    if "log_alpha" in ckpt:
-        log_alpha = torch.tensor(float(ckpt["log_alpha"]), device=device, requires_grad=True)
-    else:
+    # α 상태 복구
+    la = ckpt.get("log_alpha")
+    if la is None:
         log_alpha = torch.tensor(np.log(0.2), device=device, requires_grad=True)
+    else:
+        log_alpha = torch.tensor(float(la), device=device, requires_grad=True)
     alpha_opt = optim.Adam([log_alpha], lr=3e-4)
-    if "alpha_opt" in ckpt:
-        try:
-            alpha_opt.load_state_dict(ckpt["alpha_opt"])
-        except Exception:
-            pass
-    target_entropy = ckpt.get("target_entropy", -float(action_dim))
+    if ckpt.get("alpha_opt") is not None:
+        alpha_opt.load_state_dict(ckpt["alpha_opt"])
 
-    # 선택적 모드/값
+    target_entropy = ckpt.get("target_entropy", None)
     alpha_mode = ckpt.get("alpha_mode", "auto")
     fixed_alpha = ckpt.get("fixed_alpha", None)
 
@@ -220,8 +238,7 @@ def load_sac_checkpoint(path, state_dim, action_dim):
         "actor_opt": actor_opt,
         "critic_1_opt": critic_1_opt,
         "critic_2_opt": critic_2_opt,
-        "replay_buffer": replay_buffer,
-        # α 상태 반환
+        "replay_buffer": replay,
         "log_alpha": log_alpha,
         "alpha_opt": alpha_opt,
         "target_entropy": target_entropy,
@@ -229,27 +246,34 @@ def load_sac_checkpoint(path, state_dim, action_dim):
         "fixed_alpha": fixed_alpha,
     }
 
-# =====================
-# SAC Train (with α controls)
-# =====================
+
+# ======================================
+# SAC 학습 (성공률 기반 target_entropy 보정 + Early Stop)
+# ======================================
 def sac_train(env,
               actor=None,
               critic_1=None, critic_2=None,
               target_critic_1=None, target_critic_2=None,
               actor_opt=None, critic_1_opt=None, critic_2_opt=None,
-              replay_buffer=None,
+              replay_buffer: Optional[ReplayBuffer] = None,
               episodes=500, batch_size=64, gamma=0.99, tau=0.005,
-              # α 자동튜닝 상태 주입/생성
-              log_alpha=None, alpha_opt=None, target_entropy=None,
-              # α 제어 옵션
+              # α 자동튜닝 상태
+              log_alpha: Optional[torch.Tensor] = None,
+              alpha_opt: Optional[optim.Optimizer] = None,
+              target_entropy: Optional[float] = None,
+              # α 제어
               auto_alpha=True, fixed_alpha=None,
               alpha_min=0.03, alpha_max=0.30,
-              freeze_alpha_success=None,
-              # ▼▼ B안: 성공률→target_entropy 제어 옵션 추가 ▼▼
-              success_target=0.90,  # 목표 성공률(0~1)
-              te_lr=0.30,  # target_entropy 보정 속도(작게 시작)
-              te_min=None,  # 하한(기본: -2*action_dim)
-              te_max=None):  # 상한(기본: 0.0)
+              freeze_alpha_success: Optional[float] = None,
+              # Early-Stop 옵션
+              early_stop_success: Optional[float] = None,
+              early_stop_patience: int = 3,
+              early_stop_min_episodes: int = 300,
+              # B안: 성공률 → target_entropy 보정
+              success_target=0.90,
+              te_lr=0.30,
+              te_min: Optional[float] = None,
+              te_max: Optional[float] = None):
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -272,7 +296,6 @@ def sac_train(env,
     actor_opt = actor_opt or optim.Adam(actor.parameters(), lr=3e-4)
     critic_1_opt = critic_1_opt or optim.Adam(critic_1.parameters(), lr=3e-4)
     critic_2_opt = critic_2_opt or optim.Adam(critic_2.parameters(), lr=3e-4)
-
     buffer = replay_buffer if (replay_buffer is not None) else ReplayBuffer()
 
     # α 자동튜닝 기본값
@@ -283,12 +306,14 @@ def sac_train(env,
     if alpha_opt is None:
         alpha_opt = optim.Adam([log_alpha], lr=3e-4)
 
-    # 성공률 기반 α 고정
+    # 성공률/알파 상태
     recent_success = deque(maxlen=100)
     alpha_frozen = False
+    _early_stop_streak = 0
 
-    te_min = -3.0 * float(action_dim) if te_min is None else float(te_min)
-    te_max = -0.1 * float(action_dim) if te_max is None else float(te_max)
+    # B안: te 범위
+    te_min = (-2.0 * float(action_dim)) if te_min is None else float(te_min)
+    te_max = (-0.05 * float(action_dim)) if te_max is None else float(te_max)
     success_target = float(success_target)
     te_lr = float(te_lr)
 
@@ -302,7 +327,7 @@ def sac_train(env,
 
     success_count = 0
 
-    for ep in range(episodes):
+    for ep in range(int(episodes)):
         state, _ = env.reset()
         state = torch.as_tensor(np.array(state), dtype=torch.float32, device=device)
         total_reward = 0.0
@@ -317,9 +342,9 @@ def sac_train(env,
             action_np = action.cpu().numpy()[0]
 
             next_state, reward, terminated, truncated, info = env.step(action_np)
-            done = terminated or truncated
+            done = bool(terminated or truncated)
 
-            # 종료 원인 파악
+            # 종료 사유 기록
             if isinstance(info, dict):
                 terms = info.get("reward_terms") or {}
                 if terms.get("success", 0):
@@ -328,7 +353,7 @@ def sac_train(env,
                 elif terms.get("collision_reset", False):
                     last_reason = "collision"
 
-            buffer.push(state.cpu().numpy(), action_np, reward, next_state, done)
+            buffer.push(state.cpu().numpy(), action_np, float(reward), np.array(next_state), done)
 
             state = torch.as_tensor(np.array(next_state), dtype=torch.float32, device=device)
             total_reward += float(reward)
@@ -341,22 +366,21 @@ def sac_train(env,
                 next_states = torch.as_tensor(next_states, dtype=torch.float32, device=device)
                 dones = torch.as_tensor(dones, dtype=torch.float32, device=device).unsqueeze(1)
 
-                # 현재 α 값 (모드에 따라)
                 a_val = current_alpha_value()
-                alpha_tensor = torch.as_tensor(a_val, device=device)
+                alpha_tensor = torch.as_tensor(a_val, dtype=torch.float32, device=device)
 
                 # ---- Critic update ----
                 with torch.no_grad():
                     next_action, log_prob_next = actor.sample(next_states)
-                    target_q1 = target_critic_1(next_states, next_action)
-                    target_q2 = target_critic_2(next_states, next_action)
-                    target_q = torch.min(target_q1, target_q2) - alpha_tensor * log_prob_next
-                    target_value = rewards + gamma * (1 - dones) * target_q
+                    tq1 = target_critic_1(next_states, next_action)
+                    tq2 = target_critic_2(next_states, next_action)
+                    target_q = torch.min(tq1, tq2) - alpha_tensor * log_prob_next
+                    target_v = rewards + gamma * (1.0 - dones) * target_q
 
                 q1 = critic_1(states, actions)
                 q2 = critic_2(states, actions)
-                critic_1_loss = F.mse_loss(q1, target_value)
-                critic_2_loss = F.mse_loss(q2, target_value)
+                critic_1_loss = F.mse_loss(q1, target_v)
+                critic_2_loss = F.mse_loss(q2, target_v)
 
                 critic_1_opt.zero_grad(); critic_1_loss.backward(); critic_1_opt.step()
                 critic_2_opt.zero_grad(); critic_2_loss.backward(); critic_2_opt.step()
@@ -369,17 +393,17 @@ def sac_train(env,
                 actor_loss = (alpha_tensor * log_prob - q_new).mean()
                 actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
 
-                # ---- α update (auto 모드일 때만) ----
+                # ---- α update ----
                 if auto_alpha and not alpha_frozen:
-                    # J(α) = E[ α * (-logπ - H_target) ]
                     alpha_loss = (log_alpha.exp() * (-log_prob - target_entropy).detach()).mean()
                     alpha_opt.zero_grad(); alpha_loss.backward(); alpha_opt.step()
 
                 # ---- Polyak ----
-                for tp, p in zip(target_critic_1.parameters(), critic_1.parameters()):
-                    tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
-                for tp, p in zip(target_critic_2.parameters(), critic_2.parameters()):
-                    tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
+                with torch.no_grad():
+                    for tp, p in zip(target_critic_1.parameters(), critic_1.parameters()):
+                        tp.data.mul_(1 - tau).add_(tau * p.data)
+                    for tp, p in zip(target_critic_2.parameters(), critic_2.parameters()):
+                        tp.data.mul_(1 - tau).add_(tau * p.data)
 
             if done:
                 last_truncated = bool(truncated)
@@ -392,17 +416,19 @@ def sac_train(env,
             status = "실패(충돌)" if last_reason == "collision" else ("실패(시간초과)" if last_truncated else "실패")
 
         recent_success.append(1 if episode_success else 0)
-        # --- 성공률 기반 target_entropy 보정 ---  <-- [추가]
-        if auto_alpha and not alpha_frozen and (len(recent_success) == recent_success.maxlen):
-            rec_frac = sum(recent_success) / len(recent_success)  # 0~1, 분모는 len(...)
-            delta = te_lr * (success_target - rec_frac)  # 부호 수정!
+
+        # --- 성공률 기반 target_entropy 보정 (B안) ---
+        if len(recent_success) >= 20:
+            rec_frac = (sum(recent_success) / recent_success.maxlen) if (recent_success.maxlen > 0) else 0.0
+            delta = te_lr * (rec_frac - success_target)
             target_entropy = float(np.clip(target_entropy + delta, te_min, te_max))
 
         success_rate = 100.0 * (success_count / float(ep + 1))
-        recent_rate = 100.0 * (sum(recent_success) / recent_success.maxlen)
+        recent_rate = 100.0 * (sum(recent_success) / max(1, recent_success.maxlen))
 
         a_print = current_alpha_value()
-        print(f"[Episode {ep + 1}] {status} | Return: {total_reward:.2f} | 누적성공률: {success_rate:.1f}% | 최근100: {recent_rate:.1f}% | alpha={a_print:.4f}")
+        print(f"[Episode {ep + 1}] {status} | Return: {total_reward:.2f} | "
+              f"누적성공률: {success_rate:.1f}% | 최근100: {recent_rate:.1f}% | alpha={a_print:.4f}")
 
         # 성공률 임계치 넘으면 α 고정
         if (freeze_alpha_success is not None) and (len(recent_success) == recent_success.maxlen) and auto_alpha and not alpha_frozen:
@@ -412,6 +438,22 @@ def sac_train(env,
                 alpha_frozen = True
                 auto_alpha = False
                 print(f"[α-freeze] success_rate={sr:.2f}  fixed_alpha={fixed_alpha:.4f}")
+
+        # --- Early Stop: 최근 성공률이 임계치 이상을 연속으로 만족하면 종료 ---
+        if (early_stop_success is not None
+            and (ep + 1) >= int(early_stop_min_episodes)
+            and len(recent_success) == recent_success.maxlen):
+            rec_frac = sum(recent_success) / recent_success.maxlen  # 0~1
+            if rec_frac >= float(early_stop_success):
+                _early_stop_streak += 1
+            else:
+                _early_stop_streak = 0
+
+            if _early_stop_streak >= int(early_stop_patience):
+                print(f"[EarlyStop] 최근{recent_success.maxlen} 성공률 {rec_frac*100:.1f}% "
+                      f"≥ {100*float(early_stop_success):.0f}% 를 "
+                      f"{early_stop_patience}회 연속 달성 → 학습 종료.")
+                break
 
     print("Training Complete")
 
@@ -432,76 +474,3 @@ def sac_train(env,
         "alpha_mode": ("auto" if (auto_alpha and not alpha_frozen) else "fixed"),
         "fixed_alpha": fixed_alpha,
     }
-
-# =====================
-# BC (Behavior Cloning)
-# =====================
-
-def expert_action_geodesic(env, speed_gain=0.8):
-    """지오데식 맵을 따라가는 간단 전문가 행동을 [-1,1]^2로 생성."""
-    geo = getattr(env, "_geo_map", None)
-    if geo is None or not np.isfinite(geo).any():
-        vec = env.goal_pos - env.agent_pos
-    else:
-        r, c = env._pos_to_geo_rc(env.agent_pos)
-        rows, cols = geo.shape
-        best = (float(geo[r, c]) if np.isfinite(geo[r, c]) else np.inf, None)
-        N8 = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
-        for dr, dc in N8:
-            nr, nc = r+dr, c+dc
-            if 0 <= nr < rows and 0 <= nc < cols:
-                v = float(geo[nr, nc])
-                if np.isfinite(v) and v + 1e-6 < best[0]:
-                    best = (v, (nr, nc))
-        if best[1] is None:
-            vec = env.goal_pos - env.agent_pos
-        else:
-            nxt = env._geo_rc_to_world_center(best[1][0], best[1][1])
-            vec = nxt - env.agent_pos
-
-    ang = np.arctan2(vec[1], vec[0])
-    dist = np.linalg.norm(vec)
-    speed_norm = np.clip(speed_gain * dist / max(getattr(env, "step_size", 1.0), 1e-6), 0.0, 1.0)
-    a0 = np.clip(ang / np.pi, -1.0, 1.0)  # angle in [-1,1]
-    a1 = 2.0 * speed_norm - 1.0           # speed in [-1,1]
-    return np.array([a0, a1], np.float32)
-
-
-def collect_bc_dataset(env, episodes=300, noise_std=0.05, max_steps=None):
-    """전문가 정책으로 (obs, action) 쌍 수집."""
-    Xs, Ys = [], []
-    steps_limit = max_steps or getattr(env, "max_steps", 300)
-    for _ in range(episodes):
-        obs, _ = env.reset()
-        for _ in range(steps_limit):
-            a = expert_action_geodesic(env)
-            Xs.append(obs.astype(np.float32))
-            if noise_std > 0.0:
-                a = np.clip(a + np.random.normal(0, noise_std, size=a.shape), -1.0, 1.0)
-            Ys.append(a.astype(np.float32))
-            obs, _, term, trunc, _ = env.step(a)
-            if term or trunc:
-                break
-    return np.stack(Xs), np.stack(Ys)
-
-
-def bc_pretrain_actor(env, actor, dataset=None, epochs=10, batch_size=256, lr=3e-4):
-    """actor의 mean을 tanh로 스케일해 데모 액션을 MSE로 모방."""
-    if dataset is None:
-        X, Y = collect_bc_dataset(env, episodes=300, noise_std=0.05)
-    else:
-        X, Y = dataset
-    actor.train()
-    opt = optim.Adam(actor.parameters(), lr=lr)
-    N = X.shape[0]
-    for _ in range(epochs):
-        perm = np.random.permutation(N)
-        for i in range(0, N, batch_size):
-            idx = perm[i:i+batch_size]
-            xb = torch.from_numpy(X[idx]).float().to(device)
-            yb = torch.from_numpy(Y[idx]).float().to(device)
-            mean, _ = actor.forward(xb)
-            pred = torch.tanh(mean)
-            loss = F.mse_loss(pred, yb)
-            opt.zero_grad(); loss.backward(); opt.step()
-    return actor

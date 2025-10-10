@@ -22,24 +22,31 @@ CONFIG = SimpleNamespace(
     random_maps=False,  # True면 랜덤 맵에서 수집/학습, False면 고정 맵
 
     # BC 설정
-    bc_episodes=600,
+    bc_episodes=800,
     bc_epochs=10,
     bc_noise=0.05,
 
     # RL 설정
-    rl_episodes=12000,
+    rl_episodes=10000,
     target_entropy=-2.0,  # 연속 2D 액션이면 -2.0 권장
 
     # α 제어
     auto_alpha=True,          # True면 자동튜닝 (fixed_alpha가 None일 때 권장)
     fixed_alpha=None,         # 고정하고 싶으면 예: 0.18 (지정 시 auto_alpha는 무시됨)
     alpha_min=0.03,
-    alpha_max=0.70,
+    alpha_max=1.50,
     freeze_alpha_success=None,  # 최근100 성공률이 이 값 이상이면 α 그 시점에 고정
-    success_target=0.75,   # 목표 성공률(0~1) 권장 시작값: 0.6~0.8
-    te_lr=0.08,            # 보정 속도(너무 크면 진동) 권장: 0.05~0.10
+
+    # B안: 성공률 → target_entropy 보정
+    success_target=0.80,   # 목표 성공률(0~1)
+    te_lr=0.08,            # 보정 속도(너무 크면 진동)
     te_min=None,           # 기본: -2*action_dim
-    te_max=None,           # 기본: 0.0
+    te_max=None,           # 기본: -0.05*action_dim
+
+    # Early Stop 옵션
+    early_stop_success=0.98,      # 최근100 성공률 80% 이상이면
+    early_stop_patience=3,        # 3회 연속 만족 시 종료
+    early_stop_min_episodes=1000,  # 300 에피소드부터 체크 시작
 
     # 체크포인트/데모
     resume=False,
@@ -52,7 +59,6 @@ CONFIG = SimpleNamespace(
 # =========================
 # BC(Behavior Cloning) 유틸
 # =========================
-
 def expert_action_geodesic(env, speed_gain=0.8):
     """지오데식 맵을 '내려가는' 전문가 정책. 반환: [-1,1]^2 액션"""
     geo = getattr(env, "_geo_map", None)
@@ -131,10 +137,10 @@ def bc_pretrain_actor(env, actor, dataset=None, epochs=10, batch_size=256, lr=3e
         print(f"[BC] epoch {ep+1}/{epochs}  loss={tot/N:.4f}")
     return actor
 
+
 # =========================
 # 환경 생성
 # =========================
-
 def make_env(seed=1, fixed_maze=True):
     return ENV.Vector2DEnv(
         seed=seed,
@@ -151,10 +157,10 @@ def make_env(seed=1, fixed_maze=True):
         collision_terminate=True,
     )
 
+
 # =========================
 # 인자 병합 로직
 # =========================
-
 def parse_or_config():
     """USE_CODE_CONFIG=True면 CONFIG를 Namespace로 반환. 아니면 argparse 사용."""
     if USE_CODE_CONFIG:
@@ -187,6 +193,8 @@ def parse_or_config():
     parser.add_argument("--alpha-max", type=float, default=CONFIG.alpha_max)
     parser.add_argument("--freeze-alpha-success", type=float, default=CONFIG.freeze_alpha_success,
                         help="최근100 성공률이 이 값 이상이면 α 고정")
+
+    # B안 파라미터
     parser.add_argument("--success-target", type=float, default=CONFIG.success_target,
                         help="최근 성공률 목표(0~1), 목표보다 낮으면 탐색↑")
     parser.add_argument("--te-lr", type=float, default=CONFIG.te_lr,
@@ -194,7 +202,12 @@ def parse_or_config():
     parser.add_argument("--te-min", type=float, default=CONFIG.te_min,
                         help="target_entropy 하한(기본: -2*action_dim)")
     parser.add_argument("--te-max", type=float, default=CONFIG.te_max,
-                        help="target_entropy 상한(기본: 0.0)")
+                        help="target_entropy 상한(기본: -0.05*action_dim)")
+
+    # Early Stop
+    parser.add_argument("--early-stop-success", type=float, default=CONFIG.early_stop_success)
+    parser.add_argument("--early-stop-patience", type=int,   default=CONFIG.early_stop_patience)
+    parser.add_argument("--early-stop-min-episodes", type=int, default=CONFIG.early_stop_min_episodes)
 
     # 체크포인트
     parser.add_argument("--resume", action="store_true", default=CONFIG.resume,
@@ -212,10 +225,10 @@ def parse_or_config():
         args.auto_alpha = False
     return args
 
+
 # =========================
 # 메인 실행
 # =========================
-
 def main():
     args = parse_or_config()
 
@@ -250,12 +263,17 @@ def main():
             episodes=args.rl_episodes,
             log_alpha=bundle["log_alpha"],
             alpha_opt=bundle["alpha_opt"],
-            target_entropy=(args.target_entropy if args.target_entropy is not None else bundle.get("target_entropy", -float(action_dim))),
+            target_entropy=(args.target_entropy if args.target_entropy is not None else bundle.get("target_entropy")),
             auto_alpha=auto_alpha,
             fixed_alpha=fixed_alpha,
             alpha_min=args.alpha_min,
             alpha_max=args.alpha_max,
             freeze_alpha_success=args.freeze_alpha_success,
+            # Early Stop
+            early_stop_success=args.early_stop_success,
+            early_stop_patience=args.early_stop_patience,
+            early_stop_min_episodes=args.early_stop_min_episodes,
+            # B안
             success_target=args.success_target,
             te_lr=args.te_lr,
             te_min=args.te_min,
@@ -270,7 +288,7 @@ def main():
             replay_buffer=bundle["replay_buffer"],
             log_alpha=bundle["log_alpha"],
             alpha_opt_state=bundle["alpha_opt"].state_dict(),
-            target_entropy=bundle.get("target_entropy", -float(action_dim)),
+            target_entropy=bundle.get("target_entropy"),
             alpha_mode=bundle.get("alpha_mode"),
             fixed_alpha=bundle.get("fixed_alpha"),
         )
@@ -312,6 +330,11 @@ def main():
         alpha_min=args.alpha_min,
         alpha_max=args.alpha_max,
         freeze_alpha_success=args.freeze_alpha_success,
+        # Early Stop
+        early_stop_success=args.early_stop_success,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_min_episodes=args.early_stop_min_episodes,
+        # B안
         success_target=args.success_target,
         te_lr=args.te_lr,
         te_min=args.te_min,

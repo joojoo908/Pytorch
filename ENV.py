@@ -38,7 +38,7 @@ class Vector2DEnv(gym.Env):
                  player_size=(0.1, 0.1),
 
                  # === Maze (movement/collision) ===
-                 maze_cells=(5, 5),
+                 maze_cells=(7, 7),
                  maze_margin=0.2,
                  maze_variable_bars=False,
                  maze_bar_max_len=6,

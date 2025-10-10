@@ -335,7 +335,7 @@ if __name__ == "__main__":
 
     actor_path = "sac_actor.pth"
     env = ENV.Vector2DEnv(
-        seed=0,success_radius=0.2,
+        seed=1,success_radius=0.2,
         fixed_maze=True,          # True: 고정 맵, False: 매 에피소드 새 맵
         fixed_agent_goal=False,
         geodesic_shaping=True,
