@@ -38,13 +38,13 @@ class Vector2DEnv(gym.Env):
                  player_size=(0.1, 0.1),
 
                  # === Maze (movement/collision) ===
-                 maze_cells=(7, 7),
+                 maze_cells=(11, 11),
                  maze_margin=0.2,
                  maze_variable_bars=False,
                  maze_bar_max_len=6,
 
                  # === Collision ===
-                 collision_terminate=True,       # True면 충돌시 에피소드 종료
+                 collision_terminate=False,       # True면 충돌시 에피소드 종료
                  collision_mode="slide",          # "slide" | "revert"
                  collision_penalty=0.3,           # 충돌(비종료) 시 즉시 감점
 
@@ -82,7 +82,7 @@ class Vector2DEnv(gym.Env):
                  fixed_agent_goal=False,
 
                  # === Seed ===
-                 seed=None,
+                 seed=1,
                  ):
         super().__init__()
 

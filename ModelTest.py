@@ -150,15 +150,25 @@ def recover_descent_path_world(env, max_len=500):
 
 @torch.no_grad()
 def policy_act(actor, obs_np):
-    # 입력을 actor와 같은 device로 이동
-    x = torch.from_numpy(obs_np).float().unsqueeze(0).to(next(actor.parameters()).device)
-    out = actor.forward(x)
-    if isinstance(out, (tuple, list)):
-        mean = out[0]
-        a = torch.tanh(mean)
-    else:
-        a = torch.clamp(out, -1.0, 1.0)
-    return a.squeeze(0).cpu().numpy()
+    import torch
+    device = next(actor.parameters()).device
+    with torch.no_grad():
+        x = torch.as_tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
+
+        # 1) 최신 정책: 결정적 행동 API 사용
+        if hasattr(actor, "act_deterministic"):
+            a = actor.act_deterministic(x)
+
+        else:
+            # 2) 구버전 호환: forward 출력에 따라 처리
+            out = actor(x)
+            if isinstance(out, (tuple, list)):
+                mean = out[0]          # (mean, log_std)
+                a = torch.tanh(mean)   # [-1,1]로 보장
+            else:
+                a = torch.clamp(out, -1.0, 1.0)
+
+        return a.squeeze(0).cpu().numpy()
 
 
 # ============================================================
@@ -331,9 +341,12 @@ def run_multiple_evaluations(env, actor, episodes=5,
 
 if __name__ == "__main__":
     import ENV
-    from Model import GaussianPolicy, device
+    from Model import GaussianPolicy
+    import torch
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    actor_path = "sac_actor.pth"
+    #actor_path = "sac_actor.pth"
+    actor_path = "sac_actor_best.pth"  # 또는 "sac_actor_last.pth"
     env = ENV.Vector2DEnv(
         seed=1,success_radius=0.2,
         fixed_maze=True,          # True: 고정 맵, False: 매 에피소드 새 맵
