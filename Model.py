@@ -417,7 +417,9 @@ def sac_train(env,
         info: Dict[str, Any] = {}
         last_reward = 0.0
 
-        while (not done) and (ep_steps < max_steps):
+        ep_horizon = (env.max_steps if (max_steps is None and hasattr(env, "max_steps"))
+                      else max_steps)
+        while (not done) and (ep_steps < (ep_horizon if ep_horizon is not None else 10**9)):
             s = to_tensor(obs, device).unsqueeze(0)
             act_t, logp_t = actor.sample(s)
             act = act_t.squeeze(0).detach().cpu().numpy()

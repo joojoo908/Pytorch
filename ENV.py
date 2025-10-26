@@ -86,6 +86,12 @@ class Vector2DEnv(gym.Env):
                  ):
         super().__init__()
 
+        self.dynamic_horizon = getattr(self, "dynamic_horizon", True)
+        self.dynamic_horizon_kappa = getattr(self, "dynamic_horizon_kappa", 1.6)  # 여유율(1.2~2.0 추천)
+        self.dynamic_horizon_Tmin = getattr(self, "dynamic_horizon_Tmin", 64)  # 하한 캡
+        self.dynamic_horizon_Tmax = getattr(self, "dynamic_horizon_Tmax", 2048)  # 상한 캡
+        self.dynamic_horizon_use_geodesic = getattr(self, "dynamic_horizon_use_geodesic", True)  # 가능하면 지오데식 거리 사용
+
         # --- RNG ---
         self._seed_value = seed
         self.rng = random.Random(seed)
@@ -190,6 +196,68 @@ class Vector2DEnv(gym.Env):
 
         # 액션은 각도/속도 해석용 2D [-1,1]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+
+    def _compute_dynamic_horizon(self, kappa=None, Tmin=None, Tmax=None, use_geodesic=None):
+        """
+        동적 horizon(max_steps) 계산:
+        - 지오데식 거리가 '셀 개수'로 나온다고 가정하고, (map_range, geodesic_grid)로 월드 단위로 환산만 수행
+        - 지오데식이 없을 때만 유클리드 거리 사용
+        - 유클리드 대비 비율 추정/이상치 폴백/혼합 로직은 모두 제거
+        """
+        import numpy as np, math
+
+        # 기본값
+        if kappa is None: kappa = getattr(self, "dynamic_horizon_kappa", 1.6)
+        if Tmin is None: Tmin = getattr(self, "dynamic_horizon_Tmin", 64)
+        if Tmax is None: Tmax = getattr(self, "dynamic_horizon_Tmax", 1024)
+        if use_geodesic is None: use_geodesic = getattr(self, "dynamic_horizon_use_geodesic", True)
+
+        # --- 지오데식 거리(셀 개수) 취득 ---
+        d_world = None
+        if use_geodesic:
+            d_cells = None
+            try:
+                if hasattr(self, "geodesic_distance") and callable(self.geodesic_distance):
+                    d_cells = float(self.geodesic_distance(self.agent_pos))
+                elif hasattr(self, "_geo_distance_robust") and callable(self._geo_distance_robust):
+                    tmp = self._geo_distance_robust(self.agent_pos, max_search=3)
+                    d_cells = float(tmp) if (tmp is not None) else None
+            except Exception:
+                d_cells = None
+
+            # 셀 크기 계산: geodesic_grid=(H,W), map_range=R  → 보통 좌표계가 [-R, +R]이므로 span=2R
+            if d_cells is not None and np.isfinite(d_cells):
+                # 그리드 폭 W 결정
+                W = None
+                if hasattr(self, "geodesic_grid"):
+                    gg = getattr(self, "geodesic_grid")
+                    if isinstance(gg, (tuple, list)) and len(gg) == 2:
+                        W = int(gg[1])
+                if W is None and hasattr(self, "_geo_map") and getattr(self, "_geo_map") is not None:
+                    W = int(getattr(self, "_geo_map").shape[1])
+                if W is None:  # 최후 수단: 제공 정보에 맞춰 512 가정
+                    W = 512
+
+                # 맵 한 변 길이(span) 계산
+                R = float(getattr(self, "map_range", 12.8))
+                # 좌표계가 [-R,+R]이면 2*R, [0,R]이면 1*R로 바꾸세요.
+                map_span = 2.0 * R
+
+                cell_size = float(map_span) / float(W)
+                d_world = d_cells * cell_size
+
+        # --- 지오데식이 없을 때만 유클리드 사용 (비교/보정 없음) ---
+        if d_world is None:
+            a = np.asarray(self.agent_pos, dtype=np.float32)
+            g = np.asarray(self.goal_pos, dtype=np.float32)
+            d_world = float(np.linalg.norm(g - a))
+
+        # --- horizon 계산 ---
+        step = float(getattr(self, "step_size", 0.02))
+        step = max(step, 1e-9)
+        t_min = int(math.ceil(d_world / step))
+        T = int(np.clip(math.ceil(kappa * t_min), Tmin, Tmax))
+        return T
 
     # ---------- Maze helpers ----------
     def _maze_world_params(self):
@@ -612,6 +680,12 @@ class Vector2DEnv(gym.Env):
         cur = self._progress_metric()
         self._stall_best = float(cur)
         self._stall_wait = 0
+
+        try:
+            if getattr(self, "dynamic_horizon", True):
+                self.max_steps = self._compute_dynamic_horizon()
+        except Exception:
+            pass
 
         return self._pack_observation(), {}
 

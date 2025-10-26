@@ -346,7 +346,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     #actor_path = "sac_actor.pth"
-    actor_path = "sac_actor_best.pth"  # 또는 "sac_actor_last.pth"
+    actor_path = "sac_actor_last.pth"  # 또는 "sac_actor_last.pth"
     env = ENV.Vector2DEnv(
         seed=1,success_radius=0.2,
         fixed_maze=True,          # True: 고정 맵, False: 매 에피소드 새 맵
@@ -377,7 +377,7 @@ if __name__ == "__main__":
 
     returns = run_multiple_evaluations(
         env, actor,
-        episodes=30, scale=22,
+        episodes=10, scale=22,
         visualize=HAS_PYGAME,
         visualize_every=1,
         wait=20, auto_quit=True,
