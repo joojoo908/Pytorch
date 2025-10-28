@@ -346,6 +346,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     #actor_path = "sac_actor.pth"
+    #actor_path = "sac_actor_best.pth"  # 또는 "sac_actor_last.pth"
     actor_path = "sac_actor_last.pth"  # 또는 "sac_actor_last.pth"
     env = ENV.Vector2DEnv(
         seed=1,success_radius=0.2,

@@ -32,9 +32,9 @@ def set_global_seed(seed: int):
 def main():
     ap = argparse.ArgumentParser(description="PyCharm-friendly training runner (no CMD args needed).")
     # Core
-    ap.add_argument("--episodes", type=int, default=3000)
+    ap.add_argument("--episodes", type=int, default=5000)
     ap.add_argument("--max-steps", type=int, default=None)
-    ap.add_argument("--batch-size", type=int, default=128)
+    ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--resume", action="store_true", default=False)     # may be auto-enabled
     ap.add_argument("--strict-resume", action="store_true", default=False)
@@ -63,7 +63,7 @@ def main():
 
     # Dynamic horizon (ENV-side) — default ON for PyCharm convenience
     ap.add_argument("--dyn-horizon", action="store_true", default=True)
-    ap.add_argument("--dyn-kappa", type=float, default=0.1)
+    ap.add_argument("--dyn-kappa", type=float, default=1.6)
     ap.add_argument("--dyn-tmin", type=int, default=64)
     ap.add_argument("--dyn-tmax", type=int, default=2048)
     ap.add_argument("--dyn-geo", action="store_true", default=True)
@@ -125,6 +125,16 @@ def main():
     # Start training
     Model.sac_train(
         env=env,
+        actor=bundle["actor"],
+        critic_1=bundle["critic_1"],
+        critic_2=bundle["critic_2"],
+        target_critic_1=bundle["target_critic_1"],
+        target_critic_2=bundle["target_critic_2"],
+        actor_opt=bundle["actor_opt"],
+        critic_1_opt=bundle["critic_1_opt"],
+        critic_2_opt=bundle["critic_2_opt"],
+        replay_buffer=bundle["replay_buffer"],
+
         episodes=args.episodes,
         max_steps=args.max_steps,
         batch_size=args.batch_size,
