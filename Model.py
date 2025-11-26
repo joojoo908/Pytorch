@@ -277,7 +277,7 @@ def save_sac_checkpoint(path: str,
 def load_sac_checkpoint(path: str, obs_dim: int, act_dim: int, device: Optional[torch.device] = None):
     """Load a previously saved SAC checkpoint. Returns a bundle dict."""
     dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(path, map_location=dev)
+    ckpt = torch.load(path, map_location=dev, weights_only=False)
 
     actor = GaussianPolicy(obs_dim, act_dim).to(dev)
     critic_1 = QNetwork(obs_dim, act_dim).to(dev)
@@ -346,6 +346,10 @@ def sac_train(env,
               # ---- exploration bounds ----
               alpha_floor: float = 0.05,
               alpha_ceiling: float = 1.00,
+              # === NEW: alpha freeze options ===
+              alpha_freeze_recent: float | None = 0.40,   # recent@100 성공률이 40%↑면 고정
+              alpha_freeze_succbuf: int = 150_000,        # 성공버퍼가 이 만큼 차면 고정
+              alpha_fixed: float = 0.24,                  # 고정할 α 값
               # ---- online best saving ----
               save_best_online: bool = True,
               best_delta: float = 0.02,
@@ -407,6 +411,8 @@ def sac_train(env,
 
     recent_success: deque[int] = deque(maxlen=100)
     best_score = -1.0
+
+    alpha_frozen = False
 
     for ep in range(episodes):
         obs = reset_env(env)
@@ -525,16 +531,22 @@ def sac_train(env,
                     actor_loss.backward()
                     actor_opt.step()
 
-                    # ----- alpha update + clamp -----
-                    alpha_loss = (log_alpha * (-logp_pi.detach() - target_entropy)).mean()
-                    log_alpha_opt.zero_grad(set_to_none=True)
-                    alpha_loss.backward()
-                    log_alpha_opt.step()
-                    with torch.no_grad():
-                        lo = float(np.log(max(1e-6, alpha_floor)))
-                        hi = float(np.log(max(alpha_floor + 1e-6, alpha_ceiling)))
-                        log_alpha.data.clamp_(min=lo, max=hi)
-                        alpha = float(log_alpha.exp().item())
+                    # ----- alpha update (+ optional freeze) -----
+                    if not alpha_frozen:
+                        alpha_loss = (log_alpha * (-logp_pi.detach() - target_entropy)).mean()
+                        log_alpha_opt.zero_grad(set_to_none=True)
+                        alpha_loss.backward()
+                        log_alpha_opt.step()
+                        with torch.no_grad():
+                            lo = float(np.log(max(1e-6, alpha_floor)))
+                            hi = float(np.log(max(alpha_floor + 1e-6, alpha_ceiling)))
+                            log_alpha.data.clamp_(min=lo, max=hi)
+                            alpha = float(log_alpha.exp().item())
+                    else:
+                        # keep α strictly fixed
+                        with torch.no_grad():
+                            log_alpha.fill_(math.log(alpha_fixed))
+                            alpha = float(log_alpha.exp().item())
 
                     # ----- target networks -----
                     soft_update_(critic_1, target_critic_1, tau)
@@ -569,6 +581,17 @@ def sac_train(env,
 
         recent_success.append(1 if episode_success else 0)
         recent_rate = 100.0 * (sum(recent_success) / max(1, len(recent_success)))
+
+        # === NEW: freeze trigger ===
+        if (not alpha_frozen) and (alpha_freeze_recent is not None):
+            cond_recent = (len(recent_success) >= 50) and (recent_rate >= 100.0 * alpha_freeze_recent)
+            cond_succbuf = (len(succ_replay_buffer) >= alpha_freeze_succbuf)
+            if cond_recent and cond_succbuf:
+                with torch.no_grad():
+                    log_alpha.copy_(torch.tensor(math.log(alpha_fixed), device=log_alpha.device))
+                alpha_frozen = True
+                print(f"[α-FROZEN] recent@{len(recent_success)}={recent_rate:.1f}% "
+                      f"| succ_buf={len(succ_replay_buffer)} | alpha_fixed={alpha_fixed:.3f}")
 
         if (ep + 1) % 10 == 0:
             print(f"[EP {ep+1:5d}] steps={ep_steps:3d}  R={ep_reward:8.2f}  succ={int(episode_success)}  "

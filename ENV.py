@@ -619,7 +619,7 @@ class Vector2DEnv(gym.Env):
                 gr, gc = free[self.rng.randrange(len(free))]
                 goal_center = maze_origin + np.array([gc * maze_cell, gr * maze_cell], dtype=np.float32)
                 # Random position inside the cell (avoid edges by 90%)
-                self.goal_pos = goal_center + (self.nprng.random(2) - 0.5) * maze_cell * 0.9
+                self.goal_pos = goal_center #+ (self.nprng.random(2) - 0.5) * maze_cell * 0.9
 
                 # Agent cell pick (different from goal cell)
                 ar, ac = free[self.rng.randrange(len(free))]
