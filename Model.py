@@ -152,7 +152,9 @@ def mlp(in_dim: int, hidden: Tuple[int, ...], out_dim: int, act=nn.ReLU) -> nn.S
 
 
 class GaussianPolicy(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, hidden: Tuple[int, ...] = (256, 256), log_std_bounds=(-5.0, 2.0)):
+    def __init__(self, obs_dim: int, act_dim: int,
+                 hidden: Tuple[int, ...] = (512,512,512),
+                 log_std_bounds=(-5.0, 2.0)):
         super().__init__()
         self.net = mlp(obs_dim, hidden, 2 * act_dim)
         self.act_dim = act_dim
@@ -184,7 +186,8 @@ class GaussianPolicy(nn.Module):
 
 
 class QNetwork(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, hidden: Tuple[int, ...] = (256, 256)):
+    def __init__(self, obs_dim: int, act_dim: int,
+                 hidden: Tuple[int, ...] = (512,512,512)):
         super().__init__()
         self.net = mlp(obs_dim + act_dim, hidden, 1)
 
