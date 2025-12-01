@@ -409,7 +409,7 @@ def sac_train(env,
     # alpha auto-tuning
     target_entropy = -float(act_dim)
     log_alpha = nn.Parameter(torch.tensor(np.log(0.2), dtype=torch.float32, device=device))
-    log_alpha_opt = optim.Adam([log_alpha], lr=3e-4)
+    log_alpha_opt = optim.Adam([log_alpha], lr=1e-5)
     alpha = float(log_alpha.exp().item())
 
     recent_success: deque[int] = deque(maxlen=100)

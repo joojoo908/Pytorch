@@ -53,7 +53,7 @@ class Vector2DEnv(gym.Env):
                  obs_with_extras=False,           # True면 추가 항목 포함(아래 참고)
 
                  # === Terminal reward ===
-                 R_SUCCESS=1000.0,
+                 R_SUCCESS=300.0,
 
                  # === Geodesic (distance/shaping) ===
                  geodesic_grid=(512, 512),        # geodesic-only grid resolution

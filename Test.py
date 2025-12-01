@@ -50,9 +50,9 @@ def main():
     ap.add_argument("--succ-min-dist", type=float, default=0.20)
 
     # Updates & exploration
-    ap.add_argument("--updates-per-step", type=int, default=2)
+    ap.add_argument("--updates-per-step", type=int, default=1)
     ap.add_argument("--alpha-floor", type=float, default=0.05)
-    ap.add_argument("--alpha-ceiling", type=float, default=1.00)
+    ap.add_argument("--alpha-ceiling", type=float, default=2.00)
 
     # Best saving
     ap.add_argument("--save-best-online", action="store_true", default=True)
