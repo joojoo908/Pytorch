@@ -32,7 +32,7 @@ def set_global_seed(seed: int):
 def main():
     ap = argparse.ArgumentParser(description="PyCharm-friendly training runner (no CMD args needed).")
     # Core
-    ap.add_argument("--episodes", type=int, default=10000)
+    ap.add_argument("--episodes", type=int, default=20000)
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--seed", type=int, default=1)
@@ -43,7 +43,7 @@ def main():
                     help="If set, never auto-resume even if ckpt exists.")
 
     # Success mixing
-    ap.add_argument("--p-succ", type=float, default=0.30)
+    ap.add_argument("--p-succ", type=float, default=0.00)
     ap.add_argument("--succ-buffer-cap", type=int, default=200_000)
     ap.add_argument("--succ-gate-min", type=int, default=2048)
     ap.add_argument("--succ-ramp-cov", type=float, default=0.25)
@@ -56,7 +56,7 @@ def main():
 
     # Best saving
     ap.add_argument("--save-best-online", action="store_true", default=True)
-    ap.add_argument("--best-delta", type=float, default=0.02)
+    ap.add_argument("--best-delta", type=float, default=0.01)
     ap.add_argument("--best-min-episodes", type=int, default=100)
     ap.add_argument("--best-ckpt-path", type=str, default="sac_best.pth")
     ap.add_argument("--best-actor-path", type=str, default="sac_actor_best.pth")
@@ -70,7 +70,7 @@ def main():
 
     ap.add_argument("--alpha-freeze-recent", type=float, default=1.000)  # 0.40 = 40%
     ap.add_argument("--alpha-freeze-succbuf", type=int, default=150_000)
-    ap.add_argument("--alpha-fixed", type=float, default=0.63)
+    ap.add_argument("--alpha-fixed", type=float, default=0.397)
 
     args = ap.parse_args()
 
@@ -128,15 +128,15 @@ def main():
     # Start training
     Model.sac_train(
         env=env,
-        # actor=bundle["actor"],
-        # critic_1=bundle["critic_1"],
-        # critic_2=bundle["critic_2"],
-        # target_critic_1=bundle["target_critic_1"],
-        # target_critic_2=bundle["target_critic_2"],
-        # actor_opt=bundle["actor_opt"],
-        # critic_1_opt=bundle["critic_1_opt"],
-        # critic_2_opt=bundle["critic_2_opt"],
-        # replay_buffer=bundle["replay_buffer"],
+        actor=bundle["actor"],
+        critic_1=bundle["critic_1"],
+        critic_2=bundle["critic_2"],
+        target_critic_1=bundle["target_critic_1"],
+        target_critic_2=bundle["target_critic_2"],
+        actor_opt=bundle["actor_opt"],
+        critic_1_opt=bundle["critic_1_opt"],
+        critic_2_opt=bundle["critic_2_opt"],
+        replay_buffer=bundle["replay_buffer"],
 
         episodes=args.episodes,
         max_steps=args.max_steps,
