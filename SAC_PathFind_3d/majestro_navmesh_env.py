@@ -1,0 +1,765 @@
+from __future__ import annotations
+
+import heapq
+import math
+import random
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+except Exception:
+    import gym
+    from gym import spaces
+
+
+DT_POLYTYPE_GROUND = 0
+DT_VERTS_PER_POLYGON = 6
+DT_NAVMESH_MAGIC = ord("D") << 24 | ord("N") << 16 | ord("A") << 8 | ord("V")
+NAVMESHSET_MAGIC = ord("M") << 24 | ord("S") << 16 | ord("E") << 8 | ord("T")
+NAVMESHSET_VERSION = 1
+
+
+@dataclass
+class Triangle:
+    verts3d: np.ndarray
+    verts2d: np.ndarray
+    bbox_min: np.ndarray
+    bbox_max: np.ndarray
+    avg_height: float
+
+
+def _nav_to_engine(v: Sequence[float]) -> np.ndarray:
+    return np.array([float(v[2]) * 100.0, float(v[1]) * 100.0, float(v[0]) * 100.0], dtype=np.float32)
+
+
+def _point_in_triangle_2d(point: np.ndarray, tri: np.ndarray, eps: float = 1e-5) -> bool:
+    a = tri[0]
+    b = tri[1]
+    c = tri[2]
+    v0 = c - a
+    v1 = b - a
+    v2 = point - a
+
+    den = v0[0] * v1[1] - v1[0] * v0[1]
+    if abs(den) < eps:
+        return False
+
+    inv_den = 1.0 / den
+    u = (v2[0] * v1[1] - v1[0] * v2[1]) * inv_den
+    v = (v0[0] * v2[1] - v2[0] * v0[1]) * inv_den
+    w = 1.0 - u - v
+    return (u >= -eps) and (v >= -eps) and (w >= -eps)
+
+
+def _barycentric_height(point: np.ndarray, tri2d: np.ndarray, tri3d: np.ndarray) -> Optional[float]:
+    a = tri2d[0]
+    b = tri2d[1]
+    c = tri2d[2]
+    v0 = b - a
+    v1 = c - a
+    v2 = point - a
+    den = v0[0] * v1[1] - v1[0] * v0[1]
+    if abs(den) < 1e-6:
+        return None
+
+    inv_den = 1.0 / den
+    v = (v2[0] * v1[1] - v1[0] * v2[1]) * inv_den
+    w = (v0[0] * v2[1] - v2[0] * v0[1]) * inv_den
+    u = 1.0 - v - w
+    if (u < -1e-4) or (v < -1e-4) or (w < -1e-4):
+        return None
+    heights = tri3d[:, 1]
+    return float(u * heights[0] + v * heights[1] + w * heights[2])
+
+
+class MajestroNavMeshData:
+    def __init__(self, navmesh_path: str | Path):
+        self.path = Path(navmesh_path)
+        self.triangles: List[Triangle] = []
+        self.bounds_min = np.zeros(2, dtype=np.float32)
+        self.bounds_max = np.zeros(2, dtype=np.float32)
+        self._load()
+
+    def _load(self) -> None:
+        raw = self.path.read_bytes()
+        if len(raw) < 40:
+            raise ValueError(f"NavMesh file too small: {self.path}")
+
+        magic, version, num_tiles = struct.unpack_from("<3i", raw, 0)
+        if magic != NAVMESHSET_MAGIC:
+            raise ValueError(f"Unexpected navmesh magic: {hex(magic)}")
+        if version != NAVMESHSET_VERSION:
+            raise ValueError(f"Unexpected navmesh version: {version}")
+
+        offset = 40
+        all_min = np.array([np.inf, np.inf], dtype=np.float32)
+        all_max = np.array([-np.inf, -np.inf], dtype=np.float32)
+
+        for _ in range(num_tiles):
+            tile_ref, data_size = struct.unpack_from("<II", raw, offset)
+            offset += 8
+            if tile_ref == 0 or data_size <= 0:
+                break
+            tile_data = raw[offset: offset + data_size]
+            offset += data_size
+            self._parse_tile(tile_data, all_min, all_max)
+
+        if not self.triangles:
+            raise ValueError(f"No walkable triangles parsed from {self.path}")
+
+        self.bounds_min = all_min
+        self.bounds_max = all_max
+
+    def _parse_tile(self, tile_data: bytes, all_min: np.ndarray, all_max: np.ndarray) -> None:
+        header = struct.unpack_from("<15i10f", tile_data, 0)
+        magic = header[0]
+        version = header[1]
+        if magic != DT_NAVMESH_MAGIC or version != 7:
+            return
+
+        poly_count = int(header[6])
+        vert_count = int(header[7])
+        max_link_count = int(header[8])
+        detail_mesh_count = int(header[9])
+        detail_vert_count = int(header[10])
+        detail_tri_count = int(header[11])
+        bv_node_count = int(header[12])
+        off_mesh_con_count = int(header[13])
+
+        offset = 100
+
+        verts = np.frombuffer(tile_data, dtype="<f4", count=vert_count * 3, offset=offset).reshape(vert_count, 3)
+        offset += vert_count * 3 * 4
+
+        polys = []
+        for i in range(poly_count):
+            poly_offset = offset + i * 32
+            first_link = struct.unpack_from("<I", tile_data, poly_offset)[0]
+            verts_idx = struct.unpack_from("<6H", tile_data, poly_offset + 4)
+            neis = struct.unpack_from("<6H", tile_data, poly_offset + 16)
+            flags = struct.unpack_from("<H", tile_data, poly_offset + 28)[0]
+            vert_count_poly = tile_data[poly_offset + 30]
+            area_and_type = tile_data[poly_offset + 31]
+            polys.append((first_link, verts_idx, neis, flags, vert_count_poly, area_and_type))
+        offset += poly_count * 32
+
+        offset += max_link_count * 12
+
+        details = []
+        for i in range(detail_mesh_count):
+            detail_offset = offset + i * 12
+            vert_base, tri_base, vert_count_detail, tri_count_detail = struct.unpack_from("<IIBB", tile_data, detail_offset)
+            details.append((vert_base, tri_base, vert_count_detail, tri_count_detail))
+        offset += detail_mesh_count * 12
+
+        detail_verts = np.frombuffer(tile_data, dtype="<f4", count=detail_vert_count * 3, offset=offset).reshape(detail_vert_count, 3)
+        offset += detail_vert_count * 3 * 4
+
+        detail_tris = np.frombuffer(tile_data, dtype=np.uint8, count=detail_tri_count * 4, offset=offset).reshape(detail_tri_count, 4)
+        offset += detail_tri_count * 4
+
+        offset += bv_node_count * 16
+        offset += off_mesh_con_count * 36
+
+        for poly_idx, poly in enumerate(polys):
+            _, verts_idx, _, _, vert_count_poly, area_and_type = poly
+            poly_type = area_and_type >> 6
+            if poly_type != DT_POLYTYPE_GROUND or vert_count_poly < 3:
+                continue
+
+            base_verts = verts[np.array(verts_idx[:vert_count_poly], dtype=np.int32)]
+            detail = details[poly_idx] if poly_idx < len(details) else None
+
+            if detail is None or detail[3] == 0:
+                self._append_poly_fan(base_verts, all_min, all_max)
+                continue
+
+            vert_base, tri_base, _, tri_count_detail = detail
+            for tri_local_idx in range(tri_count_detail):
+                tri_idx = tri_base + tri_local_idx
+                tri = detail_tris[tri_idx]
+                tri_verts = []
+                for corner in tri[:3]:
+                    idx = int(corner)
+                    if idx < vert_count_poly:
+                        nav_v = base_verts[idx]
+                    else:
+                        nav_v = detail_verts[vert_base + idx - vert_count_poly]
+                    tri_verts.append(_nav_to_engine(nav_v))
+                tri_verts3d = np.stack(tri_verts, axis=0)
+                self._append_triangle(tri_verts3d, all_min, all_max)
+
+    def _append_poly_fan(self, base_verts: np.ndarray, all_min: np.ndarray, all_max: np.ndarray) -> None:
+        if base_verts.shape[0] < 3:
+            return
+        anchor = _nav_to_engine(base_verts[0])
+        for idx in range(1, base_verts.shape[0] - 1):
+            tri_verts3d = np.stack(
+                [anchor, _nav_to_engine(base_verts[idx]), _nav_to_engine(base_verts[idx + 1])],
+                axis=0,
+            )
+            self._append_triangle(tri_verts3d, all_min, all_max)
+
+    def _append_triangle(self, tri_verts3d: np.ndarray, all_min: np.ndarray, all_max: np.ndarray) -> None:
+        tri_verts2d = tri_verts3d[:, [0, 2]].astype(np.float32)
+        edge0 = tri_verts2d[1] - tri_verts2d[0]
+        edge1 = tri_verts2d[2] - tri_verts2d[0]
+        area2 = abs(edge0[0] * edge1[1] - edge0[1] * edge1[0])
+        if area2 < 1e-4:
+            return
+
+        bbox_min = np.min(tri_verts2d, axis=0)
+        bbox_max = np.max(tri_verts2d, axis=0)
+        all_min[:] = np.minimum(all_min, bbox_min)
+        all_max[:] = np.maximum(all_max, bbox_max)
+        self.triangles.append(
+            Triangle(
+                verts3d=tri_verts3d.astype(np.float32),
+                verts2d=tri_verts2d,
+                bbox_min=bbox_min.astype(np.float32),
+                bbox_max=bbox_max.astype(np.float32),
+                avg_height=float(np.mean(tri_verts3d[:, 1])),
+            )
+        )
+
+
+class MajestroNavMeshEnv(gym.Env):
+    metadata = {"render_modes": ["human"], "render_fps": 30}
+
+    def __init__(
+        self,
+        navmesh_path: str | Path | None = None,
+        move_step_size: float = 120.0,
+        tactical_target_radius: float = 600.0,
+        success_radius: float = 120.0,
+        max_steps: int = 512,
+        seed: int = 1,
+        grid_resolution: int = 256,
+        ray_count: int = 8,
+        ray_length: float = 600.0,
+        progress_coef: float = 0.02,
+        collision_penalty: float = 0.35,
+        stall_penalty: float = 0.05,
+        stall_patience: int = 20,
+        time_penalty: float = 0.01,
+        success_reward: float = 50.0,
+        dynamic_horizon: bool = True,
+        dynamic_horizon_kappa: float = 1.8,
+        dynamic_horizon_Tmin: int = 96,
+        dynamic_horizon_Tmax: int = 1024,
+        dynamic_horizon_use_geodesic: bool = True,
+    ):
+        super().__init__()
+        if navmesh_path is None:
+            navmesh_path = Path(__file__).resolve().parent / "Resources" / "NavMesh" / "all_tiles_navmesh.bin"
+        self.navmesh_path = str(navmesh_path)
+        self._nav = MajestroNavMeshData(self.navmesh_path)
+        self.triangles = self._nav.triangles
+
+        self.step_size = float(move_step_size)
+        self.tactical_target_radius = float(tactical_target_radius)
+        self.success_radius = float(success_radius)
+        self.max_steps = int(max_steps)
+        self.base_max_steps = int(max_steps)
+        self.grid_resolution = int(grid_resolution)
+        self.ray_count = int(ray_count)
+        self.ray_length = float(ray_length)
+        self.progress_coef = float(progress_coef)
+        self.collision_penalty = float(collision_penalty)
+        self.stall_penalty = float(stall_penalty)
+        self.stall_patience = int(stall_patience)
+        self.time_penalty = float(time_penalty)
+        self._R_SUCCESS = float(success_reward)
+
+        self.dynamic_horizon = bool(dynamic_horizon)
+        self.dynamic_horizon_kappa = float(dynamic_horizon_kappa)
+        self.dynamic_horizon_Tmin = int(dynamic_horizon_Tmin)
+        self.dynamic_horizon_Tmax = int(dynamic_horizon_Tmax)
+        self.dynamic_horizon_use_geodesic = bool(dynamic_horizon_use_geodesic)
+
+        self._seed_value = seed
+        self.rng = random.Random(seed)
+        self.nprng = np.random.default_rng(seed)
+
+        self.bounds_min = self._nav.bounds_min.copy()
+        self.bounds_max = self._nav.bounds_max.copy()
+        self.map_center = 0.5 * (self.bounds_min + self.bounds_max)
+        self.map_size = np.maximum(self.bounds_max - self.bounds_min, 1.0)
+        self.map_range = float(np.max(self.map_size) * 0.5)
+
+        self._grid_origin = None
+        self._grid_cell_size = None
+        self._walkable = None
+        self._height_map = None
+        self._geo_map = None
+        self._geo_origin = None
+        self._geo_cell_size = None
+        self._geo_goal_rc = None
+        self._grid_tri_indices: List[List[int]] = []
+        self._free_cells = None
+
+        self.agent_pos = np.zeros(2, dtype=np.float32)
+        self.goal_pos = np.zeros(2, dtype=np.float32)
+        self.agent_height = 0.0
+        self.goal_height = 0.0
+        self._recent_vel = np.zeros(2, dtype=np.float32)
+        self._last_target_offset = np.zeros(2, dtype=np.float32)
+        self._stall_best = None
+        self._stall_wait = 0
+        self._prev_geo = None
+        self.steps = 0
+
+        self._build_raster_cache()
+
+        obs_dim = 3 + 3 + 3 + 2 + 2 + self.ray_count + 1
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+
+    def _build_raster_cache(self) -> None:
+        span = self.bounds_max - self.bounds_min
+        max_span = float(np.max(span))
+        cell = max(max_span / float(self.grid_resolution), 1.0)
+        cols = max(8, int(math.ceil(span[0] / cell)))
+        rows = max(8, int(math.ceil(span[1] / cell)))
+
+        self._grid_cell_size = float(cell)
+        self._grid_origin = self.bounds_min.copy()
+        self._geo_origin = self._grid_origin.copy()
+        self._geo_cell_size = np.array([cell, cell], dtype=np.float32)
+        self._grid_rows = rows
+        self._grid_cols = cols
+        self._walkable = np.zeros((rows, cols), dtype=np.uint8)
+        self._height_map = np.full((rows, cols), -np.inf, dtype=np.float32)
+        self._grid_tri_indices = [[] for _ in range(rows * cols)]
+
+        for tri_idx, tri in enumerate(self.triangles):
+            c0 = max(0, int(math.floor((tri.bbox_min[0] - self._grid_origin[0]) / cell)))
+            c1 = min(cols - 1, int(math.floor((tri.bbox_max[0] - self._grid_origin[0]) / cell)))
+            r0 = max(0, int(math.floor((tri.bbox_min[1] - self._grid_origin[1]) / cell)))
+            r1 = min(rows - 1, int(math.floor((tri.bbox_max[1] - self._grid_origin[1]) / cell)))
+
+            for r in range(r0, r1 + 1):
+                cz = self._grid_origin[1] + (r + 0.5) * cell
+                for c in range(c0, c1 + 1):
+                    cx = self._grid_origin[0] + (c + 0.5) * cell
+                    p = np.array([cx, cz], dtype=np.float32)
+                    if not _point_in_triangle_2d(p, tri.verts2d):
+                        continue
+                    bucket = self._grid_tri_indices[r * cols + c]
+                    bucket.append(tri_idx)
+                    self._walkable[r, c] = 1
+                    h = _barycentric_height(p, tri.verts2d, tri.verts3d)
+                    if h is not None and h > self._height_map[r, c]:
+                        self._height_map[r, c] = h
+
+        self._free_cells = np.argwhere(self._walkable > 0)
+        if self._free_cells.size == 0:
+            raise ValueError("No walkable raster cells created from navmesh.")
+
+    def _world_to_grid_rc(self, pos: np.ndarray) -> Tuple[int, int]:
+        c = int(math.floor((float(pos[0]) - float(self._grid_origin[0])) / self._grid_cell_size))
+        r = int(math.floor((float(pos[1]) - float(self._grid_origin[1])) / self._grid_cell_size))
+        r = max(0, min(self._grid_rows - 1, r))
+        c = max(0, min(self._grid_cols - 1, c))
+        return r, c
+
+    def _grid_rc_to_world(self, r: int, c: int) -> np.ndarray:
+        return np.array(
+            [
+                self._grid_origin[0] + (c + 0.5) * self._grid_cell_size,
+                self._grid_origin[1] + (r + 0.5) * self._grid_cell_size,
+            ],
+            dtype=np.float32,
+        )
+
+    def _nearest_valid_point(self, pos: np.ndarray, max_radius: int = 4) -> Optional[Tuple[np.ndarray, float]]:
+        r, c = self._world_to_grid_rc(pos)
+        best = None
+        best_d2 = None
+        for rad in range(max_radius + 1):
+            r0 = max(0, r - rad)
+            r1 = min(self._grid_rows - 1, r + rad)
+            c0 = max(0, c - rad)
+            c1 = min(self._grid_cols - 1, c + rad)
+            for rr in range(r0, r1 + 1):
+                for cc in range(c0, c1 + 1):
+                    if self._walkable[rr, cc] == 0:
+                        continue
+                    world = self._grid_rc_to_world(rr, cc)
+                    d2 = float(np.sum((world - pos) ** 2))
+                    if best_d2 is None or d2 < best_d2:
+                        best = world
+                        best_d2 = d2
+            if best is not None:
+                break
+        if best is None:
+            return None
+        height = self._sample_height(best)
+        if height is None:
+            height = 0.0
+        return best, float(height)
+
+    def _sample_height(self, pos: np.ndarray) -> Optional[float]:
+        r, c = self._world_to_grid_rc(pos)
+        cells = [(r, c)]
+        for rr in range(max(0, r - 1), min(self._grid_rows - 1, r + 1) + 1):
+            for cc in range(max(0, c - 1), min(self._grid_cols - 1, c + 1) + 1):
+                if (rr, cc) != (r, c):
+                    cells.append((rr, cc))
+
+        best_h = None
+        best_abs = None
+        for rr, cc in cells:
+            for tri_idx in self._grid_tri_indices[rr * self._grid_cols + cc]:
+                tri = self.triangles[tri_idx]
+                if not _point_in_triangle_2d(pos, tri.verts2d):
+                    continue
+                h = _barycentric_height(pos, tri.verts2d, tri.verts3d)
+                if h is None:
+                    continue
+                abs_h = abs(h)
+                if best_abs is None or abs_h < best_abs:
+                    best_h = h
+                    best_abs = abs_h
+        if best_h is not None:
+            return float(best_h)
+
+        if self._walkable[r, c]:
+            h = float(self._height_map[r, c])
+            if np.isfinite(h):
+                return h
+        return None
+
+    def _is_walkable_point(self, pos: np.ndarray) -> Tuple[bool, Optional[float]]:
+        h = self._sample_height(pos)
+        return h is not None, h
+
+    def _move_along_navmesh(self, start: np.ndarray, target: np.ndarray) -> Tuple[np.ndarray, float, bool]:
+        delta = target - start
+        dist = float(np.linalg.norm(delta))
+        if dist <= 1e-6:
+            return start.copy(), float(self.agent_height), False
+
+        sample_step = max(self._grid_cell_size * 0.5, 10.0)
+        steps = max(1, int(math.ceil(dist / sample_step)))
+
+        last_valid = start.copy()
+        last_height = float(self.agent_height)
+        collided = False
+
+        for i in range(1, steps + 1):
+            t = float(i) / float(steps)
+            probe = start + delta * t
+            valid, height = self._is_walkable_point(probe)
+            if valid:
+                last_valid = probe
+                last_height = float(height)
+                continue
+            collided = True
+            lo = last_valid.copy()
+            hi = probe.copy()
+            for _ in range(6):
+                mid = (lo + hi) * 0.5
+                mid_valid, mid_height = self._is_walkable_point(mid)
+                if mid_valid:
+                    last_valid = mid
+                    last_height = float(mid_height)
+                    lo = mid
+                else:
+                    hi = mid
+            break
+
+        return last_valid.astype(np.float32), float(last_height), collided
+
+    def _compute_geodesic_map(self, goal_rc: Tuple[int, int]) -> np.ndarray:
+        rows, cols = self._walkable.shape
+        dist = np.full((rows, cols), np.inf, dtype=np.float32)
+        gr, gc = goal_rc
+        if self._walkable[gr, gc] == 0:
+            return dist
+
+        dist[gr, gc] = 0.0
+        pq = [(0.0, gr, gc)]
+        neighbors = [
+            (-1, 0, 1.0),
+            (1, 0, 1.0),
+            (0, -1, 1.0),
+            (0, 1, 1.0),
+            (-1, -1, math.sqrt(2.0)),
+            (-1, 1, math.sqrt(2.0)),
+            (1, -1, math.sqrt(2.0)),
+            (1, 1, math.sqrt(2.0)),
+        ]
+        while pq:
+            d, r, c = heapq.heappop(pq)
+            if d != float(dist[r, c]):
+                continue
+            for dr, dc, w in neighbors:
+                nr = r + dr
+                nc = c + dc
+                if nr < 0 or nr >= rows or nc < 0 or nc >= cols or self._walkable[nr, nc] == 0:
+                    continue
+                nd = d + w
+                if nd < float(dist[nr, nc]):
+                    dist[nr, nc] = nd
+                    heapq.heappush(pq, (nd, nr, nc))
+        return dist
+
+    def _geo_distance(self, pos: np.ndarray, search: int = 3) -> Optional[float]:
+        if self._geo_map is None:
+            return None
+        r, c = self._world_to_grid_rc(pos)
+        best = None
+        for rad in range(search + 1):
+            r0 = max(0, r - rad)
+            r1 = min(self._grid_rows - 1, r + rad)
+            c0 = max(0, c - rad)
+            c1 = min(self._grid_cols - 1, c + rad)
+            for rr in range(r0, r1 + 1):
+                for cc in range(c0, c1 + 1):
+                    d = float(self._geo_map[rr, cc])
+                    if not math.isfinite(d):
+                        continue
+                    if best is None or d < best:
+                        best = d
+            if best is not None:
+                break
+        if best is None:
+            return None
+        return float(best * self._grid_cell_size)
+
+    def _geo_distance_robust(self, pos: np.ndarray, max_search: int = 3) -> Optional[float]:
+        return self._geo_distance(pos, search=max_search)
+
+    def _pos_to_geo_rc(self, pos: np.ndarray) -> Tuple[int, int]:
+        return self._world_to_grid_rc(pos)
+
+    def _compute_dynamic_horizon(self) -> int:
+        if self.dynamic_horizon_use_geodesic:
+            d_world = self._geo_distance(self.agent_pos)
+        else:
+            d_world = None
+        if d_world is None:
+            d_world = float(np.linalg.norm(self.goal_pos - self.agent_pos))
+        t_min = int(math.ceil(d_world / max(self.step_size, 1e-6)))
+        return int(np.clip(math.ceil(self.dynamic_horizon_kappa * t_min), self.dynamic_horizon_Tmin, self.dynamic_horizon_Tmax))
+
+    def _cast_ray(self, origin: np.ndarray, direction: np.ndarray) -> float:
+        step = max(self._grid_cell_size * 0.5, 20.0)
+        traveled = 0.0
+        while traveled < self.ray_length:
+            probe = origin + direction * traveled
+            valid, _ = self._is_walkable_point(probe)
+            if not valid:
+                return max(0.0, traveled - step)
+            traveled += step
+        return min(self.ray_length, traveled)
+
+    def _pack_observation(self) -> np.ndarray:
+        scale = max(self.map_range, 1.0)
+        agent_pos3 = np.array([self.agent_pos[0], self.agent_height, self.agent_pos[1]], dtype=np.float32)
+        goal_pos3 = np.array([self.goal_pos[0], self.goal_height, self.goal_pos[1]], dtype=np.float32)
+        delta3 = goal_pos3 - agent_pos3
+        center3 = np.array([self.map_center[0], 0.0, self.map_center[1]], dtype=np.float32)
+
+        agent_norm = (agent_pos3 - center3) / scale
+        goal_norm = (goal_pos3 - center3) / scale
+        delta_norm = delta3 / scale
+        last_target_norm = self._last_target_offset / max(self.tactical_target_radius, 1.0)
+        vel_norm = self._recent_vel / max(self.step_size, 1.0)
+
+        rays = np.zeros(self.ray_count, dtype=np.float32)
+        for idx in range(self.ray_count):
+            theta = (2.0 * math.pi * idx) / float(self.ray_count)
+            direction = np.array([math.cos(theta), math.sin(theta)], dtype=np.float32)
+            rays[idx] = self._cast_ray(self.agent_pos, direction) / max(self.ray_length, 1.0)
+
+        geo = self._geo_distance(self.agent_pos)
+        geo_norm = np.array([0.0 if geo is None else geo / max(scale, 1.0)], dtype=np.float32)
+
+        obs = np.concatenate(
+            [
+                agent_norm.astype(np.float32),
+                goal_norm.astype(np.float32),
+                delta_norm.astype(np.float32),
+                last_target_norm.astype(np.float32),
+                vel_norm.astype(np.float32),
+                rays,
+                geo_norm,
+            ]
+        )
+        return obs.astype(np.float32)
+
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
+        options = options or {}
+        if seed is not None:
+            self._seed_value = seed
+            self.rng = random.Random(seed)
+            self.nprng = np.random.default_rng(seed)
+
+        start_idx = int(self.rng.randrange(len(self._free_cells)))
+        start_rc = tuple(int(x) for x in self._free_cells[start_idx])
+        self.agent_pos = self._grid_rc_to_world(start_rc[0], start_rc[1])
+        self.agent_height = float(self._height_map[start_rc[0], start_rc[1]])
+
+        self._geo_map = None
+        self.goal_pos = self.agent_pos.copy()
+        self.goal_height = self.agent_height
+
+        min_goal_dist = max(self.step_size * 8.0, self.success_radius * 4.0)
+        for _ in range(128):
+            goal_idx = int(self.rng.randrange(len(self._free_cells)))
+            goal_rc = tuple(int(x) for x in self._free_cells[goal_idx])
+            goal_pos = self._grid_rc_to_world(goal_rc[0], goal_rc[1])
+            if float(np.linalg.norm(goal_pos - self.agent_pos)) < min_goal_dist:
+                continue
+            geo_map = self._compute_geodesic_map(goal_rc)
+            if not math.isfinite(float(geo_map[start_rc[0], start_rc[1]])):
+                continue
+            self.goal_pos = goal_pos
+            self.goal_height = float(self._height_map[goal_rc[0], goal_rc[1]])
+            self._geo_map = geo_map
+            self._geo_goal_rc = goal_rc
+            break
+
+        if self._geo_map is None:
+            candidate_indices = list(range(len(self._free_cells)))
+            self.rng.shuffle(candidate_indices)
+            best_goal = None
+            best_geo = None
+            best_goal_dist = -1.0
+            for idx in candidate_indices:
+                goal_rc = tuple(int(x) for x in self._free_cells[idx])
+                goal_pos = self._grid_rc_to_world(goal_rc[0], goal_rc[1])
+                goal_dist = float(np.linalg.norm(goal_pos - self.agent_pos))
+                if goal_dist < min_goal_dist:
+                    continue
+                geo_map = self._compute_geodesic_map(goal_rc)
+                start_geo = float(geo_map[start_rc[0], start_rc[1]])
+                if not math.isfinite(start_geo):
+                    continue
+                if goal_dist > best_goal_dist:
+                    best_goal = goal_rc
+                    best_geo = geo_map
+                    best_goal_dist = goal_dist
+            if best_goal is None:
+                best_goal = start_rc
+                best_geo = self._compute_geodesic_map(best_goal)
+            self.goal_pos = self._grid_rc_to_world(best_goal[0], best_goal[1])
+            self.goal_height = float(self._height_map[best_goal[0], best_goal[1]])
+            self._geo_map = best_geo
+            self._geo_goal_rc = best_goal
+
+        self.steps = 0
+        self._recent_vel[:] = 0.0
+        self._last_target_offset[:] = 0.0
+        self._prev_geo = self._geo_distance(self.agent_pos)
+        self._stall_best = self._prev_geo if self._prev_geo is not None else float(np.linalg.norm(self.goal_pos - self.agent_pos))
+        self._stall_wait = 0
+
+        if self.dynamic_horizon:
+            self.max_steps = self._compute_dynamic_horizon()
+        else:
+            self.max_steps = self.base_max_steps
+
+        return self._pack_observation(), {}
+
+    def step(self, action):
+        a = np.asarray(action, dtype=np.float32).reshape(-1)
+        if a.shape[0] != 2:
+            a = np.zeros(2, dtype=np.float32)
+
+        old_pos = self.agent_pos.copy()
+        old_geo = self._geo_distance(old_pos)
+        target_offset = np.clip(a[:2], -1.0, 1.0) * self.tactical_target_radius
+        desired_target = old_pos + target_offset
+        snapped = self._nearest_valid_point(desired_target, max_radius=6)
+        if snapped is None:
+            tactical_target = old_pos.copy()
+        else:
+            tactical_target = snapped[0]
+
+        to_target = tactical_target - old_pos
+        target_dist = float(np.linalg.norm(to_target))
+        if target_dist > self.step_size and target_dist > 1e-6:
+            movement_target = old_pos + (to_target / target_dist) * self.step_size
+        else:
+            movement_target = tactical_target
+
+        new_pos, new_height, collided = self._move_along_navmesh(old_pos, movement_target)
+        self.agent_pos = new_pos
+        self.agent_height = new_height
+        self.steps += 1
+
+        self._recent_vel = self.agent_pos - old_pos
+        self._last_target_offset = target_offset.astype(np.float32)
+
+        dist_to_goal = float(np.linalg.norm(self.goal_pos - self.agent_pos))
+        terminated = dist_to_goal <= self.success_radius
+        truncated = self.steps >= self.max_steps
+
+        reward = -self.time_penalty
+        terms = {"time_penalty": -self.time_penalty}
+
+        new_geo = self._geo_distance(self.agent_pos)
+        if old_geo is not None and new_geo is not None:
+            geo_delta = old_geo - new_geo
+            reward += self.progress_coef * geo_delta
+            terms["geo_delta"] = self.progress_coef * geo_delta
+            self._prev_geo = new_geo
+            cur_metric = new_geo
+        else:
+            eu_delta = float(np.linalg.norm(self.goal_pos - old_pos) - dist_to_goal)
+            reward += self.progress_coef * eu_delta
+            terms["euclid_delta"] = self.progress_coef * eu_delta
+            cur_metric = dist_to_goal
+
+        if collided:
+            reward -= self.collision_penalty
+            terms["collision_penalty"] = -self.collision_penalty
+
+        if self._stall_best is None or cur_metric < self._stall_best - 1.0:
+            self._stall_best = cur_metric
+            self._stall_wait = 0
+        else:
+            self._stall_wait += 1
+            if self._stall_wait >= self.stall_patience:
+                reward -= self.stall_penalty
+                terms["stall_penalty"] = -self.stall_penalty
+
+        if terminated:
+            reward += self._R_SUCCESS
+            terms["success"] = self._R_SUCCESS
+            self.agent_pos = self.goal_pos.copy()
+            self.agent_height = self.goal_height
+
+        info = {
+            "dist_to_goal": dist_to_goal,
+            "collided": bool(collided),
+            "geo_dist": new_geo,
+            "reward_terms": terms,
+            "agent_height": float(self.agent_height),
+            "goal_height": float(self.goal_height),
+            "tactical_target": tactical_target.astype(np.float32),
+            "requested_target": desired_target.astype(np.float32),
+        }
+        return self._pack_observation(), float(reward), terminated, truncated, info
+
+    def render(self, mode: str = "human"):
+        print(
+            f"[MajestroNavMeshEnv] pos={self.agent_pos} h={self.agent_height:.2f} "
+            f"goal={self.goal_pos} gh={self.goal_height:.2f} steps={self.steps}/{self.max_steps}"
+        )
+
+    @property
+    def R_SUCCESS(self):
+        return self._R_SUCCESS
+
+    @R_SUCCESS.setter
+    def R_SUCCESS(self, value):
+        self._R_SUCCESS = float(value)
