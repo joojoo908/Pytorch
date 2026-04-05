@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +12,21 @@ except Exception:
     HAS_PYGAME = False
 
 import torch
+
+
+ROLE_NAMES = {
+    0: "front",
+    1: "flank_l",
+    2: "flank_r",
+    3: "cover",
+}
+
+ROLE_COLORS = {
+    0: (255, 110, 110),
+    1: (110, 220, 255),
+    2: (255, 210, 90),
+    3: (180, 140, 255),
+}
 
 
 def make_world_to_screen(bounds_min, bounds_max, scale):
@@ -28,29 +44,63 @@ def make_world_to_screen(bounds_min, bounds_max, scale):
     return width, height, world_to_screen
 
 
-def get_geodesic_distance(env):
-    fn = getattr(env, "_geo_distance_robust", None)
-    if callable(fn):
+try:
+    from Model import GaussianPolicy, is_diverse_tactical_success
+except Exception:
+    from Model import GaussianPolicy
+
+    def is_diverse_tactical_success(info):
+        role_ids = np.asarray(info.get("role_ids", []), dtype=np.int32).reshape(-1)
+        success_mask = np.asarray(info.get("success_mask", []), dtype=bool).reshape(-1)
+        front = False
+        flank = False
+        cover = False
+        for role_id, success in zip(role_ids, success_mask):
+            if not bool(success):
+                continue
+            if int(role_id) == 0:
+                front = True
+            elif int(role_id) in (1, 2):
+                flank = True
+            elif int(role_id) == 3:
+                cover = True
+        return bool(front and flank and cover)
+
+def build_env(**env_kwargs):
+    try:
+        from majestro_navmesh_env import MajestroNavMeshEnv
+        return MajestroNavMeshEnv(**env_kwargs)
+    except Exception as majestro_exc:
         try:
-            d = fn(env.agent_pos, max_search=3)
-            return float(d) if d is not None else None
-        except Exception:
-            return None
-    return None
+            import ENV
+            if hasattr(ENV, "make_env") and callable(ENV.make_env):
+                return ENV.make_env(**env_kwargs)
+            raise RuntimeError("ENV module exists but make_env() is missing.")
+        except Exception as env_exc:
+            raise RuntimeError(
+                "Failed to build evaluation env. Tried majestro_navmesh_env.MajestroNavMeshEnv and ENV.make_env().\n"
+                f"majestro_navmesh_env error: {majestro_exc}\n"
+                f"ENV error: {env_exc}"
+            )
 
 
-def recover_descent_path_world(env, max_len=512):
+def reset_env_compat(env):
+    out = env.reset()
+    if isinstance(out, tuple) and len(out) == 2:
+        return out
+    return out, {}
+
+
+def recover_descent_path_world(env, start_pos, max_len=256):
     geo = getattr(env, "_geo_map", None)
-    if geo is None:
-        return []
     pos_to_rc = getattr(env, "_pos_to_geo_rc", None)
     rc_to_world = getattr(env, "_grid_rc_to_world", None)
     goal_rc = getattr(env, "_geo_goal_rc", None)
-    if not callable(pos_to_rc) or not callable(rc_to_world):
+    if geo is None or not callable(pos_to_rc) or not callable(rc_to_world):
         return []
 
     rows, cols = geo.shape
-    start_r, start_c = pos_to_rc(env.agent_pos)
+    start_r, start_c = pos_to_rc(start_pos)
 
     def find_valid_start(r, c, radius=3):
         if 0 <= r < rows and 0 <= c < cols and np.isfinite(geo[r, c]):
@@ -77,7 +127,7 @@ def recover_descent_path_world(env, max_len=512):
         return []
 
     neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
-    pts = [rc_to_world(cur[0], cur[1])]
+    pts = [np.asarray(start_pos, dtype=np.float32).copy()]
     cur_val = float(geo[cur[0], cur[1]])
 
     for _ in range(max_len):
@@ -105,7 +155,13 @@ def recover_descent_path_world(env, max_len=512):
 @torch.no_grad()
 def policy_act(actor, obs_np):
     device = next(actor.parameters()).device
-    x = torch.as_tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
+    arr = np.asarray(obs_np, dtype=np.float32)
+    if arr.ndim == 1:
+        x = torch.as_tensor(arr, dtype=torch.float32, device=device).unsqueeze(0)
+        squeeze = True
+    else:
+        x = torch.as_tensor(arr, dtype=torch.float32, device=device)
+        squeeze = False
 
     if hasattr(actor, "act_deterministic"):
         a = actor.act_deterministic(x)
@@ -116,7 +172,9 @@ def policy_act(actor, obs_np):
         else:
             a = torch.clamp(out, -1.0, 1.0)
 
-    return a.squeeze(0).cpu().numpy()
+    if squeeze:
+        return a.squeeze(0).cpu().numpy()
+    return a.cpu().numpy()
 
 
 def draw_navmesh_overlay(screen, env, world_to_screen):
@@ -142,13 +200,14 @@ def draw_navmesh_overlay(screen, env, world_to_screen):
 
 
 def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, visualize=True, save_csv_path=None):
-    obs, info = env.reset()
+    obs, info = reset_env_compat(env)
     actor.eval()
 
     start_pos = np.array(env.agent_pos, dtype=np.float32).copy()
     goal_pos = np.array(env.goal_pos, dtype=np.float32).copy()
     max_steps = int(max_steps or getattr(env, "max_steps", 300))
 
+    agent_trajs = [[np.array(pos, dtype=np.float32).copy()] for pos in np.asarray(env.agent_positions, dtype=np.float32)]
     traj = [start_pos.copy()]
     screen = clock = font = None
     world_to_screen = None
@@ -167,47 +226,108 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
 
     ep_ret = 0.0
     final_info = {}
-    terminated = truncated = False
+    env_terminated = False
+    env_truncated = False
+    user_aborted = False
 
     for step in range(max_steps):
         if visualize and HAS_PYGAME and screen is not None:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
-                    terminated = True
+                    user_aborted = True
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    terminated = True
+                    user_aborted = True
+
+        if user_aborted:
+            break
 
         action = policy_act(actor, obs)
-        obs, reward, terminated, truncated, final_info = env.step(action)
-        ep_ret += float(reward)
+        obs, reward, env_terminated, env_truncated, final_info = env.step(action)
+        ep_ret += float(np.mean(np.asarray(reward, dtype=np.float32)))
         traj.append(np.array(env.agent_pos, dtype=np.float32).copy())
+        for idx, pos in enumerate(np.asarray(env.agent_positions, dtype=np.float32)):
+            if idx < len(agent_trajs):
+                agent_trajs[idx].append(pos.copy())
 
         if visualize and HAS_PYGAME and screen is not None:
             screen.fill((14, 16, 20))
             draw_navmesh_overlay(screen, env, world_to_screen)
 
-            hint = recover_descent_path_world(env, max_len=512)
-            if len(hint) >= 2:
-                pygame.draw.lines(screen, (230, 180, 70), False, [world_to_screen(p) for p in hint], 2)
+            role_ids = final_info.get("role_ids")
+            if role_ids is None:
+                role_ids = np.zeros((len(agent_trajs),), dtype=np.int32)
+            else:
+                role_ids = np.asarray(role_ids).reshape(-1)
 
-            if len(traj) >= 2:
-                pygame.draw.lines(screen, (80, 220, 120), False, [world_to_screen(p) for p in traj], 3)
+            sense_radius = float(getattr(env, "sense_radius", 0.0))
+            sense_px = max(1, int(round(sense_radius * scale)))
+            if sense_px > 0:
+                for idx, pos in enumerate(np.asarray(env.agent_positions, dtype=np.float32)):
+                    role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
+                    color = ROLE_COLORS.get(role_id, (160, 160, 160))
+                    pygame.draw.circle(screen, color, world_to_screen(pos), sense_px, 1)
+
+            sensor_fail_codes = final_info.get("sensor_fail_code")
+            fail_arr = None if sensor_fail_codes is None else np.asarray(sensor_fail_codes, dtype=np.float32).reshape(-1)
+            if fail_arr is not None:
+                for idx, pos in enumerate(np.asarray(env.agent_positions, dtype=np.float32)):
+                    if idx >= len(fail_arr) or fail_arr[idx] <= 0.5:
+                        continue
+                    role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
+                    color = ROLE_COLORS.get(role_id, (160, 160, 160))
+                    path = recover_descent_path_world(env, pos, max_len=256)
+                    if len(path) >= 2:
+                        pygame.draw.lines(screen, color, False, [world_to_screen(p) for p in path], 1)
+
+            for idx, points in enumerate(agent_trajs):
+                if len(points) < 2:
+                    continue
+                role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
+                color = ROLE_COLORS.get(role_id, (160, 160, 160))
+                pygame.draw.lines(screen, color, False, [world_to_screen(p) for p in points], 2)
 
             tactical_target = final_info.get("tactical_target")
             if tactical_target is not None:
-                pygame.draw.circle(screen, (120, 120, 240), world_to_screen(tactical_target), 4)
+                tactical_target = np.asarray(tactical_target, dtype=np.float32)
+                if tactical_target.ndim == 1:
+                    pygame.draw.circle(screen, (120, 120, 240), world_to_screen(tactical_target), 4)
+                else:
+                    pygame.draw.circle(screen, (120, 120, 240), world_to_screen(tactical_target[0]), 4)
+                    for other_target in tactical_target[1:]:
+                        pygame.draw.circle(screen, (110, 110, 170), world_to_screen(other_target), 3)
+
+            role_targets = final_info.get("role_targets")
+            if role_targets is not None:
+                for idx, role_target in enumerate(np.asarray(role_targets, dtype=np.float32)):
+                    role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
+                    color = ROLE_COLORS.get(role_id, (170, 110, 110))
+                    pygame.draw.circle(screen, color, world_to_screen(role_target), 3, 1)
+
+            agent_positions = final_info.get("agent_positions")
+            if agent_positions is not None:
+                for idx, other in enumerate(np.asarray(agent_positions, dtype=np.float32)):
+                    role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
+                    color = ROLE_COLORS.get(role_id, (200, 140, 70))
+                    sx, sy = world_to_screen(other)
+                    pygame.draw.circle(screen, color, (sx, sy), 4)
+                    if fail_arr is not None and idx < len(fail_arr):
+                        fail_text = f"F:{int(fail_arr[idx] > 0.5)}"
+                        surf = font.render(fail_text, True, color)
+                        screen.blit(surf, (sx + 6, sy - 10))
 
             pygame.draw.circle(screen, (230, 90, 90), world_to_screen(goal_pos), 6)
-            pygame.draw.circle(screen, (80, 180, 250), world_to_screen(env.agent_pos), 5)
+            pygame.draw.circle(screen, (255, 255, 255), world_to_screen(env.agent_pos), 5, 1)
 
-            d_geo = get_geodesic_distance(env)
-            dist = float(d_geo) if d_geo is not None else float(np.linalg.norm(env.goal_pos - env.agent_pos))
+            dist = float(np.linalg.norm(env.goal_pos - env.agent_pos))
             lines = [
                 f"Step: {step + 1}/{max_steps}",
                 f"Return: {ep_ret:.3f}",
                 f"Dist: {dist:.2f}",
                 f"Pos: ({env.agent_pos[0]:.1f}, {env.agent_height:.1f}, {env.agent_pos[1]:.1f})",
             ]
+            if role_ids is not None:
+                role_labels = [ROLE_NAMES.get(int(r), str(int(r))) for r in role_ids]
+                lines.append(f"Roles: {', '.join(role_labels)}")
             y = 8
             for line in lines:
                 surf = font.render(line, True, (220, 220, 220))
@@ -217,7 +337,7 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
             pygame.display.flip()
             clock.tick(60)
 
-        if terminated or truncated:
+        if env_terminated or env_truncated:
             break
 
     if save_csv_path is not None:
@@ -227,12 +347,14 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
         except Exception as exc:
             print(f"[Warn] Failed to save trajectory: {exc}")
 
-    success = bool((final_info.get("reward_terms") or {}).get("success", 0))
-    if success:
+    success = bool(is_diverse_tactical_success(final_info))
+    if user_aborted:
+        outcome = "aborted"
+    elif success:
         outcome = "success"
-    elif truncated:
+    elif env_truncated:
         outcome = "timeout"
-    elif bool(final_info.get("collided", False)):
+    elif np.any(np.asarray(final_info.get("collided", False))):
         outcome = "blocked"
     else:
         outcome = "failed"
@@ -262,27 +384,56 @@ def run_multiple_evaluations(env, actor, episodes=10, max_steps=None, scale=0.03
         successes += int(succ)
         print(f"[Episode {ep + 1}/{episodes}] return={ret:.3f} outcome={outcome}")
 
+        if outcome == "aborted":
+            print("[Info] Evaluation stopped by user.")
+            break
+
     if visualize and HAS_PYGAME and screen_bundle and auto_quit:
         pygame.quit()
 
     avg_ret = float(np.mean(returns)) if returns else 0.0
-    print(f"[Summary] episodes={episodes} success={successes} ({100.0 * successes / max(1, episodes):.1f}%) avg_return={avg_ret:.3f}")
+    print(f"[Summary] episodes={len(returns)} success={successes} ({100.0 * successes / max(1, len(returns)):.1f}%) avg_return={avg_ret:.3f}")
     return returns
 
 
 if __name__ == "__main__":
-    import ENV
-    from Model import GaussianPolicy
+    ap = argparse.ArgumentParser(description="Evaluate shared-policy SAC on Majestro NavMesh.")
+    ap.add_argument("--actor-path", type=str, default="sac_actor_best.pth")
+    ap.add_argument("--episodes", type=int, default=50)
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--scale", type=float, default=0.03)
+    ap.add_argument("--no-visualize", action="store_true", default=False)
+    ap.add_argument("--move-step-size", type=float, default=120.0)
+    ap.add_argument("--tactical-target-radius", type=float, default=600.0)
+    ap.add_argument("--num-other-agents", type=int, default=4)
+    ap.add_argument("--observed-other-agents", type=int, default=3)
+    ap.add_argument("--agent-radius", type=float, default=90.0)
+    ap.add_argument("--sense-radius", type=float, default=600.0)
+    ap.add_argument("--goal-spawn-min-scale", type=float, default=4.0)
+    ap.add_argument("--agent-spawn-min-scale", type=float, default=2.0)
+    args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    actor_path = "sac_actor_best.pth"
-    env = ENV.make_env(seed=1)
+    actor_path = args.actor_path
+    env = build_env(
+        seed=args.seed,
+        move_step_size=args.move_step_size,
+        tactical_target_radius=args.tactical_target_radius,
+        num_other_agents=args.num_other_agents,
+        observed_other_agents=args.observed_other_agents,
+        agent_radius=args.agent_radius,
+        sense_radius=args.sense_radius,
+        goal_spawn_min_scale=args.goal_spawn_min_scale,
+        agent_spawn_min_scale=args.agent_spawn_min_scale,
+    )
 
     if not os.path.exists(actor_path):
         print(f"[WARN] {actor_path} not found. Train with Test.py first.")
         sys.exit(0)
 
-    actor = GaussianPolicy(env.observation_space.shape[0], env.action_space.shape[0]).to(device)
+    obs_dim = int(getattr(env, "single_agent_obs_dim", env.observation_space.shape[-1]))
+    act_dim = int(getattr(env, "single_agent_act_dim", env.action_space.shape[-1]))
+    actor = GaussianPolicy(obs_dim, act_dim).to(device)
     state_dict = torch.load(actor_path, map_location=device)
     actor.load_state_dict(state_dict)
     actor.eval()
@@ -290,9 +441,9 @@ if __name__ == "__main__":
     run_multiple_evaluations(
         env,
         actor,
-        episodes=50,
-        scale=0.03,
-        visualize=HAS_PYGAME,
+        episodes=args.episodes,
+        scale=args.scale,
+        visualize=(HAS_PYGAME and (not args.no_visualize)),
         visualize_every=1,
         auto_quit=True,
         save_last_csv=str(Path("last_eval_traj.csv").resolve()),

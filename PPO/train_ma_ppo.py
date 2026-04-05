@@ -13,6 +13,7 @@ class TeamBuffer:
     """
     def __init__(self):
         self.s = []
+
         self.a = []
         self.logp = []
         self.r = []

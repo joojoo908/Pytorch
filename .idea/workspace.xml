@@ -5,13 +5,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="e35c3c4e-cf94-4e27-ae16-a4fe5a7ea3c0" name="변경" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/.name" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/.name" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/PPO/ENV.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/PPO/Model_PPO.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/PPO/ONNX_Model.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/PPO/Test.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/PPO/Test_PPO.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/PPO/train_ma_ppo.py" beforeDir="false" afterPath="$PROJECT_DIR$/PPO/train_ma_ppo.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -29,7 +24,7 @@
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
   <component name="ProblemsViewState">
-    <option name="selectedTabId" value="DEPENDENCY_CHECKER_PROBLEMS_TAB" />
+    <option name="selectedTabId" value="CurrentFile" />
   </component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 8
@@ -42,31 +37,31 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "Python.ENV.executor": "Run",
-    "Python.ModelTest.executor": "Run",
-    "Python.Model_PPO.executor": "Run",
-    "Python.ONNX_Model.executor": "Run",
-    "Python.Test.executor": "Run",
-    "Python.Test_PPO.executor": "Run",
-    "Python.eval_ma_ppo.executor": "Run",
-    "Python.train_ma_ppo.executor": "Run",
-    "Python.viewer_watch_only.executor": "Run",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "main",
-    "node.js.detected.package.eslint": "true",
-    "node.js.detected.package.tslint": "true",
-    "node.js.selected.package.eslint": "(autodetect)",
-    "node.js.selected.package.tslint": "(autodetect)",
-    "nodejs_package_manager_path": "npm",
-    "settings.editor.selected.configurable": "preferences.editor",
-    "vue.rearranger.settings.migration": "true"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;Python.ENV.executor&quot;: &quot;Run&quot;,
+    &quot;Python.ModelTest.executor&quot;: &quot;Run&quot;,
+    &quot;Python.Model_PPO.executor&quot;: &quot;Run&quot;,
+    &quot;Python.ONNX_Model.executor&quot;: &quot;Run&quot;,
+    &quot;Python.Test.executor&quot;: &quot;Run&quot;,
+    &quot;Python.Test_PPO.executor&quot;: &quot;Run&quot;,
+    &quot;Python.eval_ma_ppo.executor&quot;: &quot;Run&quot;,
+    &quot;Python.train_ma_ppo.executor&quot;: &quot;Run&quot;,
+    &quot;Python.viewer_watch_only.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
+    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
+    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
+    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
+    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
+    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable&quot;,
+    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
-}]]></component>
+}</component>
   <component name="SharedIndexes">
     <attachedChunks>
       <set>

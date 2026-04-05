@@ -13,11 +13,42 @@ try:
     import gymnasium as gym
     from gymnasium import spaces
 except Exception:
-    import gym
-    from gym import spaces
+    try:
+        import gym
+        from gym import spaces
+    except Exception:
+        class _FallbackEnv:
+            pass
+
+        class _FallbackBox:
+            def __init__(self, low, high, shape, dtype):
+                self.low = low
+                self.high = high
+                self.shape = tuple(shape)
+                self.dtype = dtype
+
+            def sample(self):
+                low = np.full(self.shape, self.low, dtype=self.dtype)
+                high = np.full(self.shape, self.high, dtype=self.dtype)
+                return np.random.uniform(low, high).astype(self.dtype)
+
+        class _FallbackSpaces:
+            Box = _FallbackBox
+
+        class _FallbackGym:
+            Env = _FallbackEnv
+
+        gym = _FallbackGym()
+        spaces = _FallbackSpaces()
 
 
 DT_POLYTYPE_GROUND = 0
+
+ROLE_FRONT = 0
+ROLE_FLANK_LEFT = 1
+ROLE_FLANK_RIGHT = 2
+ROLE_COVER = 3
+ROLE_COUNT = 4
 DT_VERTS_PER_POLYGON = 6
 DT_NAVMESH_MAGIC = ord("D") << 24 | ord("N") << 16 | ord("A") << 8 | ord("V")
 NAVMESHSET_MAGIC = ord("M") << 24 | ord("S") << 16 | ord("E") << 8 | ord("T")
@@ -236,12 +267,18 @@ class MajestroNavMeshEnv(gym.Env):
         navmesh_path: str | Path | None = None,
         move_step_size: float = 120.0,
         tactical_target_radius: float = 600.0,
+        num_other_agents: int = 4,
+        observed_other_agents: int = 3,
+        agent_radius: float = 90.0,
         success_radius: float = 120.0,
+        goal_spawn_min_scale: float = 4.0,
+        agent_spawn_min_scale: float = 2.0,
         max_steps: int = 512,
         seed: int = 1,
         grid_resolution: int = 256,
         ray_count: int = 8,
         ray_length: float = 600.0,
+        sense_radius: float | None = None,
         progress_coef: float = 0.02,
         collision_penalty: float = 0.35,
         stall_penalty: float = 0.05,
@@ -263,12 +300,18 @@ class MajestroNavMeshEnv(gym.Env):
 
         self.step_size = float(move_step_size)
         self.tactical_target_radius = float(tactical_target_radius)
+        self.num_other_agents = int(max(0, num_other_agents))
+        self.observed_other_agents = int(max(0, observed_other_agents))
+        self.agent_radius = float(agent_radius)
         self.success_radius = float(success_radius)
+        self.goal_spawn_min_scale = float(goal_spawn_min_scale)
+        self.agent_spawn_min_scale = float(agent_spawn_min_scale)
         self.max_steps = int(max_steps)
         self.base_max_steps = int(max_steps)
         self.grid_resolution = int(grid_resolution)
         self.ray_count = int(ray_count)
         self.ray_length = float(ray_length)
+        self.sense_radius = float(ray_length if sense_radius is None else sense_radius)
         self.progress_coef = float(progress_coef)
         self.collision_penalty = float(collision_penalty)
         self.stall_penalty = float(stall_penalty)
@@ -307,18 +350,35 @@ class MajestroNavMeshEnv(gym.Env):
         self.goal_pos = np.zeros(2, dtype=np.float32)
         self.agent_height = 0.0
         self.goal_height = 0.0
-        self._recent_vel = np.zeros(2, dtype=np.float32)
-        self._last_target_offset = np.zeros(2, dtype=np.float32)
+        self.num_agents = 1 + self.num_other_agents
+        self.agent_positions = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self.agent_heights = np.zeros((self.num_agents,), dtype=np.float32)
+        self.agent_velocities = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self.last_target_offsets = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self.agent_role_ids = np.zeros((self.num_agents,), dtype=np.int32)
+        self.role_targets = np.zeros((self.num_agents, 2), dtype=np.float32)
         self._stall_best = None
-        self._stall_wait = 0
+        self._stall_wait = None
         self._prev_geo = None
         self.steps = 0
 
         self._build_raster_cache()
 
-        obs_dim = 3 + 3 + 3 + 2 + 2 + self.ray_count + 1
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+        obs_dim = 3 + 3 + 3 + 2 + self.observed_other_agents * 3 + 1 + 1
+        self.single_agent_obs_dim = int(obs_dim)
+        self.single_agent_act_dim = 2
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.num_agents, self.single_agent_obs_dim),
+            dtype=np.float32,
+        )
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(self.num_agents, self.single_agent_act_dim),
+            dtype=np.float32,
+        )
 
     def _build_raster_cache(self) -> None:
         span = self.bounds_max - self.bounds_min
@@ -476,6 +536,71 @@ class MajestroNavMeshEnv(gym.Env):
 
         return last_valid.astype(np.float32), float(last_height), collided
 
+    def _collides_with_other_agents(self, pos: np.ndarray, ignore_index: Optional[int] = None) -> bool:
+        if self.agent_positions.size == 0:
+            return False
+        min_dist = self.agent_radius * 2.0
+        min_dist_sq = min_dist * min_dist
+        for idx, other in enumerate(self.agent_positions):
+            if ignore_index is not None and idx == ignore_index:
+                continue
+            dx = float(pos[0] - other[0])
+            dz = float(pos[1] - other[1])
+            if dx * dx + dz * dz < min_dist_sq:
+                return True
+        return False
+
+    def _separation_penalty_value(self, pos: np.ndarray) -> float:
+        if self.agent_positions.size == 0:
+            return 0.0
+        penalty = 0.0
+        min_dist = self.agent_radius * 2.0
+        for other in self.agent_positions:
+            dist = float(np.linalg.norm(pos - other))
+            if dist < min_dist:
+                penalty += (min_dist - dist) / max(min_dist, 1.0)
+        return penalty
+
+    def _move_with_agent_avoidance(
+        self,
+        start: np.ndarray,
+        target: np.ndarray,
+        ignore_index: Optional[int] = None,
+        start_height: Optional[float] = None,
+    ) -> Tuple[np.ndarray, float, bool]:
+        saved_height = self.agent_height
+        if start_height is not None:
+            self.agent_height = float(start_height)
+
+        moved, moved_height, nav_collided = self._move_along_navmesh(start, target)
+        agent_blocked = False
+        if self._collides_with_other_agents(moved, ignore_index=ignore_index):
+            agent_blocked = True
+            direction = moved - start
+            dist = float(np.linalg.norm(direction))
+            if dist > 1e-6:
+                lo = start.copy()
+                hi = moved.copy()
+                best = start.copy()
+                best_height = float(start_height if start_height is not None else moved_height)
+                for _ in range(7):
+                    mid = (lo + hi) * 0.5
+                    mid_h = self._sample_height(mid)
+                    if mid_h is None or self._collides_with_other_agents(mid, ignore_index=ignore_index):
+                        hi = mid
+                    else:
+                        best = mid
+                        best_height = float(mid_h)
+                        lo = mid
+                moved = best.astype(np.float32)
+                moved_height = best_height
+            else:
+                moved = start.copy()
+                moved_height = float(start_height if start_height is not None else saved_height)
+
+        self.agent_height = saved_height
+        return moved, float(moved_height), bool(nav_collided or agent_blocked)
+
     def _compute_geodesic_map(self, goal_rc: Tuple[int, int]) -> np.ndarray:
         rows, cols = self._walkable.shape
         dist = np.full((rows, cols), np.inf, dtype=np.float32)
@@ -549,20 +674,237 @@ class MajestroNavMeshEnv(gym.Env):
         t_min = int(math.ceil(d_world / max(self.step_size, 1e-6)))
         return int(np.clip(math.ceil(self.dynamic_horizon_kappa * t_min), self.dynamic_horizon_Tmin, self.dynamic_horizon_Tmax))
 
-    def _cast_ray(self, origin: np.ndarray, direction: np.ndarray) -> float:
-        step = max(self._grid_cell_size * 0.5, 20.0)
-        traveled = 0.0
-        while traveled < self.ray_length:
-            probe = origin + direction * traveled
-            valid, _ = self._is_walkable_point(probe)
-            if not valid:
-                return max(0.0, traveled - step)
-            traveled += step
-        return min(self.ray_length, traveled)
+    def _other_agent_observation(self, agent_index: int, scale: float, max_distance: Optional[float] = None) -> np.ndarray:
+        if self.observed_other_agents <= 0:
+            return np.zeros((0,), dtype=np.float32), 0
+        if self.agent_positions.shape[0] <= 1:
+            return np.zeros((self.observed_other_agents * 3,), dtype=np.float32), 0
+        others = np.delete(self.agent_positions, agent_index, axis=0)
+        rel = others - self.agent_positions[agent_index][None, :]
+        dists = np.linalg.norm(rel, axis=1)
+        if max_distance is not None:
+            mask = dists <= float(max_distance)
+            rel = rel[mask]
+            dists = dists[mask]
+        if dists.size == 0:
+            return np.zeros((self.observed_other_agents * 3,), dtype=np.float32), 0
+        order = np.argsort(dists)[: self.observed_other_agents]
+        obs = np.zeros((self.observed_other_agents, 3), dtype=np.float32)
+        for out_idx, agent_idx in enumerate(order):
+            obs[out_idx, 0:2] = rel[agent_idx] / scale
+            obs[out_idx, 2] = dists[agent_idx] / scale
+        return obs.reshape(-1), int(len(order))
 
-    def _pack_observation(self) -> np.ndarray:
+    def _sense_local_space(self, agent_index: int, scale: float) -> Tuple[np.ndarray, float]:
+        sense_limit = max(1.0, float(self.sense_radius))
+        other_obs, sensed_agents = self._other_agent_observation(agent_index, scale, max_distance=sense_limit)
+        fail_code = 1.0 if sensed_agents == 0 else 0.0
+        return other_obs, fail_code
+
+    def _geo_next_waypoint(self, pos: np.ndarray, max_search: int = 3) -> Optional[np.ndarray]:
+        if self._geo_map is None:
+            return None
+        rc = self._pos_to_geo_rc(pos)
+        rows, cols = self._geo_map.shape
+
+        def find_valid_start(r: int, c: int, radius: int = 3) -> Optional[Tuple[int, int]]:
+            if 0 <= r < rows and 0 <= c < cols and np.isfinite(self._geo_map[r, c]):
+                return r, c
+            for rad in range(1, radius + 1):
+                r0 = max(0, r - rad)
+                r1 = min(rows - 1, r + rad)
+                c0 = max(0, c - rad)
+                c1 = min(cols - 1, c + rad)
+                best = None
+                best_val = np.inf
+                for rr in range(r0, r1 + 1):
+                    for cc in range(c0, c1 + 1):
+                        v = float(self._geo_map[rr, cc])
+                        if np.isfinite(v) and v < best_val:
+                            best = (rr, cc)
+                            best_val = v
+                if best is not None:
+                    return best
+            return None
+
+        start = find_valid_start(rc[0], rc[1], radius=max_search)
+        if start is None:
+            return None
+
+        cur_r, cur_c = start
+        cur_val = float(self._geo_map[cur_r, cur_c])
+        best = None
+        best_val = cur_val
+        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+        for dr, dc in neighbors:
+            rr = cur_r + dr
+            cc = cur_c + dc
+            if rr < 0 or rr >= rows or cc < 0 or cc >= cols:
+                continue
+            v = float(self._geo_map[rr, cc])
+            if np.isfinite(v) and v + 1e-6 < best_val:
+                best = (rr, cc)
+                best_val = v
+
+        if best is None:
+            return self.goal_pos.copy()
+        return self._grid_rc_to_world(best[0], best[1]).astype(np.float32)
+
+    def _role_value(self, agent_index: int) -> np.ndarray:
+        denom = max(1, ROLE_COUNT - 1)
+        role_id = int(np.clip(self.agent_role_ids[agent_index], 0, ROLE_COUNT - 1))
+        return np.array([float(role_id) / float(denom)], dtype=np.float32)
+
+    def _normalize_vec(self, v: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        n = float(np.linalg.norm(v))
+        if n <= eps:
+            return np.zeros_like(v, dtype=np.float32)
+        return (v / n).astype(np.float32)
+
+    def _closest_cover_anchor(self, agent_index: int) -> Optional[np.ndarray]:
+        if self.num_agents <= 1:
+            return None
+        my_pos = self.agent_positions[agent_index]
+        best = None
+        best_score = np.inf
+        to_goal = self.goal_pos - my_pos
+        to_goal_dir = self._normalize_vec(to_goal)
+        for idx, other in enumerate(self.agent_positions):
+            if idx == agent_index:
+                continue
+            rel = other - my_pos
+            dist = float(np.linalg.norm(rel))
+            if dist <= 1e-6:
+                continue
+            rel_dir = self._normalize_vec(rel)
+            align = float(np.dot(rel_dir, to_goal_dir))
+            score = dist - 80.0 * align
+            if score < best_score:
+                best_score = score
+                best = other.copy()
+        return best
+
+    def _role_target_for(self, agent_index: int) -> np.ndarray:
+        role_id = int(self.agent_role_ids[agent_index])
+        my_pos = self.agent_positions[agent_index]
+        to_goal = self.goal_pos - my_pos
+        goal_dir = self._normalize_vec(to_goal)
+        if float(np.linalg.norm(goal_dir)) <= 1e-6:
+            goal_dir = np.array([1.0, 0.0], dtype=np.float32)
+        side_dir = np.array([-goal_dir[1], goal_dir[0]], dtype=np.float32)
+
+        if role_id == ROLE_FRONT:
+            target = self.goal_pos.copy()
+        elif role_id == ROLE_FLANK_LEFT:
+            target = self.goal_pos + side_dir * max(self.success_radius * 1.8, self.agent_radius * 3.0)
+        elif role_id == ROLE_FLANK_RIGHT:
+            target = self.goal_pos - side_dir * max(self.success_radius * 1.8, self.agent_radius * 3.0)
+        else:
+            cover_anchor = self._closest_cover_anchor(agent_index)
+            if cover_anchor is None:
+                target = self.goal_pos - goal_dir * max(self.agent_radius * 3.0, self.success_radius * 1.2)
+            else:
+                cover_dir = self._normalize_vec(cover_anchor - self.goal_pos)
+                if float(np.linalg.norm(cover_dir)) <= 1e-6:
+                    cover_dir = -goal_dir
+                target = cover_anchor + cover_dir * max(self.agent_radius * 2.2, self.success_radius * 0.9)
+
+        snapped = self._nearest_valid_point(target, max_radius=8)
+        if snapped is not None:
+            return snapped[0].astype(np.float32)
+        return target.astype(np.float32)
+
+    def _assign_roles(self) -> None:
+        base_roles = [
+            ROLE_FRONT,
+            ROLE_FLANK_LEFT,
+            ROLE_FLANK_RIGHT,
+            ROLE_COVER,
+        ]
+        for idx in range(self.num_agents):
+            if idx == 0:
+                role_id = ROLE_FRONT
+            else:
+                role_id = base_roles[(idx - 1) % len(base_roles)]
+            self.agent_role_ids[idx] = int(role_id)
+
+    def _update_role_targets(self) -> None:
+        for idx in range(self.num_agents):
+            self.role_targets[idx] = self._role_target_for(idx)
+
+    def _role_progress_delta(self, old_pos: np.ndarray, new_pos: np.ndarray, target_pos: np.ndarray) -> float:
+        old_d = float(np.linalg.norm(target_pos - old_pos))
+        new_d = float(np.linalg.norm(target_pos - new_pos))
+        return old_d - new_d
+
+    def _role_reward_bonus(self, agent_index: int, old_pos: np.ndarray, new_pos: np.ndarray) -> Tuple[float, Dict[str, float], bool]:
+        role_id = int(self.agent_role_ids[agent_index])
+        target = self.role_targets[agent_index]
+        terms: Dict[str, float] = {}
+        bonus = 0.0
+        tactical_success = False
+
+        role_progress = self._role_progress_delta(old_pos, new_pos, target)
+        role_progress_reward = 0.03 * role_progress
+        bonus += role_progress_reward
+        terms["role_progress"] = role_progress_reward
+
+        to_goal = self.goal_pos - new_pos
+        goal_dist = float(np.linalg.norm(to_goal))
+        goal_dir = self._normalize_vec(to_goal)
+        side_dir = np.array([-goal_dir[1], goal_dir[0]], dtype=np.float32)
+
+        if role_id == ROLE_FRONT:
+            directness = float(np.dot(self._normalize_vec(self.agent_velocities[agent_index]), goal_dir))
+            direct_bonus = 0.12 * max(0.0, directness)
+            bonus += direct_bonus
+            terms["role_front"] = direct_bonus
+            tactical_success = bool(goal_dist <= self.success_radius * 1.15 and directness >= 0.45)
+        elif role_id in (ROLE_FLANK_LEFT, ROLE_FLANK_RIGHT):
+            side_sign = 1.0 if role_id == ROLE_FLANK_LEFT else -1.0
+            side_offset = float(np.dot(new_pos - self.goal_pos, side_dir)) * side_sign
+            desired_band = max(self.success_radius * 0.8, self.agent_radius * 1.5)
+            flank_bonus = 0.0
+            if side_offset > 0.0:
+                flank_bonus += 0.08 * min(side_offset / max(desired_band, 1.0), 1.5)
+            front_gap = abs(float(np.dot(new_pos - self.goal_pos, goal_dir)))
+            flank_bonus -= 0.03 * min(front_gap / max(desired_band, 1.0), 1.0)
+            bonus += flank_bonus
+            terms["role_flank"] = flank_bonus
+            tactical_success = bool(
+                side_offset >= desired_band * 0.75
+                and front_gap <= desired_band * 1.1
+                and goal_dist <= self.success_radius * 2.5
+            )
+        else:
+            anchor = self._closest_cover_anchor(agent_index)
+            cover_bonus = 0.0
+            if anchor is not None:
+                anchor_to_goal = self.goal_pos - anchor
+                me_to_anchor = new_pos - anchor
+                behind_score = float(np.dot(self._normalize_vec(me_to_anchor), -self._normalize_vec(anchor_to_goal)))
+                cover_bonus += 0.10 * max(0.0, behind_score)
+                line_gap = float(np.linalg.norm((new_pos - self.goal_pos) - anchor_to_goal))
+                cover_bonus -= 0.02 * min(line_gap / max(self.agent_radius * 4.0, 1.0), 1.5)
+                anchor_dist = float(np.linalg.norm(me_to_anchor))
+                tactical_success = bool(
+                    behind_score >= 0.55
+                    and anchor_dist <= self.agent_radius * 3.5
+                    and goal_dist <= self.success_radius * 3.0
+                )
+            if goal_dist < self.success_radius * 0.6:
+                cover_bonus -= 0.05
+            bonus += cover_bonus
+            terms["role_cover"] = cover_bonus
+
+        terms["tactical_success"] = 1.0 if tactical_success else 0.0
+        return float(bonus), terms, tactical_success
+
+    def _pack_single_observation(self, agent_index: int) -> np.ndarray:
         scale = max(self.map_range, 1.0)
-        agent_pos3 = np.array([self.agent_pos[0], self.agent_height, self.agent_pos[1]], dtype=np.float32)
+        pos2 = self.agent_positions[agent_index]
+        height = self.agent_heights[agent_index]
+        agent_pos3 = np.array([pos2[0], height, pos2[1]], dtype=np.float32)
         goal_pos3 = np.array([self.goal_pos[0], self.goal_height, self.goal_pos[1]], dtype=np.float32)
         delta3 = goal_pos3 - agent_pos3
         center3 = np.array([self.map_center[0], 0.0, self.map_center[1]], dtype=np.float32)
@@ -570,30 +912,63 @@ class MajestroNavMeshEnv(gym.Env):
         agent_norm = (agent_pos3 - center3) / scale
         goal_norm = (goal_pos3 - center3) / scale
         delta_norm = delta3 / scale
-        last_target_norm = self._last_target_offset / max(self.tactical_target_radius, 1.0)
-        vel_norm = self._recent_vel / max(self.step_size, 1.0)
+        vel_norm = self.agent_velocities[agent_index] / max(self.step_size, 1.0)
 
-        rays = np.zeros(self.ray_count, dtype=np.float32)
-        for idx in range(self.ray_count):
-            theta = (2.0 * math.pi * idx) / float(self.ray_count)
-            direction = np.array([math.cos(theta), math.sin(theta)], dtype=np.float32)
-            rays[idx] = self._cast_ray(self.agent_pos, direction) / max(self.ray_length, 1.0)
-
-        geo = self._geo_distance(self.agent_pos)
-        geo_norm = np.array([0.0 if geo is None else geo / max(scale, 1.0)], dtype=np.float32)
+        other_obs, fail_code = self._sense_local_space(agent_index, scale)
+        role_value = self._role_value(agent_index)
 
         obs = np.concatenate(
             [
                 agent_norm.astype(np.float32),
                 goal_norm.astype(np.float32),
                 delta_norm.astype(np.float32),
-                last_target_norm.astype(np.float32),
                 vel_norm.astype(np.float32),
-                rays,
-                geo_norm,
+                other_obs,
+                role_value,
+                np.array([fail_code], dtype=np.float32),
             ]
         )
         return obs.astype(np.float32)
+
+    def _pack_observation(self) -> np.ndarray:
+        return np.stack([self._pack_single_observation(i) for i in range(self.num_agents)], axis=0).astype(np.float32)
+
+    def _sample_spawn_point(self, avoid_points: List[np.ndarray], min_dist: float, tries: int = 128) -> Tuple[np.ndarray, float]:
+        min_dist_sq = min_dist * min_dist
+        for _ in range(tries):
+            idx = int(self.rng.randrange(len(self._free_cells)))
+            rc = tuple(int(x) for x in self._free_cells[idx])
+            pos = self._grid_rc_to_world(rc[0], rc[1])
+            ok = True
+            for avoid in avoid_points:
+                dx = float(pos[0] - avoid[0])
+                dz = float(pos[1] - avoid[1])
+                if dx * dx + dz * dz < min_dist_sq:
+                    ok = False
+                    break
+            if ok:
+                return pos, float(self._height_map[rc[0], rc[1]])
+
+        idx = int(self.rng.randrange(len(self._free_cells)))
+        rc = tuple(int(x) for x in self._free_cells[idx])
+        return self._grid_rc_to_world(rc[0], rc[1]), float(self._height_map[rc[0], rc[1]])
+
+    def _reset_all_agents(self) -> None:
+        self.agent_positions = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self.agent_heights = np.zeros((self.num_agents,), dtype=np.float32)
+        self.agent_velocities = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self.last_target_offsets = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self.role_targets = np.zeros((self.num_agents, 2), dtype=np.float32)
+
+        self.agent_positions[0] = self.agent_pos.copy()
+        self.agent_heights[0] = self.agent_height
+        avoid = [self.agent_pos.copy(), self.goal_pos.copy()]
+        min_dist = max(self.agent_radius * 1.0, self.success_radius * self.agent_spawn_min_scale)
+        for idx in range(1, self.num_agents):
+            pos, height = self._sample_spawn_point(avoid, min_dist=min_dist)
+            self.agent_positions[idx] = pos
+            self.agent_heights[idx] = height
+            avoid.append(pos.copy())
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         options = options or {}
@@ -611,7 +986,7 @@ class MajestroNavMeshEnv(gym.Env):
         self.goal_pos = self.agent_pos.copy()
         self.goal_height = self.agent_height
 
-        min_goal_dist = max(self.step_size * 8.0, self.success_radius * 4.0)
+        min_goal_dist = max(self.step_size * 2.0, self.success_radius * self.goal_spawn_min_scale)
         for _ in range(128):
             goal_idx = int(self.rng.randrange(len(self._free_cells)))
             goal_rc = tuple(int(x) for x in self._free_cells[goal_idx])
@@ -655,12 +1030,18 @@ class MajestroNavMeshEnv(gym.Env):
             self._geo_map = best_geo
             self._geo_goal_rc = best_goal
 
+        self._reset_all_agents()
+        self._assign_roles()
+        self._update_role_targets()
+
         self.steps = 0
-        self._recent_vel[:] = 0.0
-        self._last_target_offset[:] = 0.0
-        self._prev_geo = self._geo_distance(self.agent_pos)
-        self._stall_best = self._prev_geo if self._prev_geo is not None else float(np.linalg.norm(self.goal_pos - self.agent_pos))
-        self._stall_wait = 0
+        self._prev_geo = np.full((self.num_agents,), np.nan, dtype=np.float32)
+        self._stall_best = np.full((self.num_agents,), np.nan, dtype=np.float32)
+        self._stall_wait = np.zeros((self.num_agents,), dtype=np.int32)
+        for idx in range(self.num_agents):
+            geo = self._geo_distance(self.agent_positions[idx])
+            self._prev_geo[idx] = np.nan if geo is None else geo
+            self._stall_best[idx] = geo if geo is not None else float(np.linalg.norm(self.goal_pos - self.agent_positions[idx]))
 
         if self.dynamic_horizon:
             self.max_steps = self._compute_dynamic_horizon()
@@ -670,85 +1051,137 @@ class MajestroNavMeshEnv(gym.Env):
         return self._pack_observation(), {}
 
     def step(self, action):
-        a = np.asarray(action, dtype=np.float32).reshape(-1)
-        if a.shape[0] != 2:
-            a = np.zeros(2, dtype=np.float32)
+        acts = np.asarray(action, dtype=np.float32)
+        if acts.ndim == 1:
+            acts = np.repeat(acts.reshape(1, -1), self.num_agents, axis=0)
+        if acts.shape != (self.num_agents, 2):
+            acts = np.zeros((self.num_agents, 2), dtype=np.float32)
 
-        old_pos = self.agent_pos.copy()
-        old_geo = self._geo_distance(old_pos)
-        target_offset = np.clip(a[:2], -1.0, 1.0) * self.tactical_target_radius
-        desired_target = old_pos + target_offset
-        snapped = self._nearest_valid_point(desired_target, max_radius=6)
-        if snapped is None:
-            tactical_target = old_pos.copy()
-        else:
-            tactical_target = snapped[0]
+        old_positions = self.agent_positions.copy()
+        old_geos = np.array([self._geo_distance(p) for p in old_positions], dtype=object)
+        old_role_targets = self.role_targets.copy()
+        sensor_fail_codes = np.zeros((self.num_agents,), dtype=np.float32)
+        tactical_targets = np.zeros_like(self.agent_positions)
+        requested_targets = np.zeros_like(self.agent_positions)
+        collisions = np.zeros((self.num_agents,), dtype=bool)
+        rewards = np.full((self.num_agents,), -self.time_penalty, dtype=np.float32)
+        terms_list = [{"time_penalty": -self.time_penalty} for _ in range(self.num_agents)]
 
-        to_target = tactical_target - old_pos
-        target_dist = float(np.linalg.norm(to_target))
-        if target_dist > self.step_size and target_dist > 1e-6:
-            movement_target = old_pos + (to_target / target_dist) * self.step_size
-        else:
-            movement_target = tactical_target
+        for idx in range(self.num_agents):
+            old_pos = old_positions[idx]
+            _, fail_code = self._sense_local_space(idx, max(self.map_range, 1.0))
+            sensor_fail_codes[idx] = fail_code
+            target_offset = np.clip(acts[idx], -1.0, 1.0) * self.tactical_target_radius
+            if fail_code > 0.5:
+                waypoint = self._geo_next_waypoint(old_pos, max_search=3)
+                desired_target = self.goal_pos.copy() if waypoint is None else waypoint
+            else:
+                desired_target = old_pos + target_offset
+            snapped = self._nearest_valid_point(desired_target, max_radius=6)
+            tactical_target = old_pos.copy() if snapped is None else snapped[0]
 
-        new_pos, new_height, collided = self._move_along_navmesh(old_pos, movement_target)
-        self.agent_pos = new_pos
-        self.agent_height = new_height
+            to_target = tactical_target - old_pos
+            target_dist = float(np.linalg.norm(to_target))
+            step_size = self.step_size
+            if target_dist > step_size and target_dist > 1e-6:
+                movement_target = old_pos + (to_target / target_dist) * step_size
+            else:
+                movement_target = tactical_target
+
+            new_pos, new_height, collided = self._move_with_agent_avoidance(
+                old_pos,
+                movement_target,
+                ignore_index=idx,
+                start_height=float(self.agent_heights[idx]),
+            )
+            self.agent_positions[idx] = new_pos
+            self.agent_heights[idx] = new_height
+            self.agent_velocities[idx] = new_pos - old_pos
+            self.last_target_offsets[idx] = target_offset.astype(np.float32)
+            tactical_targets[idx] = tactical_target
+            requested_targets[idx] = desired_target
+            collisions[idx] = collided
+
+        self.agent_pos = self.agent_positions[0].copy()
+        self.agent_height = float(self.agent_heights[0])
         self.steps += 1
+        self._update_role_targets()
 
-        self._recent_vel = self.agent_pos - old_pos
-        self._last_target_offset = target_offset.astype(np.float32)
-
-        dist_to_goal = float(np.linalg.norm(self.goal_pos - self.agent_pos))
-        terminated = dist_to_goal <= self.success_radius
+        dists = np.linalg.norm(self.goal_pos[None, :] - self.agent_positions, axis=1).astype(np.float32)
+        success_mask = np.zeros((self.num_agents,), dtype=bool)
         truncated = self.steps >= self.max_steps
+        terminated = False
 
-        reward = -self.time_penalty
-        terms = {"time_penalty": -self.time_penalty}
+        geo_dists = []
+        for idx in range(self.num_agents):
+            old_geo = old_geos[idx]
+            new_geo = self._geo_distance(self.agent_positions[idx])
+            geo_dists.append(new_geo)
+            if old_geo is not None and new_geo is not None:
+                geo_delta = float(old_geo) - float(new_geo)
+                rewards[idx] += self.progress_coef * geo_delta
+                terms_list[idx]["geo_delta"] = self.progress_coef * geo_delta
+                cur_metric = float(new_geo)
+            else:
+                eu_delta = float(np.linalg.norm(self.goal_pos - old_positions[idx]) - dists[idx])
+                rewards[idx] += self.progress_coef * eu_delta
+                terms_list[idx]["euclid_delta"] = self.progress_coef * eu_delta
+                cur_metric = float(dists[idx])
 
-        new_geo = self._geo_distance(self.agent_pos)
-        if old_geo is not None and new_geo is not None:
-            geo_delta = old_geo - new_geo
-            reward += self.progress_coef * geo_delta
-            terms["geo_delta"] = self.progress_coef * geo_delta
-            self._prev_geo = new_geo
-            cur_metric = new_geo
-        else:
-            eu_delta = float(np.linalg.norm(self.goal_pos - old_pos) - dist_to_goal)
-            reward += self.progress_coef * eu_delta
-            terms["euclid_delta"] = self.progress_coef * eu_delta
-            cur_metric = dist_to_goal
+            if collisions[idx]:
+                rewards[idx] -= self.collision_penalty
+                terms_list[idx]["collision_penalty"] = -self.collision_penalty
 
-        if collided:
-            reward -= self.collision_penalty
-            terms["collision_penalty"] = -self.collision_penalty
+            separation_pen = self._separation_penalty_value(self.agent_positions[idx])
+            if separation_pen > 0.0:
+                sep_reward = -0.25 * separation_pen
+                rewards[idx] += sep_reward
+                terms_list[idx]["separation_penalty"] = sep_reward
 
-        if self._stall_best is None or cur_metric < self._stall_best - 1.0:
-            self._stall_best = cur_metric
-            self._stall_wait = 0
-        else:
-            self._stall_wait += 1
-            if self._stall_wait >= self.stall_patience:
-                reward -= self.stall_penalty
-                terms["stall_penalty"] = -self.stall_penalty
+            self.role_targets[idx] = old_role_targets[idx]
+            role_bonus, role_terms, tactical_success = self._role_reward_bonus(idx, old_positions[idx], self.agent_positions[idx])
+            self.role_targets[idx] = self._role_target_for(idx)
+            rewards[idx] += role_bonus
+            terms_list[idx].update(role_terms)
+            success_mask[idx] = bool(tactical_success)
 
-        if terminated:
-            reward += self._R_SUCCESS
-            terms["success"] = self._R_SUCCESS
-            self.agent_pos = self.goal_pos.copy()
-            self.agent_height = self.goal_height
+            best = float(self._stall_best[idx])
+            if np.isnan(best) or cur_metric < best - 1.0:
+                self._stall_best[idx] = cur_metric
+                self._stall_wait[idx] = 0
+            else:
+                self._stall_wait[idx] += 1
+                if self._stall_wait[idx] >= self.stall_patience:
+                    rewards[idx] -= self.stall_penalty
+                    terms_list[idx]["stall_penalty"] = -self.stall_penalty
+
+            self._prev_geo[idx] = np.nan if new_geo is None else float(new_geo)
+
+            if success_mask[idx]:
+                rewards[idx] += self._R_SUCCESS
+                terms_list[idx]["success"] = self._R_SUCCESS
+
+        terminated = bool(np.all(success_mask))
+
+        self.agent_pos = self.agent_positions[0].copy()
+        self.agent_height = float(self.agent_heights[0])
 
         info = {
-            "dist_to_goal": dist_to_goal,
-            "collided": bool(collided),
-            "geo_dist": new_geo,
-            "reward_terms": terms,
-            "agent_height": float(self.agent_height),
+            "dist_to_goal": dists.copy(),
+            "collided": collisions.copy(),
+            "geo_dist": np.array([np.nan if g is None else float(g) for g in geo_dists], dtype=np.float32),
+            "reward_terms": terms_list,
+            "agent_heights": self.agent_heights.copy(),
             "goal_height": float(self.goal_height),
-            "tactical_target": tactical_target.astype(np.float32),
-            "requested_target": desired_target.astype(np.float32),
+            "tactical_target": tactical_targets.copy(),
+            "requested_target": requested_targets.copy(),
+            "agent_positions": self.agent_positions.copy(),
+            "success_mask": success_mask.copy(),
+            "role_ids": self.agent_role_ids.copy(),
+            "role_targets": self.role_targets.copy(),
+            "sensor_fail_code": sensor_fail_codes.copy(),
         }
-        return self._pack_observation(), float(reward), terminated, truncated, info
+        return self._pack_observation(), rewards.astype(np.float32), terminated, truncated, info
 
     def render(self, mode: str = "human"):
         print(

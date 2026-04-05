@@ -4,15 +4,15 @@ import numpy as np
 import torch
 
 # ---- Build env from user's ENV module if present ----
-def build_env():
+def build_env(**env_kwargs):
     try:
         import ENV as ENV_mod
         if hasattr(ENV_mod, "make_env") and callable(ENV_mod.make_env):
-            return ENV_mod.make_env()
+            return ENV_mod.make_env(**env_kwargs)
         for name in ("Vector2DEnv", "Env"):
             if hasattr(ENV_mod, name):
                 cls = getattr(ENV_mod, name)
-                return cls() if callable(cls) else cls
+                return cls(**env_kwargs) if callable(cls) else cls
     except Exception as e:
         print(f"[WARN] Using fallback env due to import error: {e}")
     try:
@@ -32,9 +32,9 @@ def set_global_seed(seed: int):
 def main():
     ap = argparse.ArgumentParser(description="PyCharm-friendly training runner (no CMD args needed).")
     # Core
-    ap.add_argument("--episodes", type=int, default=20000)
+    ap.add_argument("--episodes", type=int, default=8000)
     ap.add_argument("--max-steps", type=int, default=None)
-    ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument("--batch-size", type=int, default=1024)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--resume", action="store_true", default=False)     # may be auto-enabled
     ap.add_argument("--strict-resume", action="store_true", default=False)
@@ -43,21 +43,21 @@ def main():
                     help="If set, never auto-resume even if ckpt exists.")
 
     # Success mixing
-    ap.add_argument("--p-succ", type=float, default=0.00)
+    ap.add_argument("--p-succ", type=float, default=0.10)
     ap.add_argument("--succ-buffer-cap", type=int, default=200_000)
-    ap.add_argument("--succ-gate-min", type=int, default=2048)
+    ap.add_argument("--succ-gate-min", type=int, default=8192)
     ap.add_argument("--succ-ramp-cov", type=float, default=0.25)
     ap.add_argument("--succ-min-dist", type=float, default=0.20)
 
     # Updates & exploration
-    ap.add_argument("--updates-per-step", type=int, default=1)
-    ap.add_argument("--alpha-floor", type=float, default=0.05)
-    ap.add_argument("--alpha-ceiling", type=float, default=2.00)
+    ap.add_argument("--updates-per-step", type=int, default=2)
+    ap.add_argument("--alpha-floor", type=float, default=0.03)
+    ap.add_argument("--alpha-ceiling", type=float, default=0.50)
 
     # Best saving
     ap.add_argument("--save-best-online", action="store_true", default=True)
     ap.add_argument("--best-delta", type=float, default=0.01)
-    ap.add_argument("--best-min-episodes", type=int, default=100)
+    ap.add_argument("--best-min-episodes", type=int, default=50)
     ap.add_argument("--best-ckpt-path", type=str, default="sac_best.pth")
     ap.add_argument("--best-actor-path", type=str, default="sac_actor_best.pth")
 
@@ -68,9 +68,20 @@ def main():
     ap.add_argument("--dyn-tmax", type=int, default=2048)
     ap.add_argument("--dyn-geo", action="store_true", default=True)
 
-    ap.add_argument("--alpha-freeze-recent", type=float, default=1.000)  # 0.40 = 40%
+    # [PATCH] 주석과 기본값을 맞췄다. 1.000 이면 사실상 freeze가 거의 안 걸린다.
+    ap.add_argument("--alpha-freeze-recent", type=float, default=0.40)  # 0.40 = 40%
     ap.add_argument("--alpha-freeze-succbuf", type=int, default=150_000)
     ap.add_argument("--alpha-fixed", type=float, default=0.397)
+
+    # Env
+    ap.add_argument("--move-step-size", type=float, default=120.0)
+    ap.add_argument("--tactical-target-radius", type=float, default=600.0)
+    ap.add_argument("--num-other-agents", type=int, default=4)
+    ap.add_argument("--observed-other-agents", type=int, default=3)
+    ap.add_argument("--agent-radius", type=float, default=90.0)
+    ap.add_argument("--sense-radius", type=float, default=600.0)
+    ap.add_argument("--goal-spawn-min-scale", type=float, default=4.0)
+    ap.add_argument("--agent-spawn-min-scale", type=float, default=2.0)
 
     args = ap.parse_args()
 
@@ -81,7 +92,17 @@ def main():
     import Model as Model
 
     # Build ENV
-    env = build_env()
+    env = build_env(
+        seed=args.seed,
+        move_step_size=args.move_step_size,
+        tactical_target_radius=args.tactical_target_radius,
+        num_other_agents=args.num_other_agents,
+        observed_other_agents=args.observed_other_agents,
+        agent_radius=args.agent_radius,
+        sense_radius=args.sense_radius,
+        goal_spawn_min_scale=args.goal_spawn_min_scale,
+        agent_spawn_min_scale=args.agent_spawn_min_scale,
+    )
     # Apply dynamic horizon params if supported
     if hasattr(env, "dynamic_horizon"):
         env.dynamic_horizon = bool(args.dyn_horizon)
@@ -107,8 +128,8 @@ def main():
     bundle = None
     if args.resume:
         try:
-            obs_dim = int(np.asarray(obs).shape[-1])
-            act_dim = int(getattr(getattr(env, "action_space", None), "shape", [2])[0])
+            obs_dim = int(getattr(env, "single_agent_obs_dim", np.asarray(obs).shape[-1]))
+            act_dim = int(getattr(env, "single_agent_act_dim", 2))
             bundle = Model.load_sac_checkpoint(args.ckpt, obs_dim, act_dim, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
             print(f"[INFO] Loaded checkpoint from {args.ckpt}")
         except Exception as e:
@@ -121,6 +142,7 @@ def main():
     mode = "RESUME" if bundle else "FRESH"
     auto = " (auto)" if auto_resume else ""
     print(f"[MODE] {mode}{auto} | episodes={args.episodes} | batch={args.batch_size} | max_steps={args.max_steps} | dyn_horizon={getattr(env, 'dynamic_horizon', 'N/A')}")
+    print(f"[ENV] agents={getattr(env, 'num_agents', 'N/A')} move_step={args.move_step_size} target_radius={args.tactical_target_radius} observed_others={args.observed_other_agents}")
     print(f"[CKPT] in/out: {args.ckpt} | best_ckpt={args.best_ckpt_path} | best_actor={args.best_actor_path}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -128,16 +150,8 @@ def main():
     # Start training
     Model.sac_train(
         env=env,
-        # actor=bundle["actor"],
-        # critic_1=bundle["critic_1"],
-        # critic_2=bundle["critic_2"],
-        # target_critic_1=bundle["target_critic_1"],
-        # target_critic_2=bundle["target_critic_2"],
-        # actor_opt=bundle["actor_opt"],
-        # critic_1_opt=bundle["critic_1_opt"],
-        # critic_2_opt=bundle["critic_2_opt"],
-        # replay_buffer=bundle["replay_buffer"],
-
+        # [PATCH] bundle 내부를 sac_train() 에서 실제로 복구하도록 수정했다.
+        bundle=bundle,
         episodes=args.episodes,
         max_steps=args.max_steps,
         batch_size=args.batch_size,
@@ -157,7 +171,6 @@ def main():
         best_min_episodes=args.best_min_episodes,
         best_ckpt_path=args.best_ckpt_path,
         best_actor_path=args.best_actor_path,
-        bundle=bundle,
         device=device,
     )
 

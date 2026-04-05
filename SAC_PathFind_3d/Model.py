@@ -39,6 +39,72 @@ def step_env(env, action):
     raise RuntimeError("Unsupported env.step(...) return format")
 
 
+def _is_multi_agent_obs(obs):
+    arr = np.asarray(obs)
+    return arr.ndim >= 2
+
+
+def infer_single_agent_obs_dim(env, probe_obs) -> int:
+    if hasattr(env, "single_agent_obs_dim"):
+        return int(env.single_agent_obs_dim)
+    arr = np.asarray(probe_obs)
+    if arr.ndim >= 2:
+        return int(arr.shape[-1])
+    if arr.ndim == 1:
+        return int(arr.shape[0])
+    return int(len(probe_obs))
+
+
+def infer_single_agent_act_dim(env) -> int:
+    if hasattr(env, "single_agent_act_dim"):
+        return int(env.single_agent_act_dim)
+    if hasattr(env, "action_space") and hasattr(env.action_space, "shape"):
+        shape = tuple(int(x) for x in env.action_space.shape)
+        if len(shape) >= 2:
+            return int(shape[-1])
+        if len(shape) == 1:
+            return int(shape[0])
+    return 2
+
+
+def extract_role_success(info: Dict[str, Any]) -> Dict[str, bool]:
+    result = {
+        "front": False,
+        "flank_left": False,
+        "flank_right": False,
+        "cover": False,
+    }
+    if not isinstance(info, dict):
+        return result
+    role_ids = info.get("role_ids", None)
+    success_mask = info.get("success_mask", None)
+    if role_ids is None or success_mask is None:
+        return result
+    try:
+        role_ids = np.asarray(role_ids, dtype=np.int32).reshape(-1)
+        success_mask = np.asarray(success_mask, dtype=bool).reshape(-1)
+    except Exception:
+        return result
+    for role_id, success in zip(role_ids, success_mask):
+        if not bool(success):
+            continue
+        if int(role_id) == 0:
+            result["front"] = True
+        elif int(role_id) == 1:
+            result["flank_left"] = True
+        elif int(role_id) == 2:
+            result["flank_right"] = True
+        elif int(role_id) == 3:
+            result["cover"] = True
+    return result
+
+
+def is_diverse_tactical_success(info: Dict[str, Any]) -> bool:
+    role_success = extract_role_success(info)
+    flank_ok = role_success["flank_left"] or role_success["flank_right"]
+    return bool(role_success["front"] and flank_ok and role_success["cover"])
+
+
 # ----------------------------
 # Small helpers
 # ----------------------------
@@ -213,29 +279,20 @@ def evaluate_success(env, actor: GaussianPolicy, episodes: int = 10, max_steps: 
         info: Dict[str, Any] = {}
         reward = 0.0
         while not done:
-            s = to_tensor(obs, device).unsqueeze(0)
-            a = actor.act_deterministic(s).squeeze(0).cpu().numpy()
+            obs_arr = np.asarray(obs, dtype=np.float32)
+            if _is_multi_agent_obs(obs_arr):
+                s = to_tensor(obs_arr, device)
+                a = actor.act_deterministic(s).cpu().numpy()
+            else:
+                s = to_tensor(obs_arr, device).unsqueeze(0)
+                a = actor.act_deterministic(s).squeeze(0).cpu().numpy()
             obs, reward, done, info = step_env(env, a)
             steps += 1
             if (max_steps is not None) and (steps >= max_steps):
                 break
 
         # Success detection with fallbacks
-        success = False
-        if isinstance(info, dict):
-            terms = (info.get("reward_terms") or {})
-            if terms.get("success", 0):
-                success = True
-            elif info.get("success", False):
-                success = True
-            elif float(reward) > 100.0:
-                success = True
-            else:
-                dist = info.get("dist_to_goal", None)
-                if dist is not None:
-                    radius = float(getattr(env, "success_radius", 0.5))
-                    if float(dist) <= radius + 1e-6:
-                        success = True
+        success = is_diverse_tactical_success(info)
         ok += int(success)
     return ok / float(max(1, episodes))
 
@@ -246,6 +303,7 @@ def save_sac_checkpoint(path: str,
                         actor_opt: optim.Optimizer, critic_1_opt: optim.Optimizer, critic_2_opt: optim.Optimizer,
                         replay_buffer: ReplayBuffer,
                         alpha: float, target_entropy: float,
+                        succ_replay_buffer: Optional[SuccessReplayBuffer] = None,
                         extra: Optional[Dict[str, Any]] = None,
                         **kwargs):
     """Save a minimal but sufficient checkpoint for resuming."""
@@ -269,6 +327,16 @@ def save_sac_checkpoint(path: str,
             "nobs": list(replay_buffer.nobs),
             "done": list(replay_buffer.done),
             "capacity": replay_buffer.capacity,
+        },
+        # [PATCH] 성공 리플레이도 같이 저장해야 resume 시 성공 샘플 분포가 유지된다.
+        "succ_replay": None if succ_replay_buffer is None else {
+            "obs": list(succ_replay_buffer.obs),
+            "act": list(succ_replay_buffer.act),
+            "rew": list(succ_replay_buffer.rew),
+            "nobs": list(succ_replay_buffer.nobs),
+            "done": list(succ_replay_buffer.done),
+            "dists": list(succ_replay_buffer.dists),
+            "capacity": succ_replay_buffer.capacity,
         },
         "alpha": float(alpha),
         "target_entropy": float(target_entropy),
@@ -305,6 +373,20 @@ def load_sac_checkpoint(path: str, obs_dim: int, act_dim: int, device: Optional[
     for s, a, r, ns, d in zip(ckpt["replay"]["obs"], ckpt["replay"]["act"], ckpt["replay"]["rew"], ckpt["replay"]["nobs"], ckpt["replay"]["done"]):
         rb.push(s, a, r, ns, d)
 
+    # [PATCH] 성공 리플레이 버퍼도 복구한다. 없으면 빈 버퍼로 시작한다.
+    succ_rb_data = ckpt.get("succ_replay", None)
+    succ_rb = SuccessReplayBuffer(capacity=(succ_rb_data["capacity"] if succ_rb_data is not None else 200_000))
+    if succ_rb_data is not None:
+        for s, a, r, ns, d, dist in zip(
+            succ_rb_data["obs"],
+            succ_rb_data["act"],
+            succ_rb_data["rew"],
+            succ_rb_data["nobs"],
+            succ_rb_data["done"],
+            succ_rb_data["dists"],
+        ):
+            succ_rb.push_with_dist(s, a, r, ns, d, None if float(dist) < 0.0 else float(dist))
+
     alpha = float(ckpt.get("alpha", 0.2))
     target_entropy = float(ckpt.get("target_entropy", -float(act_dim)))
 
@@ -313,6 +395,7 @@ def load_sac_checkpoint(path: str, obs_dim: int, act_dim: int, device: Optional[
         "target_critic_1": target_critic_1, "target_critic_2": target_critic_2,
         "actor_opt": actor_opt, "critic_1_opt": critic_1_opt, "critic_2_opt": critic_2_opt,
         "replay_buffer": rb,
+        "succ_replay_buffer": succ_rb,
         "alpha": alpha, "target_entropy": target_entropy,
     }
 
@@ -332,6 +415,9 @@ def sac_train(env,
               critic_2_opt: Optional[optim.Optimizer] = None,
               replay_buffer: Optional[ReplayBuffer] = None,
               succ_replay_buffer: Optional[SuccessReplayBuffer] = None,
+              # [PATCH] 런처에서 넘긴 checkpoint bundle / success buffer 용량을 실제로 사용한다.
+              bundle: Optional[Dict[str, Any]] = None,
+              succ_buffer_capacity: int = 200_000,
               episodes: int = 500,
               max_steps: int = 512,
               batch_size: int = 128,
@@ -371,14 +457,21 @@ def sac_train(env,
 
     # infer obs/act dimensions
     _probe = reset_env(env)
-    if isinstance(_probe, (list, tuple, np.ndarray)):
-        obs_dim = int(np.asarray(_probe).shape[-1])
-    else:
-        obs_dim = int(len(_probe))
-    if hasattr(env, "action_space") and hasattr(env.action_space, "shape"):
-        act_dim = int(env.action_space.shape[0])
-    else:
-        act_dim = 2
+    obs_dim = infer_single_agent_obs_dim(env, _probe)
+    act_dim = infer_single_agent_act_dim(env)
+
+    if bundle is not None:
+        # [PATCH] Test.py 에서 bundle 만 넘겨도 resume 가 실제로 되도록 복구한다.
+        actor = actor if actor is not None else bundle.get("actor")
+        critic_1 = critic_1 if critic_1 is not None else bundle.get("critic_1")
+        critic_2 = critic_2 if critic_2 is not None else bundle.get("critic_2")
+        target_critic_1 = target_critic_1 if target_critic_1 is not None else bundle.get("target_critic_1")
+        target_critic_2 = target_critic_2 if target_critic_2 is not None else bundle.get("target_critic_2")
+        actor_opt = actor_opt if actor_opt is not None else bundle.get("actor_opt")
+        critic_1_opt = critic_1_opt if critic_1_opt is not None else bundle.get("critic_1_opt")
+        critic_2_opt = critic_2_opt if critic_2_opt is not None else bundle.get("critic_2_opt")
+        replay_buffer = replay_buffer if replay_buffer is not None else bundle.get("replay_buffer")
+        succ_replay_buffer = succ_replay_buffer if succ_replay_buffer is not None else bundle.get("succ_replay_buffer")
 
     # networks
     if actor is None:
@@ -404,15 +497,22 @@ def sac_train(env,
     if replay_buffer is None:
         replay_buffer = ReplayBuffer(capacity=1_000_000)
     if succ_replay_buffer is None:
-        succ_replay_buffer = SuccessReplayBuffer(capacity=200_000)
+        # [PATCH] CLI 의 --succ-buffer-cap 이 실제 버퍼 크기에 반영되도록 수정.
+        succ_replay_buffer = SuccessReplayBuffer(capacity=succ_buffer_capacity)
 
     # alpha auto-tuning
-    target_entropy = -float(act_dim)
-    log_alpha = nn.Parameter(torch.tensor(np.log(0.2), dtype=torch.float32, device=device))
+    init_alpha = 0.2 if bundle is None else float(bundle.get("alpha", 0.2))
+    target_entropy = -float(act_dim) if bundle is None else float(bundle.get("target_entropy", -float(act_dim)))
+    # [PATCH] resume 시 alpha 도 같이 이어받는다.
+    log_alpha = nn.Parameter(torch.tensor(np.log(init_alpha), dtype=torch.float32, device=device))
     log_alpha_opt = optim.Adam([log_alpha], lr=1e-5)
     alpha = float(log_alpha.exp().item())
 
     recent_success: deque[int] = deque(maxlen=100)
+    recent_front_success: deque[int] = deque(maxlen=100)
+    recent_flank_left_success: deque[int] = deque(maxlen=100)
+    recent_flank_right_success: deque[int] = deque(maxlen=100)
+    recent_cover_success: deque[int] = deque(maxlen=100)
     best_score = -1.0
 
     alpha_frozen = False
@@ -422,41 +522,58 @@ def sac_train(env,
         done = False
         ep_steps = 0
         ep_reward = 0.0
-        episode_traj: List[Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool, Optional[float]]] = []
+        episode_traj: List[List[Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool, Optional[float]]]] = []
         info: Dict[str, Any] = {}
         last_reward = 0.0
+        obs_arr0 = np.asarray(obs, dtype=np.float32)
+        n_agents = int(obs_arr0.shape[0]) if _is_multi_agent_obs(obs_arr0) else 1
+        episode_traj = [[] for _ in range(n_agents)]
 
         ep_horizon = (env.max_steps if (max_steps is None and hasattr(env, "max_steps"))
                       else max_steps)
         while (not done) and (ep_steps < (ep_horizon if ep_horizon is not None else 10**9)):
-            s = to_tensor(obs, device).unsqueeze(0)
-            act_t, logp_t = actor.sample(s)
-            act = act_t.squeeze(0).detach().cpu().numpy()
+            obs_arr = np.asarray(obs, dtype=np.float32)
+            if _is_multi_agent_obs(obs_arr):
+                s = to_tensor(obs_arr, device)
+                act_t, logp_t = actor.sample(s)
+                act = act_t.detach().cpu().numpy()
+            else:
+                s = to_tensor(obs_arr, device).unsqueeze(0)
+                act_t, logp_t = actor.sample(s)
+                act = act_t.squeeze(0).detach().cpu().numpy()
 
             next_obs, reward, done, info = step_env(env, act)
             ep_steps += 1
-            ep_reward += float(reward)
-            last_reward = float(reward)
+            reward_arr = np.asarray(reward, dtype=np.float32)
+            next_obs_arr = np.asarray(next_obs, dtype=np.float32)
+            if reward_arr.ndim == 0:
+                reward_arr = reward_arr.reshape(1)
+            if not _is_multi_agent_obs(obs_arr):
+                obs_arr = obs_arr.reshape(1, -1)
+                next_obs_arr = next_obs_arr.reshape(1, -1)
+                act = np.asarray(act, dtype=np.float32).reshape(1, -1)
 
-            # push to main buffer
-            replay_buffer.push(obs, act, reward, next_obs, done)
+            ep_reward += float(np.mean(reward_arr))
+            last_reward = float(np.mean(reward_arr))
 
-            # cache into episode_traj (with optional distance)
-            dist = None
-            if isinstance(info, dict):
-                if "dist_to_goal" in info and info["dist_to_goal"] is not None:
-                    try:
-                        dist = float(info["dist_to_goal"])
-                    except Exception:
-                        dist = None
-            episode_traj.append((
-                np.asarray(obs, dtype=np.float32),
-                np.asarray(act, dtype=np.float32),
-                float(reward),
-                np.asarray(next_obs, dtype=np.float32),
-                bool(done),
-                dist
-            ))
+            dist_values = None
+            if isinstance(info, dict) and ("dist_to_goal" in info) and info["dist_to_goal"] is not None:
+                try:
+                    dist_values = np.asarray(info["dist_to_goal"], dtype=np.float32).reshape(-1)
+                except Exception:
+                    dist_values = None
+
+            for agent_idx in range(obs_arr.shape[0]):
+                dist = None if dist_values is None or agent_idx >= len(dist_values) else float(dist_values[agent_idx])
+                replay_buffer.push(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done)
+                episode_traj[agent_idx].append((
+                    np.asarray(obs_arr[agent_idx], dtype=np.float32),
+                    np.asarray(act[agent_idx], dtype=np.float32),
+                    float(reward_arr[agent_idx]),
+                    np.asarray(next_obs_arr[agent_idx], dtype=np.float32),
+                    bool(done),
+                    dist
+                ))
 
             obs = next_obs
 
@@ -556,34 +673,27 @@ def sac_train(env,
                     soft_update_(critic_2, target_critic_2, tau)
 
         # ---- episode end: success detection (fallbacks) ----
-        episode_success = False
-        if isinstance(info, dict):
-            terms = (info.get("reward_terms") or {})
-            if terms.get("success", 0):
-                episode_success = True
-        if (not episode_success) and isinstance(info, dict) and info.get("success", False):
-            episode_success = True
-        if (not episode_success) and (float(last_reward) > 100.0):
-            episode_success = True
-        if (not episode_success) and isinstance(info, dict):
-            if "dist_to_goal" in info and info["dist_to_goal"] is not None:
-                try:
-                    dist_end = float(info["dist_to_goal"])
-                    radius = float(getattr(env, "success_radius", 0.5))
-                    if dist_end <= radius + 1e-6:
-                        episode_success = True
-                except Exception:
-                    pass
+        role_success = extract_role_success(info)
+        episode_success = is_diverse_tactical_success(info)
 
         if episode_success:
-            for (s_, a_, r_, ns_, d_, dist_) in episode_traj:
-                if dist_ is None:
-                    succ_replay_buffer.push(s_, a_, r_, ns_, d_)
-                else:
-                    succ_replay_buffer.push_with_dist(s_, a_, r_, ns_, d_, dist_)
+            for agent_traj in episode_traj:
+                for (s_, a_, r_, ns_, d_, dist_) in agent_traj:
+                    if dist_ is None:
+                        succ_replay_buffer.push(s_, a_, r_, ns_, d_)
+                    else:
+                        succ_replay_buffer.push_with_dist(s_, a_, r_, ns_, d_, dist_)
 
         recent_success.append(1 if episode_success else 0)
+        recent_front_success.append(1 if role_success["front"] else 0)
+        recent_flank_left_success.append(1 if role_success["flank_left"] else 0)
+        recent_flank_right_success.append(1 if role_success["flank_right"] else 0)
+        recent_cover_success.append(1 if role_success["cover"] else 0)
         recent_rate = 100.0 * (sum(recent_success) / max(1, len(recent_success)))
+        front_rate = 100.0 * (sum(recent_front_success) / max(1, len(recent_front_success)))
+        flank_left_rate = 100.0 * (sum(recent_flank_left_success) / max(1, len(recent_flank_left_success)))
+        flank_right_rate = 100.0 * (sum(recent_flank_right_success) / max(1, len(recent_flank_right_success)))
+        cover_rate = 100.0 * (sum(recent_cover_success) / max(1, len(recent_cover_success)))
 
         # === NEW: freeze trigger ===
         if (not alpha_frozen) and (alpha_freeze_recent is not None):
@@ -599,6 +709,7 @@ def sac_train(env,
         if (ep + 1) % 10 == 0:
             print(f"[EP {ep+1:5d}] steps={ep_steps:3d}  R={ep_reward:8.2f}  succ={int(episode_success)}  "
                   f"recent@{len(recent_success)}={recent_rate:5.1f}%  "
+                  f"| role(front/fl/flr/cov)={front_rate:4.1f}/{flank_left_rate:4.1f}/{flank_right_rate:4.1f}/{cover_rate:4.1f} "
                   f"| alpha={alpha:.3f} | succ_buf={len(succ_replay_buffer)}")
 
         # zero-cost best-by-online metric
@@ -610,6 +721,7 @@ def sac_train(env,
                                     target_critic_1, target_critic_2,
                                     actor_opt, critic_1_opt, critic_2_opt,
                                     replay_buffer, alpha, target_entropy,
+                                    succ_replay_buffer=succ_replay_buffer,
                                     extra={"best_score": best_score, "episodes": ep + 1})
                 torch.save(actor.state_dict(), best_actor_path)
                 print(f"[BEST-online] ep={ep+1} mean={recent_mean:.3f} → saved {best_actor_path}")
