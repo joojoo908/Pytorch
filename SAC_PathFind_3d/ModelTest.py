@@ -91,7 +91,17 @@ def reset_env_compat(env):
     return out, {}
 
 
-def recover_descent_path_world(env, start_pos, max_len=256):
+def recover_descent_path_world(env, start_pos, start_height=None, max_len=256):
+    recover = getattr(env, "recover_fallback_path_world", None)
+    if callable(recover):
+        try:
+            return recover(start_pos, start_height=start_height, max_len=max_len)
+        except TypeError:
+            try:
+                return recover(start_pos)
+            except Exception:
+                pass
+
     geo = getattr(env, "_geo_map", None)
     pos_to_rc = getattr(env, "_pos_to_geo_rc", None)
     rc_to_world = getattr(env, "_grid_rc_to_world", None)
@@ -275,7 +285,10 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
                         continue
                     role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
                     color = ROLE_COLORS.get(role_id, (160, 160, 160))
-                    path = recover_descent_path_world(env, pos, max_len=256)
+                    start_height = None
+                    if idx < len(env.agent_heights):
+                        start_height = float(env.agent_heights[idx])
+                    path = recover_descent_path_world(env, pos, start_height=start_height, max_len=256)
                     if len(path) >= 2:
                         pygame.draw.lines(screen, color, False, [world_to_screen(p) for p in path], 1)
 
