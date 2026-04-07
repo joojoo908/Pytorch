@@ -274,8 +274,9 @@ class MajestroNavMeshEnv(gym.Env):
         observed_other_agents: int = 3,
         agent_radius: float = 90.0,
         success_radius: float = 120.0,
-        goal_spawn_min_scale: float = 4.0,
-        agent_spawn_min_scale: float = 2.0,
+        goal_spawn_min_scale: float = 0.001,
+        agent_spawn_min_scale: float = 0.00001,
+        agent_spawn_max_scale: float = 0.0001,
         max_steps: int = 512,
         seed: int = 1,
         grid_resolution: int = 256,
@@ -309,6 +310,7 @@ class MajestroNavMeshEnv(gym.Env):
         self.success_radius = float(success_radius)
         self.goal_spawn_min_scale = float(goal_spawn_min_scale)
         self.agent_spawn_min_scale = float(agent_spawn_min_scale)
+        self.agent_spawn_max_scale = float(max(agent_spawn_max_scale, self.agent_spawn_min_scale))
         self.max_steps = int(max_steps)
         self.base_max_steps = int(max_steps)
         self.grid_resolution = int(grid_resolution)
@@ -1104,12 +1106,29 @@ class MajestroNavMeshEnv(gym.Env):
     def _pack_observation(self) -> np.ndarray:
         return np.stack([self._pack_single_observation(i) for i in range(self.num_agents)], axis=0).astype(np.float32)
 
-    def _sample_spawn_point(self, avoid_points: List[np.ndarray], min_dist: float, tries: int = 128) -> Tuple[np.ndarray, float]:
+    def _sample_spawn_point(
+            self,
+            avoid_points: List[np.ndarray],
+            min_dist: float,
+            tries: int = 128,
+            anchor: Optional[np.ndarray] = None,
+            max_dist: Optional[float] = None,
+    ) -> Tuple[np.ndarray, float]:
         min_dist_sq = min_dist * min_dist
+        max_dist_sq = None
+        anchor_pos = None
+        if anchor is not None and max_dist is not None and float(max_dist) > 0.0:
+            max_dist_sq = float(max_dist) * float(max_dist)
+            anchor_pos = np.asarray(anchor, dtype=np.float32).reshape(-1)[:2]
         for _ in range(tries):
             idx = int(self.rng.randrange(len(self._free_cells)))
             rc = tuple(int(x) for x in self._free_cells[idx])
             pos = self._grid_rc_to_world(rc[0], rc[1])
+            if max_dist_sq is not None and anchor_pos is not None:
+                adx = float(pos[0] - anchor_pos[0])
+                adz = float(pos[1] - anchor_pos[1])
+                if adx * adx + adz * adz > max_dist_sq:
+                    continue
             ok = True
             for avoid in avoid_points:
                 dx = float(pos[0] - avoid[0])
@@ -1119,6 +1138,33 @@ class MajestroNavMeshEnv(gym.Env):
                     break
             if ok:
                 return pos, float(self._height_map[rc[0], rc[1]])
+
+        if anchor_pos is not None and max_dist_sq is not None:
+            best_pos = None
+            best_height = None
+            best_d2 = None
+            for rc in self._free_cells:
+                pos = self._grid_rc_to_world(int(rc[0]), int(rc[1]))
+                adx = float(pos[0] - anchor_pos[0])
+                adz = float(pos[1] - anchor_pos[1])
+                anchor_d2 = adx * adx + adz * adz
+                if anchor_d2 > max_dist_sq:
+                    continue
+                ok = True
+                for avoid in avoid_points:
+                    dx = float(pos[0] - avoid[0])
+                    dz = float(pos[1] - avoid[1])
+                    if dx * dx + dz * dz < min_dist_sq:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                if best_d2 is None or anchor_d2 < best_d2:
+                    best_pos = pos
+                    best_height = float(self._height_map[int(rc[0]), int(rc[1])])
+                    best_d2 = anchor_d2
+            if best_pos is not None:
+                return best_pos.astype(np.float32), float(best_height)
 
         idx = int(self.rng.randrange(len(self._free_cells)))
         rc = tuple(int(x) for x in self._free_cells[idx])
@@ -1135,8 +1181,14 @@ class MajestroNavMeshEnv(gym.Env):
         self.agent_heights[0] = self.agent_height
         avoid = [self.agent_pos.copy(), self.goal_pos.copy()]
         min_dist = max(self.agent_radius * 1.0, self.success_radius * self.agent_spawn_min_scale)
+        max_dist = max(min_dist, self.success_radius * self.agent_spawn_max_scale)
         for idx in range(1, self.num_agents):
-            pos, height = self._sample_spawn_point(avoid, min_dist=min_dist)
+            pos, height = self._sample_spawn_point(
+                avoid,
+                min_dist=min_dist,
+                anchor=self.agent_pos,
+                max_dist=max_dist,
+            )
             self.agent_positions[idx] = pos
             self.agent_heights[idx] = height
             avoid.append(pos.copy())

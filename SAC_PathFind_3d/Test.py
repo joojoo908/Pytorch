@@ -69,7 +69,7 @@ def main():
     ap.add_argument("--dyn-geo", action="store_true", default=True)
 
     # [PATCH] 주석과 기본값을 맞췄다. 1.000 이면 사실상 freeze가 거의 안 걸린다.
-    ap.add_argument("--alpha-freeze-recent", type=float, default=0.40)  # 0.40 = 40%
+    ap.add_argument("--alpha-freeze-recent", type=float, default=1.00)  # 0.40 = 40%
     ap.add_argument("--alpha-freeze-succbuf", type=int, default=150_000)
     ap.add_argument("--alpha-fixed", type=float, default=0.397)
 
@@ -82,6 +82,7 @@ def main():
     ap.add_argument("--sense-radius", type=float, default=600.0)
     ap.add_argument("--goal-spawn-min-scale", type=float, default=4.0)
     ap.add_argument("--agent-spawn-min-scale", type=float, default=2.0)
+    ap.add_argument("--agent-spawn-max-scale", type=float, default=3.0)
 
     args = ap.parse_args()
 
@@ -102,6 +103,7 @@ def main():
         sense_radius=args.sense_radius,
         goal_spawn_min_scale=args.goal_spawn_min_scale,
         agent_spawn_min_scale=args.agent_spawn_min_scale,
+        agent_spawn_max_scale=args.agent_spawn_max_scale,
     )
     # Apply dynamic horizon params if supported
     if hasattr(env, "dynamic_horizon"):

@@ -424,6 +424,7 @@ if __name__ == "__main__":
     ap.add_argument("--sense-radius", type=float, default=600.0)
     ap.add_argument("--goal-spawn-min-scale", type=float, default=4.0)
     ap.add_argument("--agent-spawn-min-scale", type=float, default=2.0)
+    ap.add_argument("--agent-spawn-max-scale", type=float, default=3.0)
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -438,6 +439,7 @@ if __name__ == "__main__":
         sense_radius=args.sense_radius,
         goal_spawn_min_scale=args.goal_spawn_min_scale,
         agent_spawn_min_scale=args.agent_spawn_min_scale,
+        agent_spawn_max_scale=args.agent_spawn_max_scale,
     )
 
     if not os.path.exists(actor_path):
