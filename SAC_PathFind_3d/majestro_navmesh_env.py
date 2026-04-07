@@ -373,7 +373,7 @@ class MajestroNavMeshEnv(gym.Env):
         self._build_raster_cache()
         self._init_detour_wrapper()
 
-        obs_dim = 3 + 3 + 3 + 2 + self.observed_other_agents * 3 + 1 + 1
+        obs_dim = 3 + 3 + 3 + 2 + self.observed_other_agents * 3 + 1
         self.single_agent_obs_dim = int(obs_dim)
         self.single_agent_act_dim = 2
         self.observation_space = spaces.Box(
@@ -1088,8 +1088,6 @@ class MajestroNavMeshEnv(gym.Env):
         vel_norm = self.agent_velocities[agent_index] / max(self.step_size, 1.0)
 
         other_obs, fail_code = self._sense_local_space(agent_index, scale)
-        role_value = self._role_value(agent_index)
-
         obs = np.concatenate(
             [
                 agent_norm.astype(np.float32),
@@ -1097,7 +1095,6 @@ class MajestroNavMeshEnv(gym.Env):
                 delta_norm.astype(np.float32),
                 vel_norm.astype(np.float32),
                 other_obs,
-                role_value,
                 np.array([fail_code], dtype=np.float32),
             ]
         )

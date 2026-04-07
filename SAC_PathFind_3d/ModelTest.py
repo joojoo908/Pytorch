@@ -45,7 +45,14 @@ def make_world_to_screen(bounds_min, bounds_max, scale):
 
 
 try:
-    from Model import GaussianPolicy, is_diverse_tactical_success
+    from Model import (
+        GaussianPolicy,
+        is_diverse_tactical_success,
+        ROLE_IDS,
+        role_name,
+        get_env_role_ids,
+        role_policy_actions,
+    )
 except Exception:
     from Model import GaussianPolicy
 
@@ -65,6 +72,35 @@ except Exception:
             elif int(role_id) == 3:
                 cover = True
         return bool(front and flank and cover)
+
+    ROLE_IDS = (0, 1, 2, 3)
+
+    def role_name(role_id):
+        return {0: "front", 1: "flank_left", 2: "flank_right", 3: "cover"}.get(int(role_id), f"role_{int(role_id)}")
+
+    def get_env_role_ids(env, count):
+        role_ids = getattr(env, "agent_role_ids", None)
+        if role_ids is None:
+            return np.zeros((count,), dtype=np.int32)
+        return np.asarray(role_ids, dtype=np.int32).reshape(-1)[:count]
+
+    @torch.no_grad()
+    def role_policy_actions(role_bundles, obs_arr, role_ids_arr, deterministic=True):
+        actions = np.zeros((obs_arr.shape[0], 2), dtype=np.float32)
+        for role_id in ROLE_IDS:
+            idxs = np.where(role_ids_arr == role_id)[0]
+            if idxs.size == 0:
+                continue
+            actor = role_bundles[int(role_id)]["actor"]
+            device = next(actor.parameters()).device
+            s = torch.as_tensor(obs_arr[idxs], dtype=torch.float32, device=device)
+            if deterministic:
+                a = actor.act_deterministic(s).cpu().numpy()
+            else:
+                a, _ = actor.sample(s)
+                a = a.detach().cpu().numpy()
+            actions[idxs] = a
+        return actions
 
 def build_env(**env_kwargs):
     try:
@@ -163,28 +199,13 @@ def recover_descent_path_world(env, start_pos, start_height=None, max_len=256):
 
 
 @torch.no_grad()
-def policy_act(actor, obs_np):
-    device = next(actor.parameters()).device
+def policy_act(role_bundles, env, obs_np):
     arr = np.asarray(obs_np, dtype=np.float32)
     if arr.ndim == 1:
-        x = torch.as_tensor(arr, dtype=torch.float32, device=device).unsqueeze(0)
-        squeeze = True
-    else:
-        x = torch.as_tensor(arr, dtype=torch.float32, device=device)
-        squeeze = False
-
-    if hasattr(actor, "act_deterministic"):
-        a = actor.act_deterministic(x)
-    else:
-        out = actor(x)
-        if isinstance(out, (tuple, list)):
-            a = torch.tanh(out[0])
-        else:
-            a = torch.clamp(out, -1.0, 1.0)
-
-    if squeeze:
-        return a.squeeze(0).cpu().numpy()
-    return a.cpu().numpy()
+        role_ids_arr = get_env_role_ids(env, 1)
+        return role_policy_actions(role_bundles, arr.reshape(1, -1), role_ids_arr, deterministic=True).reshape(-1)
+    role_ids_arr = get_env_role_ids(env, arr.shape[0])
+    return role_policy_actions(role_bundles, arr, role_ids_arr, deterministic=True)
 
 
 def draw_navmesh_overlay(screen, env, world_to_screen):
@@ -209,9 +230,10 @@ def draw_navmesh_overlay(screen, env, world_to_screen):
             pygame.draw.circle(screen, color, (sx, sy), step)
 
 
-def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, visualize=True, save_csv_path=None):
+def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=None, visualize=True, save_csv_path=None):
     obs, info = reset_env_compat(env)
-    actor.eval()
+    for bundle in role_bundles.values():
+        bundle["actor"].eval()
 
     start_pos = np.array(env.agent_pos, dtype=np.float32).copy()
     goal_pos = np.array(env.goal_pos, dtype=np.float32).copy()
@@ -251,7 +273,7 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
         if user_aborted:
             break
 
-        action = policy_act(actor, obs)
+        action = policy_act(role_bundles, env, obs)
         obs, reward, env_terminated, env_truncated, final_info = env.step(action)
         ep_ret += float(np.mean(np.asarray(reward, dtype=np.float32)))
         traj.append(np.array(env.agent_pos, dtype=np.float32).copy())
@@ -376,7 +398,7 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
     return ep_ret, success, outcome, screen_bundle
 
 
-def run_multiple_evaluations(env, actor, episodes=10, max_steps=None, scale=0.03, visualize=True, visualize_every=1, auto_quit=True, save_last_csv=None):
+def run_multiple_evaluations(env, role_bundles, episodes=10, max_steps=None, scale=0.03, visualize=True, visualize_every=1, auto_quit=True, save_last_csv=None):
     returns = []
     successes = 0
     screen_bundle = None
@@ -386,7 +408,7 @@ def run_multiple_evaluations(env, actor, episodes=10, max_steps=None, scale=0.03
         save_csv = save_last_csv if ep == episodes - 1 else None
         ret, succ, outcome, screen_bundle = evaluate_once(
             env,
-            actor,
+            role_bundles,
             max_steps=max_steps,
             scale=scale,
             screen_bundle=screen_bundle if vis else None,
@@ -448,14 +470,19 @@ if __name__ == "__main__":
 
     obs_dim = int(getattr(env, "single_agent_obs_dim", env.observation_space.shape[-1]))
     act_dim = int(getattr(env, "single_agent_act_dim", env.action_space.shape[-1]))
-    actor = GaussianPolicy(obs_dim, act_dim).to(device)
-    state_dict = torch.load(actor_path, map_location=device)
-    actor.load_state_dict(state_dict)
-    actor.eval()
+    state_obj = torch.load(actor_path, map_location=device, weights_only=False)
+    if state_obj.get("format") != "multi_role_actor":
+        raise RuntimeError("Expected multi_role_actor checkpoint.")
+    role_bundles = {}
+    for role_id in ROLE_IDS:
+        actor = GaussianPolicy(obs_dim, act_dim).to(device)
+        actor.load_state_dict(state_obj["actors"][role_name(role_id)])
+        actor.eval()
+        role_bundles[int(role_id)] = {"actor": actor}
 
     run_multiple_evaluations(
         env,
-        actor,
+        role_bundles,
         episodes=args.episodes,
         scale=args.scale,
         visualize=(HAS_PYGAME and (not args.no_visualize)),

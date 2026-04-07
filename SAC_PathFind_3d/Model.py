@@ -105,6 +105,31 @@ def is_diverse_tactical_success(info: Dict[str, Any]) -> bool:
     return bool(role_success["front"] and flank_ok and role_success["cover"])
 
 
+ROLE_ID_TO_NAME = {
+    0: "front",
+    1: "flank_left",
+    2: "flank_right",
+    3: "cover",
+}
+ROLE_IDS = tuple(sorted(ROLE_ID_TO_NAME.keys()))
+
+
+def role_name(role_id: int) -> str:
+    return ROLE_ID_TO_NAME.get(int(role_id), f"role_{int(role_id)}")
+
+
+def get_env_role_ids(env, count: int) -> np.ndarray:
+    role_ids = getattr(env, "agent_role_ids", None)
+    if role_ids is None:
+        return np.zeros((count,), dtype=np.int32)
+    arr = np.asarray(role_ids, dtype=np.int32).reshape(-1)
+    if arr.shape[0] < count:
+        out = np.zeros((count,), dtype=np.int32)
+        out[:arr.shape[0]] = arr
+        return out
+    return arr[:count]
+
+
 # ----------------------------
 # Small helpers
 # ----------------------------
@@ -265,139 +290,152 @@ class QNetwork(nn.Module):
 # ----------------------------
 # Evaluation & Checkpoint
 # ----------------------------
+def _save_replay(rb: ReplayBuffer) -> Dict[str, Any]:
+    return {"obs": list(rb.obs), "act": list(rb.act), "rew": list(rb.rew), "nobs": list(rb.nobs), "done": list(rb.done), "capacity": rb.capacity}
+
+
+def _save_succ_replay(rb: SuccessReplayBuffer) -> Dict[str, Any]:
+    return {
+        "obs": list(rb.obs), "act": list(rb.act), "rew": list(rb.rew), "nobs": list(rb.nobs), "done": list(rb.done),
+        "dists": list(rb.dists), "capacity": rb.capacity,
+    }
+
+
+def _load_replay(data: Dict[str, Any]) -> ReplayBuffer:
+    rb = ReplayBuffer(capacity=data["capacity"])
+    for s, a, r, ns, d in zip(data["obs"], data["act"], data["rew"], data["nobs"], data["done"]):
+        rb.push(s, a, r, ns, d)
+    return rb
+
+
+def _load_succ_replay(data: Optional[Dict[str, Any]], capacity_default: int = 200_000) -> SuccessReplayBuffer:
+    rb = SuccessReplayBuffer(capacity=(data["capacity"] if data is not None else capacity_default))
+    if data is not None:
+        for s, a, r, ns, d, dist in zip(data["obs"], data["act"], data["rew"], data["nobs"], data["done"], data["dists"]):
+            rb.push_with_dist(s, a, r, ns, d, None if float(dist) < 0.0 else float(dist))
+    return rb
+
+
+def init_role_bundle(obs_dim: int, act_dim: int, dev: torch.device, actor_lr: float, critic_lr: float, succ_buffer_capacity: int) -> Dict[str, Any]:
+    actor = GaussianPolicy(obs_dim, act_dim).to(dev)
+    critic_1 = QNetwork(obs_dim, act_dim).to(dev)
+    critic_2 = QNetwork(obs_dim, act_dim).to(dev)
+    target_critic_1 = QNetwork(obs_dim, act_dim).to(dev)
+    target_critic_2 = QNetwork(obs_dim, act_dim).to(dev)
+    target_critic_1.load_state_dict(critic_1.state_dict())
+    target_critic_2.load_state_dict(critic_2.state_dict())
+    actor_opt = optim.Adam(actor.parameters(), lr=actor_lr)
+    critic_1_opt = optim.Adam(critic_1.parameters(), lr=critic_lr)
+    critic_2_opt = optim.Adam(critic_2.parameters(), lr=critic_lr)
+    log_alpha = nn.Parameter(torch.tensor(np.log(0.2), dtype=torch.float32, device=dev))
+    log_alpha_opt = optim.Adam([log_alpha], lr=1e-5)
+    return {
+        "actor": actor, "critic_1": critic_1, "critic_2": critic_2,
+        "target_critic_1": target_critic_1, "target_critic_2": target_critic_2,
+        "actor_opt": actor_opt, "critic_1_opt": critic_1_opt, "critic_2_opt": critic_2_opt,
+        "replay_buffer": ReplayBuffer(capacity=1_000_000),
+        "succ_replay_buffer": SuccessReplayBuffer(capacity=succ_buffer_capacity),
+        "log_alpha": log_alpha, "log_alpha_opt": log_alpha_opt,
+        "alpha": 0.2, "target_entropy": -float(act_dim),
+    }
+
 
 @torch.no_grad()
-def evaluate_success(env, actor: GaussianPolicy, episodes: int = 10, max_steps: Optional[int] = None, device: Optional[torch.device] = None) -> float:
-    """Deterministic policy evaluation (success rate in [0,1])."""
-    if device is None:
+def role_policy_actions(role_bundles: Dict[int, Dict[str, Any]], obs_arr: np.ndarray, role_ids_arr: np.ndarray, deterministic: bool = True) -> np.ndarray:
+    act_dim = next(iter(role_bundles.values()))["actor"].act_dim
+    actions = np.zeros((obs_arr.shape[0], act_dim), dtype=np.float32)
+    for role_id in ROLE_IDS:
+        idxs = np.where(role_ids_arr == role_id)[0]
+        if idxs.size == 0:
+            continue
+        actor = role_bundles[int(role_id)]["actor"]
         device = next(actor.parameters()).device
+        s = to_tensor(obs_arr[idxs], device)
+        if deterministic:
+            a = actor.act_deterministic(s).cpu().numpy()
+        else:
+            a, _ = actor.sample(s)
+            a = a.detach().cpu().numpy()
+        actions[idxs] = a
+    return actions
+
+
+@torch.no_grad()
+def evaluate_success(env, role_bundles: Dict[int, Dict[str, Any]], episodes: int = 10, max_steps: Optional[int] = None, device: Optional[torch.device] = None) -> float:
     ok = 0
     for _ in range(episodes):
         obs = reset_env(env)
         done = False
         steps = 0
         info: Dict[str, Any] = {}
-        reward = 0.0
         while not done:
             obs_arr = np.asarray(obs, dtype=np.float32)
             if _is_multi_agent_obs(obs_arr):
-                s = to_tensor(obs_arr, device)
-                a = actor.act_deterministic(s).cpu().numpy()
+                role_ids_arr = get_env_role_ids(env, obs_arr.shape[0])
+                act = role_policy_actions(role_bundles, obs_arr, role_ids_arr, deterministic=True)
             else:
-                s = to_tensor(obs_arr, device).unsqueeze(0)
-                a = actor.act_deterministic(s).squeeze(0).cpu().numpy()
-            obs, reward, done, info = step_env(env, a)
+                role_ids_arr = get_env_role_ids(env, 1)
+                act = role_policy_actions(role_bundles, obs_arr.reshape(1, -1), role_ids_arr, deterministic=True).reshape(-1)
+            obs, _, done, info = step_env(env, act)
             steps += 1
             if (max_steps is not None) and (steps >= max_steps):
                 break
-
-        # Success detection with fallbacks
-        success = is_diverse_tactical_success(info)
-        ok += int(success)
+        ok += int(is_diverse_tactical_success(info))
     return ok / float(max(1, episodes))
 
 
-def save_sac_checkpoint(path: str,
-                        actor: nn.Module, critic_1: nn.Module, critic_2: nn.Module,
-                        target_critic_1: nn.Module, target_critic_2: nn.Module,
-                        actor_opt: optim.Optimizer, critic_1_opt: optim.Optimizer, critic_2_opt: optim.Optimizer,
-                        replay_buffer: ReplayBuffer,
-                        alpha: float, target_entropy: float,
-                        succ_replay_buffer: Optional[SuccessReplayBuffer] = None,
-                        extra: Optional[Dict[str, Any]] = None,
-                        **kwargs):
-    """Save a minimal but sufficient checkpoint for resuming."""
-    # absorb extra kwargs into extra field
+def save_sac_checkpoint(path: str, role_bundles: Dict[int, Dict[str, Any]], extra: Optional[Dict[str, Any]] = None, **kwargs):
     extra_dict = (extra or {}).copy()
     extra_dict.update(kwargs)
-
-    obj = {
-        "actor": actor.state_dict(),
-        "critic_1": critic_1.state_dict(),
-        "critic_2": critic_2.state_dict(),
-        "target_critic_1": target_critic_1.state_dict(),
-        "target_critic_2": target_critic_2.state_dict(),
-        "actor_opt": actor_opt.state_dict(),
-        "critic_1_opt": critic_1_opt.state_dict(),
-        "critic_2_opt": critic_2_opt.state_dict(),
-        "replay": {
-            "obs": list(replay_buffer.obs),
-            "act": list(replay_buffer.act),
-            "rew": list(replay_buffer.rew),
-            "nobs": list(replay_buffer.nobs),
-            "done": list(replay_buffer.done),
-            "capacity": replay_buffer.capacity,
-        },
-        # [PATCH] 성공 리플레이도 같이 저장해야 resume 시 성공 샘플 분포가 유지된다.
-        "succ_replay": None if succ_replay_buffer is None else {
-            "obs": list(succ_replay_buffer.obs),
-            "act": list(succ_replay_buffer.act),
-            "rew": list(succ_replay_buffer.rew),
-            "nobs": list(succ_replay_buffer.nobs),
-            "done": list(succ_replay_buffer.done),
-            "dists": list(succ_replay_buffer.dists),
-            "capacity": succ_replay_buffer.capacity,
-        },
-        "alpha": float(alpha),
-        "target_entropy": float(target_entropy),
-        "extra": extra_dict,
-    }
-    torch.save(obj, path)
+    roles_obj: Dict[str, Any] = {}
+    actor_only: Dict[str, Any] = {}
+    for role_id, bundle in role_bundles.items():
+        key = role_name(role_id)
+        roles_obj[key] = {
+            "actor": bundle["actor"].state_dict(),
+            "critic_1": bundle["critic_1"].state_dict(),
+            "critic_2": bundle["critic_2"].state_dict(),
+            "target_critic_1": bundle["target_critic_1"].state_dict(),
+            "target_critic_2": bundle["target_critic_2"].state_dict(),
+            "actor_opt": bundle["actor_opt"].state_dict(),
+            "critic_1_opt": bundle["critic_1_opt"].state_dict(),
+            "critic_2_opt": bundle["critic_2_opt"].state_dict(),
+            "replay": _save_replay(bundle["replay_buffer"]),
+            "succ_replay": _save_succ_replay(bundle["succ_replay_buffer"]),
+            "alpha": float(bundle["alpha"]),
+            "target_entropy": float(bundle["target_entropy"]),
+        }
+        actor_only[key] = bundle["actor"].state_dict()
+    torch.save({"format": "multi_role_sac", "roles": roles_obj, "extra": extra_dict}, path)
+    return actor_only
 
 
 def load_sac_checkpoint(path: str, obs_dim: int, act_dim: int, device: Optional[torch.device] = None):
-    """Load a previously saved SAC checkpoint. Returns a bundle dict."""
     dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(path, map_location=dev, weights_only=False)
-
-    actor = GaussianPolicy(obs_dim, act_dim).to(dev)
-    critic_1 = QNetwork(obs_dim, act_dim).to(dev)
-    critic_2 = QNetwork(obs_dim, act_dim).to(dev)
-    target_critic_1 = QNetwork(obs_dim, act_dim).to(dev)
-    target_critic_2 = QNetwork(obs_dim, act_dim).to(dev)
-
-    actor.load_state_dict(ckpt["actor"])
-    critic_1.load_state_dict(ckpt["critic_1"])
-    critic_2.load_state_dict(ckpt["critic_2"])
-    target_critic_1.load_state_dict(ckpt["target_critic_1"])
-    target_critic_2.load_state_dict(ckpt["target_critic_2"])
-
-    actor_opt = optim.Adam(actor.parameters(), lr=3e-4)
-    critic_1_opt = optim.Adam(critic_1.parameters(), lr=3e-4)
-    critic_2_opt = optim.Adam(critic_2.parameters(), lr=3e-4)
-    actor_opt.load_state_dict(ckpt["actor_opt"])
-    critic_1_opt.load_state_dict(ckpt["critic_1_opt"])
-    critic_2_opt.load_state_dict(ckpt["critic_2_opt"])
-
-    rb = ReplayBuffer(capacity=ckpt["replay"]["capacity"])
-    for s, a, r, ns, d in zip(ckpt["replay"]["obs"], ckpt["replay"]["act"], ckpt["replay"]["rew"], ckpt["replay"]["nobs"], ckpt["replay"]["done"]):
-        rb.push(s, a, r, ns, d)
-
-    # [PATCH] 성공 리플레이 버퍼도 복구한다. 없으면 빈 버퍼로 시작한다.
-    succ_rb_data = ckpt.get("succ_replay", None)
-    succ_rb = SuccessReplayBuffer(capacity=(succ_rb_data["capacity"] if succ_rb_data is not None else 200_000))
-    if succ_rb_data is not None:
-        for s, a, r, ns, d, dist in zip(
-            succ_rb_data["obs"],
-            succ_rb_data["act"],
-            succ_rb_data["rew"],
-            succ_rb_data["nobs"],
-            succ_rb_data["done"],
-            succ_rb_data["dists"],
-        ):
-            succ_rb.push_with_dist(s, a, r, ns, d, None if float(dist) < 0.0 else float(dist))
-
-    alpha = float(ckpt.get("alpha", 0.2))
-    target_entropy = float(ckpt.get("target_entropy", -float(act_dim)))
-
-    return {
-        "actor": actor, "critic_1": critic_1, "critic_2": critic_2,
-        "target_critic_1": target_critic_1, "target_critic_2": target_critic_2,
-        "actor_opt": actor_opt, "critic_1_opt": critic_1_opt, "critic_2_opt": critic_2_opt,
-        "replay_buffer": rb,
-        "succ_replay_buffer": succ_rb,
-        "alpha": alpha, "target_entropy": target_entropy,
-    }
+    if ckpt.get("format") != "multi_role_sac":
+        raise ValueError("Unsupported checkpoint format. Expected multi_role_sac.")
+    role_bundles: Dict[int, Dict[str, Any]] = {}
+    for role_id in ROLE_IDS:
+        key = role_name(role_id)
+        role_data = ckpt["roles"][key]
+        bundle = init_role_bundle(obs_dim, act_dim, dev, actor_lr=3e-4, critic_lr=3e-4, succ_buffer_capacity=(role_data.get("succ_replay") or {}).get("capacity", 200_000))
+        bundle["actor"].load_state_dict(role_data["actor"])
+        bundle["critic_1"].load_state_dict(role_data["critic_1"])
+        bundle["critic_2"].load_state_dict(role_data["critic_2"])
+        bundle["target_critic_1"].load_state_dict(role_data["target_critic_1"])
+        bundle["target_critic_2"].load_state_dict(role_data["target_critic_2"])
+        bundle["actor_opt"].load_state_dict(role_data["actor_opt"])
+        bundle["critic_1_opt"].load_state_dict(role_data["critic_1_opt"])
+        bundle["critic_2_opt"].load_state_dict(role_data["critic_2_opt"])
+        bundle["replay_buffer"] = _load_replay(role_data["replay"])
+        bundle["succ_replay_buffer"] = _load_succ_replay(role_data.get("succ_replay"))
+        bundle["alpha"] = float(role_data.get("alpha", 0.2))
+        bundle["target_entropy"] = float(role_data.get("target_entropy", -float(act_dim)))
+        with torch.no_grad():
+            bundle["log_alpha"].copy_(torch.tensor(np.log(bundle["alpha"]), dtype=torch.float32, device=dev))
+        role_bundles[role_id] = bundle
+    return {"role_bundles": role_bundles}
 
 
 # ----------------------------
@@ -405,17 +443,6 @@ def load_sac_checkpoint(path: str, obs_dim: int, act_dim: int, device: Optional[
 # ----------------------------
 
 def sac_train(env,
-              actor: Optional[GaussianPolicy] = None,
-              critic_1: Optional[QNetwork] = None,
-              critic_2: Optional[QNetwork] = None,
-              target_critic_1: Optional[QNetwork] = None,
-              target_critic_2: Optional[QNetwork] = None,
-              actor_opt: Optional[optim.Optimizer] = None,
-              critic_1_opt: Optional[optim.Optimizer] = None,
-              critic_2_opt: Optional[optim.Optimizer] = None,
-              replay_buffer: Optional[ReplayBuffer] = None,
-              succ_replay_buffer: Optional[SuccessReplayBuffer] = None,
-              # [PATCH] 런처에서 넘긴 checkpoint bundle / success buffer 용량을 실제로 사용한다.
               bundle: Optional[Dict[str, Any]] = None,
               succ_buffer_capacity: int = 200_000,
               episodes: int = 500,
@@ -426,87 +453,32 @@ def sac_train(env,
               actor_lr: float = 3e-4,
               critic_lr: float = 3e-4,
               device: Optional[torch.device] = None,
-              # ---- success mixing accel ----
-              p_succ: float = 0.30,        # target mixing ratio upper bound
-              succ_gate_min: int = 2048,   # below this size, don't mix at all
-              succ_ramp_cov: float = 0.25, # ramp mixing by fill ratio up to this coverage
-              # ---- UDR (updates per env step) ----
+              p_succ: float = 0.30,
+              succ_gate_min: int = 2048,
+              succ_ramp_cov: float = 0.25,
               updates_per_step: int = 2,
-              # ---- exploration bounds ----
               alpha_floor: float = 0.05,
               alpha_ceiling: float = 1.00,
-              # === NEW: alpha freeze options ===
-              alpha_freeze_recent: float | None = 0.40,   # recent@100 성공률이 40%↑면 고정
-              alpha_freeze_succbuf: int = 150_000,        # 성공버퍼가 이 만큼 차면 고정
-              alpha_fixed: float = 0.24,                  # 고정할 α 값
-              # ---- online best saving ----
+              alpha_freeze_recent: float | None = 0.40,
+              alpha_freeze_succbuf: int = 150_000,
+              alpha_fixed: float = 0.24,
               save_best_online: bool = True,
               best_delta: float = 0.02,
               best_min_episodes: int = 30,
               best_ckpt_path: str = "sac_best.pth",
               best_actor_path: str = "sac_actor_best.pth",
-              # ---- success sample min distance ----
               succ_min_dist: float = 0.20,
               **kwargs):
-    """
-    Train SAC and return a bundle of components.
-    """
     assert episodes > 0 and batch_size > 0
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # infer obs/act dimensions
     _probe = reset_env(env)
     obs_dim = infer_single_agent_obs_dim(env, _probe)
     act_dim = infer_single_agent_act_dim(env)
-
-    if bundle is not None:
-        # [PATCH] Test.py 에서 bundle 만 넘겨도 resume 가 실제로 되도록 복구한다.
-        actor = actor if actor is not None else bundle.get("actor")
-        critic_1 = critic_1 if critic_1 is not None else bundle.get("critic_1")
-        critic_2 = critic_2 if critic_2 is not None else bundle.get("critic_2")
-        target_critic_1 = target_critic_1 if target_critic_1 is not None else bundle.get("target_critic_1")
-        target_critic_2 = target_critic_2 if target_critic_2 is not None else bundle.get("target_critic_2")
-        actor_opt = actor_opt if actor_opt is not None else bundle.get("actor_opt")
-        critic_1_opt = critic_1_opt if critic_1_opt is not None else bundle.get("critic_1_opt")
-        critic_2_opt = critic_2_opt if critic_2_opt is not None else bundle.get("critic_2_opt")
-        replay_buffer = replay_buffer if replay_buffer is not None else bundle.get("replay_buffer")
-        succ_replay_buffer = succ_replay_buffer if succ_replay_buffer is not None else bundle.get("succ_replay_buffer")
-
-    # networks
-    if actor is None:
-        actor = GaussianPolicy(obs_dim, act_dim).to(device)
-    if critic_1 is None:
-        critic_1 = QNetwork(obs_dim, act_dim).to(device)
-    if critic_2 is None:
-        critic_2 = QNetwork(obs_dim, act_dim).to(device)
-    if target_critic_1 is None:
-        target_critic_1 = QNetwork(obs_dim, act_dim).to(device)
-        target_critic_1.load_state_dict(critic_1.state_dict())
-    if target_critic_2 is None:
-        target_critic_2 = QNetwork(obs_dim, act_dim).to(device)
-        target_critic_2.load_state_dict(critic_2.state_dict())
-
-    if actor_opt is None:
-        actor_opt = optim.Adam(actor.parameters(), lr=actor_lr)
-    if critic_1_opt is None:
-        critic_1_opt = optim.Adam(critic_1.parameters(), lr=critic_lr)
-    if critic_2_opt is None:
-        critic_2_opt = optim.Adam(critic_2.parameters(), lr=critic_lr)
-
-    if replay_buffer is None:
-        replay_buffer = ReplayBuffer(capacity=1_000_000)
-    if succ_replay_buffer is None:
-        # [PATCH] CLI 의 --succ-buffer-cap 이 실제 버퍼 크기에 반영되도록 수정.
-        succ_replay_buffer = SuccessReplayBuffer(capacity=succ_buffer_capacity)
-
-    # alpha auto-tuning
-    init_alpha = 0.2 if bundle is None else float(bundle.get("alpha", 0.2))
-    target_entropy = -float(act_dim) if bundle is None else float(bundle.get("target_entropy", -float(act_dim)))
-    # [PATCH] resume 시 alpha 도 같이 이어받는다.
-    log_alpha = nn.Parameter(torch.tensor(np.log(init_alpha), dtype=torch.float32, device=device))
-    log_alpha_opt = optim.Adam([log_alpha], lr=1e-5)
-    alpha = float(log_alpha.exp().item())
+    role_bundles = None if bundle is None else bundle.get("role_bundles")
+    if role_bundles is None:
+        role_bundles = {role_id: init_role_bundle(obs_dim, act_dim, device, actor_lr, critic_lr, succ_buffer_capacity) for role_id in ROLE_IDS}
 
     recent_success: deque[int] = deque(maxlen=100)
     recent_front_success: deque[int] = deque(maxlen=100)
@@ -514,7 +486,6 @@ def sac_train(env,
     recent_flank_right_success: deque[int] = deque(maxlen=100)
     recent_cover_success: deque[int] = deque(maxlen=100)
     best_score = -1.0
-
     alpha_frozen = False
 
     for ep in range(episodes):
@@ -522,25 +493,20 @@ def sac_train(env,
         done = False
         ep_steps = 0
         ep_reward = 0.0
-        episode_traj: List[List[Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool, Optional[float]]]] = []
         info: Dict[str, Any] = {}
-        last_reward = 0.0
         obs_arr0 = np.asarray(obs, dtype=np.float32)
         n_agents = int(obs_arr0.shape[0]) if _is_multi_agent_obs(obs_arr0) else 1
-        episode_traj = [[] for _ in range(n_agents)]
+        episode_traj: List[List[Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool, Optional[float], int]]] = [[] for _ in range(n_agents)]
+        ep_horizon = (env.max_steps if (max_steps is None and hasattr(env, "max_steps")) else max_steps)
 
-        ep_horizon = (env.max_steps if (max_steps is None and hasattr(env, "max_steps"))
-                      else max_steps)
         while (not done) and (ep_steps < (ep_horizon if ep_horizon is not None else 10**9)):
             obs_arr = np.asarray(obs, dtype=np.float32)
             if _is_multi_agent_obs(obs_arr):
-                s = to_tensor(obs_arr, device)
-                act_t, logp_t = actor.sample(s)
-                act = act_t.detach().cpu().numpy()
+                role_ids_arr = get_env_role_ids(env, obs_arr.shape[0])
+                act = role_policy_actions(role_bundles, obs_arr, role_ids_arr, deterministic=False)
             else:
-                s = to_tensor(obs_arr, device).unsqueeze(0)
-                act_t, logp_t = actor.sample(s)
-                act = act_t.squeeze(0).detach().cpu().numpy()
+                role_ids_arr = get_env_role_ids(env, 1)
+                act = role_policy_actions(role_bundles, obs_arr.reshape(1, -1), role_ids_arr, deterministic=False).reshape(-1)
 
             next_obs, reward, done, info = step_env(env, act)
             ep_steps += 1
@@ -554,8 +520,6 @@ def sac_train(env,
                 act = np.asarray(act, dtype=np.float32).reshape(1, -1)
 
             ep_reward += float(np.mean(reward_arr))
-            last_reward = float(np.mean(reward_arr))
-
             dist_values = None
             if isinstance(info, dict) and ("dist_to_goal" in info) and info["dist_to_goal"] is not None:
                 try:
@@ -564,23 +528,39 @@ def sac_train(env,
                     dist_values = None
 
             for agent_idx in range(obs_arr.shape[0]):
+                role_id = int(role_ids_arr[agent_idx]) if agent_idx < len(role_ids_arr) else 0
                 dist = None if dist_values is None or agent_idx >= len(dist_values) else float(dist_values[agent_idx])
-                replay_buffer.push(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done)
+                role_bundles[role_id]["replay_buffer"].push(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done)
                 episode_traj[agent_idx].append((
                     np.asarray(obs_arr[agent_idx], dtype=np.float32),
                     np.asarray(act[agent_idx], dtype=np.float32),
                     float(reward_arr[agent_idx]),
                     np.asarray(next_obs_arr[agent_idx], dtype=np.float32),
                     bool(done),
-                    dist
+                    dist,
+                    role_id,
                 ))
 
             obs = next_obs
 
-            # ---- updates per step ----
-            if len(replay_buffer) >= batch_size:
+            for role_id, rbundle in role_bundles.items():
+                replay_buffer = rbundle["replay_buffer"]
+                succ_replay_buffer = rbundle["succ_replay_buffer"]
+                if len(replay_buffer) < batch_size:
+                    continue
+                actor = rbundle["actor"]
+                critic_1 = rbundle["critic_1"]
+                critic_2 = rbundle["critic_2"]
+                target_critic_1 = rbundle["target_critic_1"]
+                target_critic_2 = rbundle["target_critic_2"]
+                actor_opt = rbundle["actor_opt"]
+                critic_1_opt = rbundle["critic_1_opt"]
+                critic_2_opt = rbundle["critic_2_opt"]
+                log_alpha = rbundle["log_alpha"]
+                log_alpha_opt = rbundle["log_alpha_opt"]
+                target_entropy = rbundle["target_entropy"]
+
                 for _ in range(max(1, int(updates_per_step))):
-                    # compute effective success mixing ratio (gate & ramp)
                     succ_size = len(succ_replay_buffer)
                     succ_cov = succ_size / max(1, getattr(succ_replay_buffer, "capacity", succ_size))
                     if succ_size < succ_gate_min:
@@ -588,27 +568,17 @@ def sac_train(env,
                     else:
                         ramp = min(1.0, succ_cov / max(1e-6, succ_ramp_cov))
                         p_eff = float(np.clip(p_succ, 0.0, 1.0)) * ramp
-                        if len(recent_success) >= 10:
-                            rec_frac = (sum(recent_success) / len(recent_success))
-                            if rec_frac < 0.5:
-                                p_eff *= 0.7  # early reduce
-
-                    k = int(round(batch_size * p_eff))
-                    k = max(0, min(k, batch_size))
-
-                    # sample success part with minimum-distance filter
+                        if len(recent_success) >= 10 and (sum(recent_success) / len(recent_success)) < 0.5:
+                            p_eff *= 0.7
+                    k = max(0, min(int(round(batch_size * p_eff)), batch_size))
                     if succ_size > 0 and k > 0:
-                        S1, A1, R1, NS1, D1 = succ_replay_buffer.sample_by_dist(
-                            min(k, succ_size), min_dist=max(0.0, succ_min_dist)
-                        )
+                        S1, A1, R1, NS1, D1 = succ_replay_buffer.sample_by_dist(min(k, succ_size), min_dist=max(0.0, succ_min_dist))
                         k_eff = len(S1)
                     else:
                         S1 = A1 = R1 = NS1 = D1 = None
                         k_eff = 0
-
                     need = batch_size - k_eff
                     S2, A2, R2, NS2, D2 = replay_buffer.sample(need)
-
                     if k_eff > 0:
                         S = np.concatenate([S1, S2], axis=0)
                         A = np.concatenate([A1, A2], axis=0)
@@ -618,13 +588,12 @@ def sac_train(env,
                     else:
                         S, A, R, NS, D = S2, A2, R2, NS2, D2
 
-                    states      = to_tensor(S, device)
-                    actions     = to_tensor(A, device)
-                    rewards     = to_tensor(R, device).unsqueeze(1)
+                    states = to_tensor(S, device)
+                    actions = to_tensor(A, device)
+                    rewards = to_tensor(R, device).unsqueeze(1)
                     next_states = to_tensor(NS, device)
-                    dones       = to_tensor(D, device).unsqueeze(1)
+                    dones = to_tensor(D, device).unsqueeze(1)
 
-                    # ----- critic update -----
                     with torch.no_grad():
                         next_a, next_logp = actor.sample(next_states)
                         tq1 = target_critic_1(next_states, next_a)
@@ -641,7 +610,6 @@ def sac_train(env,
                     critic_1_opt.step()
                     critic_2_opt.step()
 
-                    # ----- actor update -----
                     pi, logp_pi = actor.sample(states)
                     q1_pi = critic_1(states, pi)
                     q2_pi = critic_2(states, pi)
@@ -651,34 +619,27 @@ def sac_train(env,
                     actor_loss.backward()
                     actor_opt.step()
 
-                    # ----- alpha update (+ optional freeze) -----
                     if not alpha_frozen:
                         alpha_loss = (log_alpha * (-logp_pi.detach() - target_entropy)).mean()
                         log_alpha_opt.zero_grad(set_to_none=True)
                         alpha_loss.backward()
                         log_alpha_opt.step()
                         with torch.no_grad():
-                            lo = float(np.log(max(1e-6, alpha_floor)))
-                            hi = float(np.log(max(alpha_floor + 1e-6, alpha_ceiling)))
-                            log_alpha.data.clamp_(min=lo, max=hi)
-                            alpha = float(log_alpha.exp().item())
+                            log_alpha.data.clamp_(min=float(np.log(max(1e-6, alpha_floor))), max=float(np.log(max(alpha_floor + 1e-6, alpha_ceiling))))
                     else:
-                        # keep α strictly fixed
                         with torch.no_grad():
                             log_alpha.fill_(math.log(alpha_fixed))
-                            alpha = float(log_alpha.exp().item())
-
-                    # ----- target networks -----
+                    rbundle["alpha"] = float(log_alpha.exp().item())
                     soft_update_(critic_1, target_critic_1, tau)
                     soft_update_(critic_2, target_critic_2, tau)
 
-        # ---- episode end: success detection (fallbacks) ----
         role_success = extract_role_success(info)
         episode_success = is_diverse_tactical_success(info)
 
         if episode_success:
             for agent_traj in episode_traj:
-                for (s_, a_, r_, ns_, d_, dist_) in agent_traj:
+                for (s_, a_, r_, ns_, d_, dist_, role_id_) in agent_traj:
+                    succ_replay_buffer = role_bundles[int(role_id_)]["succ_replay_buffer"]
                     if dist_ is None:
                         succ_replay_buffer.push(s_, a_, r_, ns_, d_)
                     else:
@@ -695,50 +656,33 @@ def sac_train(env,
         flank_right_rate = 100.0 * (sum(recent_flank_right_success) / max(1, len(recent_flank_right_success)))
         cover_rate = 100.0 * (sum(recent_cover_success) / max(1, len(recent_cover_success)))
 
-        # === NEW: freeze trigger ===
         if (not alpha_frozen) and (alpha_freeze_recent is not None):
+            succ_buf_total = sum(len(role_bundles[r]["succ_replay_buffer"]) for r in ROLE_IDS)
             cond_recent = (len(recent_success) >= 50) and (recent_rate >= 100.0 * alpha_freeze_recent)
-            cond_succbuf = (len(succ_replay_buffer) >= alpha_freeze_succbuf)
+            cond_succbuf = succ_buf_total >= alpha_freeze_succbuf
             if cond_recent and cond_succbuf:
-                with torch.no_grad():
-                    log_alpha.copy_(torch.tensor(math.log(alpha_fixed), device=log_alpha.device))
+                for role_id in ROLE_IDS:
+                    with torch.no_grad():
+                        role_bundles[role_id]["log_alpha"].copy_(torch.tensor(math.log(alpha_fixed), device=role_bundles[role_id]["log_alpha"].device))
+                        role_bundles[role_id]["alpha"] = alpha_fixed
                 alpha_frozen = True
-                print(f"[α-FROZEN] recent@{len(recent_success)}={recent_rate:.1f}% "
-                      f"| succ_buf={len(succ_replay_buffer)} | alpha_fixed={alpha_fixed:.3f}")
+                print(f"[α-FROZEN] recent@{len(recent_success)}={recent_rate:.1f}% | succ_buf_total={succ_buf_total} | alpha_fixed={alpha_fixed:.3f}")
 
         if (ep + 1) % 10 == 0:
+            alpha_summary = "/".join(f"{role_name(r)}:{role_bundles[r]['alpha']:.3f}" for r in ROLE_IDS)
+            succ_summary = "/".join(f"{role_name(r)}:{len(role_bundles[r]['succ_replay_buffer'])}" for r in ROLE_IDS)
             print(f"[EP {ep+1:5d}] steps={ep_steps:3d}  R={ep_reward:8.2f}  succ={int(episode_success)}  "
                   f"recent@{len(recent_success)}={recent_rate:5.1f}%  "
                   f"| role(front/fl/flr/cov)={front_rate:4.1f}/{flank_left_rate:4.1f}/{flank_right_rate:4.1f}/{cover_rate:4.1f} "
-                  f"| alpha={alpha:.3f} | succ_buf={len(succ_replay_buffer)}")
+                  f"| alpha={alpha_summary} | succ_buf={succ_summary}")
 
-        # zero-cost best-by-online metric
         if save_best_online and len(recent_success) >= best_min_episodes:
             recent_mean = sum(recent_success) / len(recent_success)
             if recent_mean >= best_score + best_delta:
                 best_score = float(recent_mean)
-                save_sac_checkpoint(best_ckpt_path, actor, critic_1, critic_2,
-                                    target_critic_1, target_critic_2,
-                                    actor_opt, critic_1_opt, critic_2_opt,
-                                    replay_buffer, alpha, target_entropy,
-                                    succ_replay_buffer=succ_replay_buffer,
-                                    extra={"best_score": best_score, "episodes": ep + 1})
-                torch.save(actor.state_dict(), best_actor_path)
+                actor_only = save_sac_checkpoint(best_ckpt_path, role_bundles, extra={"best_score": best_score, "episodes": ep + 1})
+                torch.save({"format": "multi_role_actor", "actors": actor_only}, best_actor_path)
                 print(f"[BEST-online] ep={ep+1} mean={recent_mean:.3f} → saved {best_actor_path}")
 
-    # Save final actor (optional)
-    torch.save(actor.state_dict(), "sac_actor_last.pth")
-    return {
-        "actor": actor,
-        "critic_1": critic_1,
-        "critic_2": critic_2,
-        "target_critic_1": target_critic_1,
-        "target_critic_2": target_critic_2,
-        "actor_opt": actor_opt,
-        "critic_1_opt": critic_1_opt,
-        "critic_2_opt": critic_2_opt,
-        "replay_buffer": replay_buffer,
-        "succ_replay_buffer": succ_replay_buffer,
-        "alpha": alpha,
-        "target_entropy": target_entropy,
-    }
+    torch.save({"format": "multi_role_actor", "actors": {role_name(role_id): role_bundles[role_id]["actor"].state_dict() for role_id in ROLE_IDS}}, "sac_actor_last.pth")
+    return {"role_bundles": role_bundles}
