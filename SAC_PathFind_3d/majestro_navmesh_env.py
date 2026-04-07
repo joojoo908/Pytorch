@@ -812,13 +812,24 @@ class MajestroNavMeshEnv(gym.Env):
             return self.goal_pos.copy()
         return self._grid_rc_to_world(best[0], best[1]).astype(np.float32)
 
-    def _detour_next_waypoint(self, pos: np.ndarray, height: Optional[float] = None) -> Optional[np.ndarray]:
+    def _detour_next_waypoint_to_target(
+        self,
+        pos: np.ndarray,
+        target_pos: np.ndarray,
+        height: Optional[float] = None,
+        target_height: Optional[float] = None,
+    ) -> Optional[np.ndarray]:
         if not self._detour_enabled or self._detour_wrapper is None:
             return None
 
         cur_h = float(self.agent_height if height is None else height)
         start3 = np.array([float(pos[0]), cur_h, float(pos[1])], dtype=np.float32)
-        goal3 = np.array([float(self.goal_pos[0]), float(self.goal_height), float(self.goal_pos[1])], dtype=np.float32)
+        if target_height is None:
+            sampled_h = self._sample_height(np.asarray(target_pos, dtype=np.float32).reshape(-1)[:2])
+            goal_h = float(self.goal_height if sampled_h is None else sampled_h)
+        else:
+            goal_h = float(target_height)
+        goal3 = np.array([float(target_pos[0]), goal_h, float(target_pos[1])], dtype=np.float32)
         sx, sy, sz = self._world3_to_detour_xyz(start3)
         gx, gy, gz = self._world3_to_detour_xyz(goal3)
 
@@ -833,6 +844,14 @@ class MajestroNavMeshEnv(gym.Env):
         wx, wy, wz = waypoint
         world3 = self._detour_xyz_to_world3(wx, wy, wz)
         return world3[[0, 2]].astype(np.float32)
+
+    def _detour_next_waypoint(self, pos: np.ndarray, height: Optional[float] = None) -> Optional[np.ndarray]:
+        return self._detour_next_waypoint_to_target(
+            pos,
+            self.goal_pos,
+            height=height,
+            target_height=float(self.goal_height),
+        )
 
     def recover_fallback_path_world(
         self,
@@ -1281,6 +1300,10 @@ class MajestroNavMeshEnv(gym.Env):
         old_geos = np.array([self._geo_distance(p) for p in old_positions], dtype=object)
         old_role_targets = self.role_targets.copy()
         sensor_fail_codes = np.zeros((self.num_agents,), dtype=np.float32)
+        detour_used_codes = np.zeros((self.num_agents,), dtype=np.float32)
+        detour_attempt_codes = np.zeros((self.num_agents,), dtype=np.float32)
+        detour_targets = np.zeros_like(self.agent_positions)
+        detour_waypoints = np.full_like(self.agent_positions, np.nan, dtype=np.float32)
         tactical_targets = np.zeros_like(self.agent_positions)
         requested_targets = np.zeros_like(self.agent_positions)
         collisions = np.zeros((self.num_agents,), dtype=bool)
@@ -1293,14 +1316,31 @@ class MajestroNavMeshEnv(gym.Env):
             sensor_fail_codes[idx] = fail_code
             target_offset = np.clip(acts[idx], -1.0, 1.0) * self.tactical_target_radius
             if fail_code > 0.5:
-                waypoint = self._detour_next_waypoint(old_pos, height=float(self.agent_heights[idx]))
-                if waypoint is None:
-                    waypoint = self._geo_next_waypoint(old_pos, max_search=3)
-                desired_target = self.goal_pos.copy() if waypoint is None else waypoint
+                desired_target = self.goal_pos.copy()
             else:
                 desired_target = old_pos + target_offset
             snapped = self._nearest_valid_point(desired_target, max_radius=6)
-            tactical_target = old_pos.copy() if snapped is None else snapped[0]
+            snapped_target = old_pos.copy() if snapped is None else snapped[0]
+            snapped_height = None if snapped is None else float(snapped[1])
+            detour_targets[idx] = snapped_target
+
+            if self._detour_enabled:
+                detour_attempt_codes[idx] = 1.0
+                waypoint = self._detour_next_waypoint_to_target(
+                    old_pos,
+                    snapped_target,
+                    height=float(self.agent_heights[idx]),
+                    target_height=snapped_height,
+                )
+                detour_used_codes[idx] = 1.0 if waypoint is not None else 0.0
+                if waypoint is not None:
+                    detour_waypoints[idx] = waypoint
+                tactical_target = snapped_target if waypoint is None else waypoint
+            elif fail_code > 0.5:
+                waypoint = self._geo_next_waypoint(old_pos, max_search=3)
+                tactical_target = snapped_target if waypoint is None else waypoint
+            else:
+                tactical_target = snapped_target
 
             to_target = tactical_target - old_pos
             target_dist = float(np.linalg.norm(to_target))
@@ -1402,6 +1442,12 @@ class MajestroNavMeshEnv(gym.Env):
             "role_ids": self.agent_role_ids.copy(),
             "role_targets": self.role_targets.copy(),
             "sensor_fail_code": sensor_fail_codes.copy(),
+            "detour_used": detour_used_codes.copy(),
+            "detour_attempted": detour_attempt_codes.copy(),
+            "detour_target": detour_targets.copy(),
+            "detour_waypoint": detour_waypoints.copy(),
+            "detour_enabled": bool(self._detour_enabled),
+            "detour_error": self._detour_last_error,
         }
         return self._pack_observation(), rewards.astype(np.float32), terminated, truncated, info
 
