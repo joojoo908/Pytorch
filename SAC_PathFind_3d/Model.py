@@ -73,6 +73,8 @@ def extract_role_success(info: Dict[str, Any]) -> Dict[str, bool]:
         "flank_left": False,
         "flank_right": False,
         "cover": False,
+        "base_move": False,
+        "surround": False,
     }
     if not isinstance(info, dict):
         return result
@@ -96,13 +98,17 @@ def extract_role_success(info: Dict[str, Any]) -> Dict[str, bool]:
             result["flank_right"] = True
         elif int(role_id) == 3:
             result["cover"] = True
+        elif int(role_id) == 4:
+            result["base_move"] = True
+        elif int(role_id) == 5:
+            result["surround"] = True
     return result
 
 
 def is_diverse_tactical_success(info: Dict[str, Any]) -> bool:
     role_success = extract_role_success(info)
     flank_ok = role_success["flank_left"] or role_success["flank_right"]
-    return bool(role_success["front"] and flank_ok and role_success["cover"])
+    return bool(role_success["front"] and flank_ok and role_success["cover"] and role_success["surround"])
 
 
 ROLE_ID_TO_NAME = {
@@ -110,6 +116,8 @@ ROLE_ID_TO_NAME = {
     1: "flank_left",
     2: "flank_right",
     3: "cover",
+    4: "base_move",
+    5: "surround",
 }
 ROLE_IDS = tuple(sorted(ROLE_ID_TO_NAME.keys()))
 
@@ -485,6 +493,8 @@ def sac_train(env,
     recent_flank_left_success: deque[int] = deque(maxlen=100)
     recent_flank_right_success: deque[int] = deque(maxlen=100)
     recent_cover_success: deque[int] = deque(maxlen=100)
+    recent_base_move_success: deque[int] = deque(maxlen=100)
+    recent_surround_success: deque[int] = deque(maxlen=100)
     best_score = -1.0
     alpha_frozen = False
 
@@ -650,11 +660,15 @@ def sac_train(env,
         recent_flank_left_success.append(1 if role_success["flank_left"] else 0)
         recent_flank_right_success.append(1 if role_success["flank_right"] else 0)
         recent_cover_success.append(1 if role_success["cover"] else 0)
+        recent_base_move_success.append(1 if role_success["base_move"] else 0)
+        recent_surround_success.append(1 if role_success["surround"] else 0)
         recent_rate = 100.0 * (sum(recent_success) / max(1, len(recent_success)))
         front_rate = 100.0 * (sum(recent_front_success) / max(1, len(recent_front_success)))
         flank_left_rate = 100.0 * (sum(recent_flank_left_success) / max(1, len(recent_flank_left_success)))
         flank_right_rate = 100.0 * (sum(recent_flank_right_success) / max(1, len(recent_flank_right_success)))
         cover_rate = 100.0 * (sum(recent_cover_success) / max(1, len(recent_cover_success)))
+        base_move_rate = 100.0 * (sum(recent_base_move_success) / max(1, len(recent_base_move_success)))
+        surround_rate = 100.0 * (sum(recent_surround_success) / max(1, len(recent_surround_success)))
 
         if (not alpha_frozen) and (alpha_freeze_recent is not None):
             succ_buf_total = sum(len(role_bundles[r]["succ_replay_buffer"]) for r in ROLE_IDS)
@@ -673,7 +687,7 @@ def sac_train(env,
             succ_summary = "/".join(f"{role_name(r)}:{len(role_bundles[r]['succ_replay_buffer'])}" for r in ROLE_IDS)
             print(f"[EP {ep+1:5d}] steps={ep_steps:3d}  R={ep_reward:8.2f}  succ={int(episode_success)}  "
                   f"recent@{len(recent_success)}={recent_rate:5.1f}%  "
-                  f"| role(front/fl/flr/cov)={front_rate:4.1f}/{flank_left_rate:4.1f}/{flank_right_rate:4.1f}/{cover_rate:4.1f} "
+                  f"| role(front/fl/flr/cov/base/sur)={front_rate:4.1f}/{flank_left_rate:4.1f}/{flank_right_rate:4.1f}/{cover_rate:4.1f}/{base_move_rate:4.1f}/{surround_rate:4.1f} "
                   f"| alpha={alpha_summary} | succ_buf={succ_summary}")
 
         if save_best_online and len(recent_success) >= best_min_episodes:

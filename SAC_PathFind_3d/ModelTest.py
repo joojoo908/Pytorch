@@ -19,6 +19,8 @@ ROLE_NAMES = {
     1: "flank_l",
     2: "flank_r",
     3: "cover",
+    4: "base",
+    5: "surround",
 }
 
 ROLE_COLORS = {
@@ -26,6 +28,8 @@ ROLE_COLORS = {
     1: (110, 220, 255),
     2: (255, 210, 90),
     3: (180, 140, 255),
+    4: (160, 255, 160),
+    5: (255, 140, 200),
 }
 
 DETOUR_PATH_COLOR = (80, 255, 220)
@@ -64,6 +68,7 @@ except Exception:
         front = False
         flank = False
         cover = False
+        surround = False
         for role_id, success in zip(role_ids, success_mask):
             if not bool(success):
                 continue
@@ -73,12 +78,14 @@ except Exception:
                 flank = True
             elif int(role_id) == 3:
                 cover = True
-        return bool(front and flank and cover)
+            elif int(role_id) == 5:
+                surround = True
+        return bool(front and flank and cover and surround)
 
-    ROLE_IDS = (0, 1, 2, 3)
+    ROLE_IDS = (0, 1, 2, 3, 4, 5)
 
     def role_name(role_id):
-        return {0: "front", 1: "flank_left", 2: "flank_right", 3: "cover"}.get(int(role_id), f"role_{int(role_id)}")
+        return {0: "front", 1: "flank_left", 2: "flank_right", 3: "cover", 4: "base_move", 5: "surround"}.get(int(role_id), f"role_{int(role_id)}")
 
     def get_env_role_ids(env, count):
         role_ids = getattr(env, "agent_role_ids", None)
@@ -475,6 +482,7 @@ if __name__ == "__main__":
     ap.add_argument("--goal-spawn-min-scale", type=float, default=4.0)
     ap.add_argument("--agent-spawn-min-scale", type=float, default=2.0)
     ap.add_argument("--agent-spawn-max-scale", type=float, default=3.0)
+    ap.add_argument("--role-rule", type=str, default="fixed", choices=["fixed", "heuristic"])
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -490,6 +498,7 @@ if __name__ == "__main__":
         goal_spawn_min_scale=args.goal_spawn_min_scale,
         agent_spawn_min_scale=args.agent_spawn_min_scale,
         agent_spawn_max_scale=args.agent_spawn_max_scale,
+        role_rule=args.role_rule,
     )
 
     if not os.path.exists(actor_path):
