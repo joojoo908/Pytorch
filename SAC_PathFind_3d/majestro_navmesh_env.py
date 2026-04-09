@@ -292,6 +292,7 @@ class MajestroNavMeshEnv(gym.Env):
         time_penalty: float = 0.01,
         success_reward: float = 50.0,
         role_rule: str = "fixed",
+        agent_role_rules: Optional[Sequence[str]] = None,
         role_selector: Optional[Callable[["MajestroNavMeshEnv"], Sequence[int]]] = None,
         dynamic_horizon: bool = True,
         dynamic_horizon_kappa: float = 1.8,
@@ -328,6 +329,7 @@ class MajestroNavMeshEnv(gym.Env):
         self.time_penalty = float(time_penalty)
         self._R_SUCCESS = float(success_reward)
         self.role_rule = str(role_rule).strip().lower()
+        self.agent_role_rules = None if agent_role_rules is None else [str(x).strip().lower() for x in agent_role_rules]
         self.role_selector = role_selector
 
         self.dynamic_horizon = bool(dynamic_horizon)
@@ -378,6 +380,14 @@ class MajestroNavMeshEnv(gym.Env):
 
         self._build_raster_cache()
         self._init_detour_wrapper()
+
+        if self.agent_role_rules is not None:
+            if len(self.agent_role_rules) == 1:
+                self.agent_role_rules = self.agent_role_rules * self.num_agents
+            elif len(self.agent_role_rules) != self.num_agents:
+                raise ValueError(
+                    f"agent_role_rules length must be 1 or num_agents ({self.num_agents}), got {len(self.agent_role_rules)}"
+                )
 
         obs_dim = 3 + 3 + 3 + 2 + self.observed_other_agents * 3 + 1
         self.single_agent_obs_dim = int(obs_dim)
@@ -1050,7 +1060,7 @@ class MajestroNavMeshEnv(gym.Env):
             return snapped[0].astype(np.float32)
         return target.astype(np.float32)
 
-    def _assign_roles_fixed(self) -> np.ndarray:
+    def _fixed_role_for_agent(self, agent_index: int) -> int:
         base_roles = [
             ROLE_FRONT,
             ROLE_FLANK_LEFT,
@@ -1059,72 +1069,86 @@ class MajestroNavMeshEnv(gym.Env):
             ROLE_BASE_MOVE,
             ROLE_SURROUND,
         ]
-        out = np.zeros((self.num_agents,), dtype=np.int32)
-        for idx in range(self.num_agents):
-            if idx == 0:
-                role_id = ROLE_FRONT
-            else:
-                role_id = base_roles[(idx - 1) % len(base_roles)]
-            out[idx] = int(role_id)
-        return out
+        if agent_index == 0:
+            return ROLE_FRONT
+        return int(base_roles[(agent_index - 1) % len(base_roles)])
 
-    def _assign_roles_rule_based(self) -> np.ndarray:
-        if self.num_agents <= 0:
-            return np.zeros((0,), dtype=np.int32)
+    def _agent_rule_stats(self, agent_index: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, float]:
         positions = self.agent_positions.copy()
         dists = np.linalg.norm(self.goal_pos[None, :] - positions, axis=1)
-        remaining = list(np.argsort(dists))
-        roles = np.full((self.num_agents,), ROLE_FRONT, dtype=np.int32)
-        assigned = set()
+        my_pos = positions[agent_index]
+        team_center = np.mean(positions, axis=0) if len(positions) > 0 else my_pos
+        approach_dir = self._normalize_vec(self.goal_pos - team_center)
+        if float(np.linalg.norm(approach_dir)) <= 1e-6:
+            approach_dir = self._normalize_vec(self.goal_pos - my_pos)
+        if float(np.linalg.norm(approach_dir)) <= 1e-6:
+            approach_dir = np.array([1.0, 0.0], dtype=np.float32)
+        side_dir = np.array([-approach_dir[1], approach_dir[0]], dtype=np.float32)
+        side_score = float(np.dot(my_pos - self.goal_pos, side_dir))
+        my_dist = float(dists[agent_index])
+        median_dist = float(np.median(dists)) if len(dists) > 0 else my_dist
+        p30 = float(np.percentile(dists, 30)) if len(dists) > 0 else my_dist
+        p70 = float(np.percentile(dists, 70)) if len(dists) > 0 else my_dist
+        return positions, dists, side_dir, side_score, my_dist, median_dist, p30, p70
 
-        front_idx = int(remaining.pop(0))
-        roles[front_idx] = ROLE_FRONT
-        assigned.add(front_idx)
+    def _choose_role_for_agent(self, agent_index: int, rule_name: str) -> int:
+        rule = str(rule_name).strip().lower()
+        if rule == "fixed":
+            return self._fixed_role_for_agent(agent_index)
 
-        if remaining:
-            cover_idx = int(max(remaining, key=lambda idx: dists[idx]))
-            roles[cover_idx] = ROLE_COVER
-            assigned.add(cover_idx)
-            remaining.remove(cover_idx)
+        _, dists, _, side_score, my_dist, median_dist, p30, p70 = self._agent_rule_stats(agent_index)
+        surround_radius = max(self.success_radius * 1.6, self.agent_radius * 2.2)
+        ring_error = abs(my_dist - surround_radius)
+        _, angle_gap, ally_count = self._surround_stats(agent_index)
+        cover_anchor = self._closest_cover_anchor(agent_index)
 
-        ref_pos = positions[front_idx]
-        to_goal = self.goal_pos - ref_pos
-        goal_dir = self._normalize_vec(to_goal)
-        if float(np.linalg.norm(goal_dir)) <= 1e-6:
-            goal_dir = np.array([1.0, 0.0], dtype=np.float32)
-        side_dir = np.array([-goal_dir[1], goal_dir[0]], dtype=np.float32)
+        if rule in ("balanced", "heuristic", "rule", "rule_based", "dynamic", "auto"):
+            if my_dist <= self.success_radius * 1.15:
+                return ROLE_FRONT
+            if ally_count >= 2 and angle_gap >= 0.70 and ring_error <= self.agent_radius * 1.5:
+                return ROLE_SURROUND
+            if side_score >= self.agent_radius * 1.2:
+                return ROLE_FLANK_LEFT
+            if side_score <= -self.agent_radius * 1.2:
+                return ROLE_FLANK_RIGHT
+            if cover_anchor is not None and my_dist >= median_dist + self.agent_radius * 0.2:
+                return ROLE_COVER
+            return ROLE_BASE_MOVE
 
-        if remaining:
-            side_scores = {int(idx): float(np.dot(positions[idx] - ref_pos, side_dir)) for idx in remaining}
-            left_idx = int(max(remaining, key=lambda idx: side_scores[int(idx)]))
-            roles[left_idx] = ROLE_FLANK_LEFT
-            assigned.add(left_idx)
-            remaining.remove(left_idx)
+        if rule in ("pressure", "aggressive", "attack"):
+            if my_dist <= p30 or my_dist <= self.success_radius * 1.4:
+                return ROLE_FRONT
+            if side_score >= self.agent_radius * 1.1:
+                return ROLE_FLANK_LEFT
+            if side_score <= -self.agent_radius * 1.1:
+                return ROLE_FLANK_RIGHT
+            if my_dist >= p70:
+                return ROLE_COVER
+            return ROLE_BASE_MOVE
 
-        if remaining:
-            side_scores = {int(idx): float(np.dot(positions[idx] - ref_pos, side_dir)) for idx in remaining}
-            right_idx = int(min(remaining, key=lambda idx: side_scores[int(idx)]))
-            roles[right_idx] = ROLE_FLANK_RIGHT
-            assigned.add(right_idx)
-            remaining.remove(right_idx)
+        if rule in ("encircle", "surround", "flank_heavy"):
+            if ally_count >= 1 and angle_gap >= 0.55 and ring_error <= self.success_radius * 1.3:
+                return ROLE_SURROUND
+            if side_score >= self.agent_radius * 0.9:
+                return ROLE_FLANK_LEFT
+            if side_score <= -self.agent_radius * 0.9:
+                return ROLE_FLANK_RIGHT
+            if my_dist <= p30:
+                return ROLE_FRONT
+            return ROLE_COVER
 
-        if remaining:
-            surround_idx = int(min(remaining, key=lambda idx: abs(float(np.linalg.norm(positions[idx] - self.goal_pos)) - max(self.success_radius * 1.6, self.agent_radius * 2.2))))
-            roles[surround_idx] = ROLE_SURROUND
-            assigned.add(surround_idx)
-            remaining.remove(surround_idx)
+        if rule in ("mobility", "detour", "base_move_heavy"):
+            if my_dist <= self.success_radius * 1.2:
+                return ROLE_FRONT
+            if side_score >= self.agent_radius * 1.4:
+                return ROLE_FLANK_LEFT
+            if side_score <= -self.agent_radius * 1.4:
+                return ROLE_FLANK_RIGHT
+            if my_dist >= p70 and ally_count >= 1:
+                return ROLE_SURROUND
+            return ROLE_BASE_MOVE
 
-        for idx in remaining:
-            side_score = float(np.dot(positions[idx] - ref_pos, side_dir))
-            if side_score >= self.agent_radius * 0.5:
-                roles[int(idx)] = ROLE_FLANK_LEFT
-            elif side_score <= -self.agent_radius * 0.5:
-                roles[int(idx)] = ROLE_FLANK_RIGHT
-            elif dists[int(idx)] <= float(np.median(dists)) + self.agent_radius:
-                roles[int(idx)] = ROLE_BASE_MOVE
-            else:
-                roles[int(idx)] = ROLE_SURROUND
-        return roles
+        return self._fixed_role_for_agent(agent_index)
 
     def _compute_assigned_roles(self) -> np.ndarray:
         if callable(self.role_selector):
@@ -1135,9 +1159,14 @@ class MajestroNavMeshEnv(gym.Env):
             except Exception:
                 pass
 
-        if self.role_rule in ("rule", "rule_based", "dynamic", "heuristic", "auto"):
-            return self._assign_roles_rule_based()
-        return self._assign_roles_fixed()
+        out = np.zeros((self.num_agents,), dtype=np.int32)
+        for idx in range(self.num_agents):
+            if self.agent_role_rules is not None:
+                rule = self.agent_role_rules[idx]
+            else:
+                rule = self.role_rule
+            out[idx] = int(self._choose_role_for_agent(idx, rule))
+        return out
 
     def _assign_roles(self) -> None:
         self.agent_role_ids[:] = self._compute_assigned_roles()
@@ -1529,14 +1558,8 @@ class MajestroNavMeshEnv(gym.Env):
             new_geo = self._geo_distance(self.agent_positions[idx])
             geo_dists.append(new_geo)
             if old_geo is not None and new_geo is not None:
-                geo_delta = float(old_geo) - float(new_geo)
-                rewards[idx] += self.progress_coef * geo_delta
-                terms_list[idx]["geo_delta"] = self.progress_coef * geo_delta
                 cur_metric = float(new_geo)
             else:
-                eu_delta = float(np.linalg.norm(self.goal_pos - old_positions[idx]) - dists[idx])
-                rewards[idx] += self.progress_coef * eu_delta
-                terms_list[idx]["euclid_delta"] = self.progress_coef * eu_delta
                 cur_metric = float(dists[idx])
 
             if collisions[idx]:
@@ -1590,6 +1613,7 @@ class MajestroNavMeshEnv(gym.Env):
             "agent_positions": self.agent_positions.copy(),
             "success_mask": success_mask.copy(),
             "role_ids": step_role_ids.copy(),
+            "agent_role_rules": list(self.agent_role_rules) if self.agent_role_rules is not None else [self.role_rule] * self.num_agents,
             "role_targets": self.role_targets.copy(),
             "sensor_fail_code": sensor_fail_codes.copy(),
             "detour_used": detour_used_codes.copy(),

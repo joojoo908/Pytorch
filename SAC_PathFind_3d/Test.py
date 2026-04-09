@@ -52,7 +52,7 @@ def main():
     # Updates & exploration
     ap.add_argument("--updates-per-step", type=int, default=2)
     ap.add_argument("--alpha-floor", type=float, default=0.03)
-    ap.add_argument("--alpha-ceiling", type=float, default=0.50)
+    ap.add_argument("--alpha-ceiling", type=float, default=0.90)
 
     # Best saving
     ap.add_argument("--save-best-online", action="store_true", default=True)
@@ -83,8 +83,15 @@ def main():
     ap.add_argument("--goal-spawn-min-scale", type=float, default=4.0)
     ap.add_argument("--agent-spawn-min-scale", type=float, default=2.0)
     ap.add_argument("--agent-spawn-max-scale", type=float, default=3.0)
+    ap.add_argument("--role-rule", type=str, default="fixed", choices=["fixed", "balanced", "pressure", "encircle", "mobility"])
+    ap.add_argument("--agent-role-rules", type=str, default=None,
+                    help="Comma-separated per-agent heuristic list. Length must be 1 or num_agents. Example: balanced,pressure,encircle,mobility,fixed")
 
     args = ap.parse_args()
+
+    agent_role_rules = None
+    if args.agent_role_rules:
+        agent_role_rules = [part.strip() for part in args.agent_role_rules.split(",") if part.strip()]
 
     # Set seeds
     set_global_seed(args.seed)
@@ -104,6 +111,8 @@ def main():
         goal_spawn_min_scale=args.goal_spawn_min_scale,
         agent_spawn_min_scale=args.agent_spawn_min_scale,
         agent_spawn_max_scale=args.agent_spawn_max_scale,
+        role_rule=args.role_rule,
+        agent_role_rules=agent_role_rules,
     )
     # Apply dynamic horizon params if supported
     if hasattr(env, "dynamic_horizon"):

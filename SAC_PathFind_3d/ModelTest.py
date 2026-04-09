@@ -23,6 +23,14 @@ ROLE_NAMES = {
     5: "surround",
 }
 
+HEURISTIC_SHORT = {
+    "fixed": "fix",
+    "balanced": "bal",
+    "pressure": "prs",
+    "encircle": "enc",
+    "mobility": "mob",
+}
+
 ROLE_COLORS = {
     0: (255, 110, 110),
     1: (110, 220, 255),
@@ -310,8 +318,12 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
 
             sensor_fail_codes = final_info.get("sensor_fail_code")
             fail_arr = None if sensor_fail_codes is None else np.asarray(sensor_fail_codes, dtype=np.float32).reshape(-1)
-            detour_used = final_info.get("detour_used")
-            detour_arr = None if detour_used is None else np.asarray(detour_used, dtype=np.float32).reshape(-1)
+            agent_role_rules = final_info.get("agent_role_rules")
+            if agent_role_rules is None:
+                default_rule = getattr(env, "role_rule", "fixed")
+                agent_role_rules = [default_rule] * len(agent_trajs)
+            else:
+                agent_role_rules = list(agent_role_rules)
             if fail_arr is not None:
                 for idx, pos in enumerate(np.asarray(env.agent_positions, dtype=np.float32)):
                     if idx >= len(fail_arr) or fail_arr[idx] <= 0.5:
@@ -354,47 +366,23 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
                     color = ROLE_COLORS.get(role_id, (200, 140, 70))
                     sx, sy = world_to_screen(other)
                     pygame.draw.circle(screen, color, (sx, sy), 4)
-                    if fail_arr is not None and idx < len(fail_arr):
-                        detour_flag = int(detour_arr[idx] > 0.5) if detour_arr is not None and idx < len(detour_arr) else 0
-                        fail_text = f"F:{int(fail_arr[idx] > 0.5)} D:{detour_flag}"
-                        surf = font.render(fail_text, True, color)
-                        screen.blit(surf, (sx + 6, sy - 10))
+                    rule_name = str(agent_role_rules[idx]) if idx < len(agent_role_rules) else str(getattr(env, "role_rule", "fixed"))
+                    rule_short = HEURISTIC_SHORT.get(rule_name, rule_name[:3])
+                    role_label = ROLE_NAMES.get(role_id, str(role_id))
+                    label = f"{rule_short}->{role_label}"
+                    surf = font.render(label, True, color)
+                    screen.blit(surf, (sx + 6, sy - 10))
 
             pygame.draw.circle(screen, (230, 90, 90), world_to_screen(goal_pos), 6)
             pygame.draw.circle(screen, (255, 255, 255), world_to_screen(env.agent_pos), 5, 1)
 
             dist = float(np.linalg.norm(env.goal_pos - env.agent_pos))
-            detour_enabled = bool(final_info.get("detour_enabled", False))
-            detour_attempted = final_info.get("detour_attempted")
-            detour_target = final_info.get("detour_target")
-            detour_waypoint = final_info.get("detour_waypoint")
-            detour_error = final_info.get("detour_error", "")
-            detour_attempt_main = 0
-            if detour_attempted is not None:
-                detour_attempt_main = int(np.asarray(detour_attempted, dtype=np.float32).reshape(-1)[0] > 0.5)
-            detour_target_main = None
-            if detour_target is not None:
-                detour_target_main = np.asarray(detour_target, dtype=np.float32).reshape(-1, 2)[0]
-            detour_waypoint_main = None
-            if detour_waypoint is not None:
-                wp0 = np.asarray(detour_waypoint, dtype=np.float32).reshape(-1, 2)[0]
-                if np.all(np.isfinite(wp0)):
-                    detour_waypoint_main = wp0
             lines = [
                 f"Step: {step + 1}/{max_steps}",
                 f"Return: {ep_ret:.3f}",
                 f"Dist: {dist:.2f}",
                 f"Pos: ({env.agent_pos[0]:.1f}, {env.agent_height:.1f}, {env.agent_pos[1]:.1f})",
-                f"Detour: enabled={int(detour_enabled)} attempt={detour_attempt_main}",
             ]
-            if detour_target_main is not None:
-                lines.append(f"DTarget0: ({detour_target_main[0]:.1f}, {detour_target_main[1]:.1f})")
-            if detour_waypoint_main is not None:
-                lines.append(f"DWaypoint0: ({detour_waypoint_main[0]:.1f}, {detour_waypoint_main[1]:.1f})")
-            elif detour_enabled and detour_attempt_main:
-                lines.append(f"DWaypoint0: none")
-            if detour_error:
-                lines.append(f"DError: {detour_error[:80]}")
             if role_ids is not None:
                 role_labels = [ROLE_NAMES.get(int(r), str(int(r))) for r in role_ids]
                 lines.append(f"Roles: {', '.join(role_labels)}")
@@ -482,11 +470,17 @@ if __name__ == "__main__":
     ap.add_argument("--goal-spawn-min-scale", type=float, default=4.0)
     ap.add_argument("--agent-spawn-min-scale", type=float, default=2.0)
     ap.add_argument("--agent-spawn-max-scale", type=float, default=3.0)
-    ap.add_argument("--role-rule", type=str, default="fixed", choices=["fixed", "heuristic"])
+    ap.add_argument("--role-rule", type=str, default="fixed", choices=["fixed", "balanced", "pressure", "encircle", "mobility"])
+    ap.add_argument("--agent-role-rules", type=str, default=None,
+                    help="Comma-separated per-agent heuristic list. Length must be 1 or num_agents. Example: balanced,pressure,encircle,mobility,fixed")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     actor_path = args.actor_path
+    agent_role_rules = None
+    if args.agent_role_rules:
+        agent_role_rules = [part.strip() for part in args.agent_role_rules.split(",") if part.strip()]
+
     env = build_env(
         seed=args.seed,
         move_step_size=args.move_step_size,
@@ -499,6 +493,7 @@ if __name__ == "__main__":
         agent_spawn_min_scale=args.agent_spawn_min_scale,
         agent_spawn_max_scale=args.agent_spawn_max_scale,
         role_rule=args.role_rule,
+        agent_role_rules=agent_role_rules,
     )
 
     if not os.path.exists(actor_path):
