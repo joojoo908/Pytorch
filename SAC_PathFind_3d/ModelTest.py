@@ -471,7 +471,7 @@ if __name__ == "__main__":
     ap.add_argument("--agent-spawn-min-scale", type=float, default=2.0)
     ap.add_argument("--agent-spawn-max-scale", type=float, default=3.0)
     ap.add_argument("--role-rule", type=str, default="fixed", choices=["fixed", "balanced", "pressure", "encircle", "mobility"])
-    ap.add_argument("--agent-role-rules", type=str, default=None,
+    ap.add_argument("--agent-role-rules", type=str, default="fixed,fixed,fixed,fixed,fixed",
                     help="Comma-separated per-agent heuristic list. Length must be 1 or num_agents. Example: balanced,pressure,encircle,mobility,fixed")
     args = ap.parse_args()
 

@@ -4,6 +4,8 @@
 
 `ModelTest.py`는 학습된 actor를 불러와 현재 환경에서 평가하고, pygame으로 2D 탑다운 디버그 시각화를 보여주는 스크립트입니다.
 
+현재 환경 관측에는 다른 에이전트들의 heuristic ID가 포함되므로, 예전 입력 차원으로 학습된 actor는 새 환경과 바로 호환되지 않을 수 있습니다.
+
 역할:
 
 1. 저장된 actor 가중치로 여러 에피소드 평가
@@ -197,6 +199,8 @@ python ModelTest.py --no-visualize
 8. 모든 에이전트의 실제 위치를 궤적 버퍼에 추가
 9. pygame 화면에 navmesh, 궤적, 감지 반경, fallback 경로, 현재 위치를 다시 그림
 10. `terminated` 또는 `truncated`이면 에피소드 종료
+
+현재 기본 단일 에이전트 관측 차원은 `24`이며, 주변 에이전트 슬롯마다 상대 위치/거리와 함께 heuristic ID가 포함됩니다.
 
 ## 평가 결과 로그 의미
 

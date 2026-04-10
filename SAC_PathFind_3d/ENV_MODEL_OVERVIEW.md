@@ -11,9 +11,9 @@
 
 현재 기준:
 
-- 에이전트 1명 기준 관측 크기: `22`
+- 에이전트 1명 기준 관측 크기: `24`
 - 에이전트 1명 기준 행동 크기: `2`
-- 전체 관측 shape: `(num_agents, 22)`
+- 전체 관측 shape: `(num_agents, 24)`
 - 전체 행동 shape: `(num_agents, 2)`
 
 기본값 기준:
@@ -52,6 +52,19 @@
 - 역할별 보상에 사용되고
 - 역할별 성공 판정에도 사용됩니다
 
+휴리스틱 규칙도 에이전트별로 따로 가질 수 있습니다.
+
+- 공통 규칙: `role_rule`
+- 개별 규칙: `agent_role_rules`
+
+현재 지원 규칙:
+
+- `fixed`
+- `balanced`
+- `pressure`
+- `encircle`
+- `mobility`
+
 ## 로컬 탐지
 
 현재 로컬 탐지는 `sense_radius` 안의 주변 몹만 봅니다.
@@ -70,7 +83,7 @@ python Test.py --sense-radius 500
 python ModelTest.py --sense-radius 500
 ```
 
-## 입력 22개
+## 입력 24개
 
 ### 0-2: 현재 위치
 
@@ -95,32 +108,43 @@ python ModelTest.py --sense-radius 500
 - `velocity_x`
 - `velocity_z`
 
-### 11-19: 주변 몹 정보
+### 11-22: 주변 몹 정보 + 휴리스틱
 
 - `other_0_rel_x`
 - `other_0_rel_z`
 - `other_0_dist`
+- `other_0_heuristic`
 - `other_1_rel_x`
 - `other_1_rel_z`
 - `other_1_dist`
+- `other_1_heuristic`
 - `other_2_rel_x`
 - `other_2_rel_z`
 - `other_2_dist`
+- `other_2_heuristic`
 
 의미:
 
-- `sense_radius` 안의 다른 에이전트 중 가장 가까운 최대 3명의 상대 위치/거리
+- `sense_radius` 안의 다른 에이전트 중 가장 가까운 최대 3명의 상대 위치/거리/휴리스틱
 - 부족한 슬롯은 `0`으로 채워짐
 
-### 20: 역할 ID
-
-- 정규화된 `role_id`
-
-### 21: 센서 실패 코드
+### 23: 센서 실패 코드
 
 - `sensor_fail_code`
 - `0.0`: 반경 안에 주변 몹 있음
 - `1.0`: 반경 안에 주변 몹 없음
+
+현재는 자기 자신의 휴리스틱을 따로 넣지 않고, 관측한 다른 에이전트 슬롯에 그 에이전트의 휴리스틱을 함께 넣습니다.
+
+휴리스틱 정규화 규칙:
+
+- `fixed -> 0.00`
+- `balanced -> 0.25`
+- `pressure -> 0.50`
+- `encircle -> 0.75`
+- `mobility -> 1.00`
+
+즉 정책은 "내가 무슨 heuristic인가"보다 "내 주변에 보이는 다른 에이전트들이 어떤 heuristic인가"를 입력으로 받습니다.
 
 ## 출력 2개
 

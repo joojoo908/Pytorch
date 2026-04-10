@@ -54,6 +54,14 @@ ROLE_COVER = 3
 ROLE_BASE_MOVE = 4
 ROLE_SURROUND = 5
 ROLE_COUNT = 6
+HEURISTIC_NAME_TO_ID = {
+    "fixed": 0,
+    "balanced": 1,
+    "pressure": 2,
+    "encircle": 3,
+    "mobility": 4,
+}
+HEURISTIC_COUNT = len(HEURISTIC_NAME_TO_ID)
 DT_VERTS_PER_POLYGON = 6
 DT_NAVMESH_MAGIC = ord("D") << 24 | ord("N") << 16 | ord("A") << 8 | ord("V")
 NAVMESHSET_MAGIC = ord("M") << 24 | ord("S") << 16 | ord("E") << 8 | ord("T")
@@ -389,7 +397,7 @@ class MajestroNavMeshEnv(gym.Env):
                     f"agent_role_rules length must be 1 or num_agents ({self.num_agents}), got {len(self.agent_role_rules)}"
                 )
 
-        obs_dim = 3 + 3 + 3 + 2 + self.observed_other_agents * 3 + 1
+        obs_dim = 3 + 3 + 3 + 2 + self.observed_other_agents * 4 + 1
         self.single_agent_obs_dim = int(obs_dim)
         self.single_agent_act_dim = 2
         self.observation_space = spaces.Box(
@@ -756,21 +764,24 @@ class MajestroNavMeshEnv(gym.Env):
         if self.observed_other_agents <= 0:
             return np.zeros((0,), dtype=np.float32), 0
         if self.agent_positions.shape[0] <= 1:
-            return np.zeros((self.observed_other_agents * 3,), dtype=np.float32), 0
-        others = np.delete(self.agent_positions, agent_index, axis=0)
+            return np.zeros((self.observed_other_agents * 4,), dtype=np.float32), 0
+        other_indices = np.array([idx for idx in range(self.agent_positions.shape[0]) if idx != agent_index], dtype=np.int32)
+        others = self.agent_positions[other_indices]
         rel = others - self.agent_positions[agent_index][None, :]
         dists = np.linalg.norm(rel, axis=1)
         if max_distance is not None:
             mask = dists <= float(max_distance)
+            other_indices = other_indices[mask]
             rel = rel[mask]
             dists = dists[mask]
         if dists.size == 0:
-            return np.zeros((self.observed_other_agents * 3,), dtype=np.float32), 0
+            return np.zeros((self.observed_other_agents * 4,), dtype=np.float32), 0
         order = np.argsort(dists)[: self.observed_other_agents]
-        obs = np.zeros((self.observed_other_agents, 3), dtype=np.float32)
+        obs = np.zeros((self.observed_other_agents, 4), dtype=np.float32)
         for out_idx, agent_idx in enumerate(order):
             obs[out_idx, 0:2] = rel[agent_idx] / scale
             obs[out_idx, 2] = dists[agent_idx] / scale
+            obs[out_idx, 3] = self._heuristic_value(int(other_indices[agent_idx]))[0]
         return obs.reshape(-1), int(len(order))
 
     def _sense_local_space(self, agent_index: int, scale: float) -> Tuple[np.ndarray, float]:
@@ -962,6 +973,15 @@ class MajestroNavMeshEnv(gym.Env):
         denom = max(1, ROLE_COUNT - 1)
         role_id = int(np.clip(self.agent_role_ids[agent_index], 0, ROLE_COUNT - 1))
         return np.array([float(role_id) / float(denom)], dtype=np.float32)
+
+    def _heuristic_value(self, agent_index: int) -> np.ndarray:
+        if self.agent_role_rules is not None:
+            rule_name = str(self.agent_role_rules[agent_index]).strip().lower()
+        else:
+            rule_name = str(self.role_rule).strip().lower()
+        heuristic_id = int(HEURISTIC_NAME_TO_ID.get(rule_name, 0))
+        denom = max(1, HEURISTIC_COUNT - 1)
+        return np.array([float(heuristic_id) / float(denom)], dtype=np.float32)
 
     def _normalize_vec(self, v: np.ndarray, eps: float = 1e-6) -> np.ndarray:
         n = float(np.linalg.norm(v))
