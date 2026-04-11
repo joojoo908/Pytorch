@@ -32,6 +32,9 @@ python ModelTest.py
 python ModelTest.py --actor-path sac_actor_best.pth
 python ModelTest.py --episodes 20
 python ModelTest.py --sense-radius 500
+python ModelTest.py --role-rule melee_dps
+python ModelTest.py --role-rule ranged_dps
+python ModelTest.py --agent-role-rules fixed,melee_dps,ranged_dps,fixed,fixed
 python ModelTest.py --goal-spawn-min-scale 2.0 --agent-spawn-min-scale 1.2
 python ModelTest.py --no-visualize
 ```

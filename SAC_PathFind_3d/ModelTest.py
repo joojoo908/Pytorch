@@ -21,14 +21,15 @@ ROLE_NAMES = {
     3: "cover",
     4: "base",
     5: "surround",
+    6: "kiting",
 }
 
 HEURISTIC_SHORT = {
     "fixed": "fix",
-    "balanced": "bal",
-    "pressure": "prs",
-    "encircle": "enc",
-    "mobility": "mob",
+    "melee_dps": "mdps",
+    "meleedps": "mdps",
+    "ranged_dps": "rdps",
+    "rangeddps": "rdps",
 }
 
 ROLE_COLORS = {
@@ -38,6 +39,7 @@ ROLE_COLORS = {
     3: (180, 140, 255),
     4: (160, 255, 160),
     5: (255, 140, 200),
+    6: (255, 170, 110),
 }
 
 DETOUR_PATH_COLOR = (80, 255, 220)
@@ -88,12 +90,14 @@ except Exception:
                 cover = True
             elif int(role_id) == 5:
                 surround = True
+            elif int(role_id) == 6:
+                pass
         return bool(front and flank and cover and surround)
 
-    ROLE_IDS = (0, 1, 2, 3, 4, 5)
+    ROLE_IDS = (0, 1, 2, 3, 4, 5, 6)
 
     def role_name(role_id):
-        return {0: "front", 1: "flank_left", 2: "flank_right", 3: "cover", 4: "base_move", 5: "surround"}.get(int(role_id), f"role_{int(role_id)}")
+        return {0: "front", 1: "flank_left", 2: "flank_right", 3: "cover", 4: "base_move", 5: "surround", 6: "kiting"}.get(int(role_id), f"role_{int(role_id)}")
 
     def get_env_role_ids(env, count):
         role_ids = getattr(env, "agent_role_ids", None)
@@ -470,9 +474,9 @@ if __name__ == "__main__":
     ap.add_argument("--goal-spawn-min-scale", type=float, default=4.0)
     ap.add_argument("--agent-spawn-min-scale", type=float, default=2.0)
     ap.add_argument("--agent-spawn-max-scale", type=float, default=3.0)
-    ap.add_argument("--role-rule", type=str, default="fixed", choices=["fixed", "balanced", "pressure", "encircle", "mobility"])
-    ap.add_argument("--agent-role-rules", type=str, default="fixed,fixed,fixed,fixed,fixed",
-                    help="Comma-separated per-agent heuristic list. Length must be 1 or num_agents. Example: balanced,pressure,encircle,mobility,fixed")
+    ap.add_argument("--role-rule", type=str, default="fixed", choices=["fixed", "melee_dps", "ranged_dps"])
+    ap.add_argument("--agent-role-rules", type=str, default="melee_dps,melee_dps,melee_dps,ranged_dps,ranged_dps",
+                    help="Comma-separated per-agent heuristic list. Length must be 1 or num_agents. Example: fixed,melee_dps,ranged_dps,fixed,fixed")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

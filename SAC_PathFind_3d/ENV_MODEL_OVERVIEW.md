@@ -60,10 +60,8 @@
 현재 지원 규칙:
 
 - `fixed`
-- `balanced`
-- `pressure`
-- `encircle`
-- `mobility`
+- `melee_dps`
+- `ranged_dps`
 
 ## 로컬 탐지
 
@@ -139,12 +137,22 @@ python ModelTest.py --sense-radius 500
 휴리스틱 정규화 규칙:
 
 - `fixed -> 0.00`
-- `balanced -> 0.25`
-- `pressure -> 0.50`
-- `encircle -> 0.75`
-- `mobility -> 1.00`
+- `melee_dps -> 0.50`
+- `ranged_dps -> 1.00`
 
 즉 정책은 "내가 무슨 heuristic인가"보다 "내 주변에 보이는 다른 에이전트들이 어떤 heuristic인가"를 입력으로 받습니다.
+
+`melee_dps`의 역할 선택 규칙은 현재 다음과 같습니다.
+
+- goal과 멀면 `base_move`
+- goal과 가깝고 주변 actor가 없으면 `front`
+- goal과 가깝고 주변 actor가 있으면 `surround`
+
+`ranged_dps`의 역할 선택 규칙은 현재 다음과 같습니다.
+
+- goal이 kiting 유지 범위보다 멀면 `base_move`
+- sense radius 안에 `melee_dps` actor가 있으면 `cover`
+- 위 조건이 아니면 `kiting`
 
 ## 출력 2개
 
@@ -238,7 +246,10 @@ progress_coef * (old_dist - new_dist)
 - `front`: 정면 압박
 - `flank_left`: 왼쪽 측면 점유
 - `flank_right`: 오른쪽 측면 점유
-- `cover`: 다른 몹 뒤 위치
+- `cover`: 다른 액터 뒤 엄폐, 단 goal과 너무 멀면 감점
+- `base_move`: 빠르게 접근
+- `surround`: 포위 반경과 각도 분산
+- `kiting`: goal과 일정 거리를 유지하며 이탈 방향 움직임
 
 ### 7. 성공 보상
 

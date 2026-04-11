@@ -75,6 +75,7 @@ def extract_role_success(info: Dict[str, Any]) -> Dict[str, bool]:
         "cover": False,
         "base_move": False,
         "surround": False,
+        "kiting": False,
     }
     if not isinstance(info, dict):
         return result
@@ -102,6 +103,8 @@ def extract_role_success(info: Dict[str, Any]) -> Dict[str, bool]:
             result["base_move"] = True
         elif int(role_id) == 5:
             result["surround"] = True
+        elif int(role_id) == 6:
+            result["kiting"] = True
     return result
 
 
@@ -118,6 +121,7 @@ ROLE_ID_TO_NAME = {
     3: "cover",
     4: "base_move",
     5: "surround",
+    6: "kiting",
 }
 ROLE_IDS = tuple(sorted(ROLE_ID_TO_NAME.keys()))
 
