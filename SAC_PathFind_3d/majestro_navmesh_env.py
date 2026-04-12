@@ -1093,7 +1093,7 @@ class MajestroNavMeshEnv(gym.Env):
                 rel_dir = side_dir
             target = self.goal_pos + rel_dir * surround_radius
         else:
-            kiting_radius = max(self.success_radius * 2.2, self.agent_radius * 3.4)
+            kiting_radius = max(1.0, float(self.sense_radius) - 50.0)
             rel = my_pos - self.goal_pos
             rel_dir = self._normalize_vec(rel)
             if float(np.linalg.norm(rel_dir)) <= 1e-6:
@@ -1143,23 +1143,17 @@ class MajestroNavMeshEnv(gym.Env):
             return self._fixed_role_for_agent(agent_index)
         if rule in ("melee_dps", "meleedps"):
             my_dist = float(np.linalg.norm(self.goal_pos - self.agent_positions[agent_index]))
-            _, sensed_agents = self._other_agent_observation(
-                agent_index,
-                scale=max(self.map_range, 1.0),
-                max_distance=max(1.0, float(self.sense_radius)),
-            )
-            is_close_to_goal = bool(my_dist <= self.success_radius * 1.5)
-            has_nearby_actor = bool(sensed_agents > 0)
-            if not is_close_to_goal:
+            goal_in_sense = bool(my_dist <= max(1.0, float(self.sense_radius)))
+            has_nearby_melee = self._has_nearby_actor_with_heuristic(agent_index, ("melee_dps", "meleedps"))
+            if not goal_in_sense:
                 return ROLE_BASE_MOVE
-            if has_nearby_actor:
+            if has_nearby_melee:
                 return ROLE_SURROUND
             return ROLE_FRONT
         if rule in ("ranged_dps", "rangeddps"):
             my_dist = float(np.linalg.norm(self.goal_pos - self.agent_positions[agent_index]))
-            kiting_radius = max(self.success_radius * 2.2, self.agent_radius * 3.4)
-            band_tol = max(self.agent_radius * 1.3, self.success_radius * 0.45)
-            if my_dist > kiting_radius + band_tol:
+            goal_in_sense = bool(my_dist <= max(1.0, float(self.sense_radius)))
+            if not goal_in_sense:
                 return ROLE_BASE_MOVE
             if self._has_nearby_actor_with_heuristic(agent_index, ("melee_dps", "meleedps")):
                 return ROLE_COVER
@@ -1239,7 +1233,7 @@ class MajestroNavMeshEnv(gym.Env):
         elif role_id == ROLE_COVER:
             anchor = self._closest_cover_anchor(agent_index)
             cover_bonus = 0.0
-            cover_goal_cap = self.success_radius * 3.0
+            cover_goal_cap = max(1.0, float(self.sense_radius))
             if anchor is not None:
                 anchor_to_goal = self.goal_pos - anchor
                 me_to_anchor = new_pos - anchor
@@ -1288,19 +1282,24 @@ class MajestroNavMeshEnv(gym.Env):
                 and angle_gap >= 0.70
             )
         else:
-            kiting_radius = max(self.success_radius * 2.2, self.agent_radius * 3.4)
-            band_tol = max(self.agent_radius * 1.3, self.success_radius * 0.45)
+            kiting_min_dist = max(0.0, float(self.sense_radius) - 100.0)
+            kiting_max_dist = max(kiting_min_dist + 1.0, float(self.sense_radius))
+            kiting_radius = 0.5 * (kiting_min_dist + kiting_max_dist)
+            band_half_width = max(1.0, 0.5 * (kiting_max_dist - kiting_min_dist))
             ring_error = abs(goal_dist - kiting_radius)
+            in_kiting_band = bool(kiting_min_dist <= goal_dist <= kiting_max_dist)
             velocity_dir = self._normalize_vec(self.agent_velocities[agent_index])
             retreat_alignment = float(np.dot(velocity_dir, -goal_dir))
-            kiting_bonus = 0.12 * max(0.0, 1.0 - ring_error / max(band_tol, 1.0))
+            kiting_bonus = 0.12 * max(0.0, 1.0 - ring_error / band_half_width)
+            if in_kiting_band:
+                kiting_bonus += 0.08
             kiting_bonus += 0.05 * max(0.0, retreat_alignment)
-            if goal_dist < kiting_radius - band_tol:
-                kiting_bonus -= 0.10 * min((kiting_radius - band_tol - goal_dist) / max(self.success_radius, 1.0), 1.5)
+            if goal_dist < kiting_min_dist:
+                kiting_bonus -= 0.10 * min((kiting_min_dist - goal_dist) / max(self.success_radius, 1.0), 1.5)
             bonus += kiting_bonus
             terms["role_kiting"] = kiting_bonus
             tactical_success = bool(
-                ring_error <= band_tol
+                in_kiting_band
                 and retreat_alignment >= 0.15
             )
 

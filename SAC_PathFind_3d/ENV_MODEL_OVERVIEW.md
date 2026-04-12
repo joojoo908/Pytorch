@@ -144,15 +144,15 @@ python ModelTest.py --sense-radius 500
 
 `melee_dps`의 역할 선택 규칙은 현재 다음과 같습니다.
 
-- goal과 멀면 `base_move`
-- goal과 가깝고 주변 actor가 없으면 `front`
-- goal과 가깝고 주변 actor가 있으면 `surround`
+- goal이 sense radius 밖이면 `base_move`
+- goal이 sense radius 안이고 주변에 다른 `melee_dps` actor가 있으면 `surround`
+- goal이 sense radius 안이고 주변에 다른 `melee_dps` actor가 없으면 `front`
 
 `ranged_dps`의 역할 선택 규칙은 현재 다음과 같습니다.
 
-- goal이 kiting 유지 범위보다 멀면 `base_move`
-- sense radius 안에 `melee_dps` actor가 있으면 `cover`
-- 위 조건이 아니면 `kiting`
+- goal이 sense radius 밖이면 `base_move`
+- goal이 sense radius 안이고 주변에 `melee_dps` actor가 있으면 `cover`
+- goal이 sense radius 안이고 주변에 `melee_dps` actor가 없으면 `kiting`
 
 ## 출력 2개
 
@@ -246,10 +246,10 @@ progress_coef * (old_dist - new_dist)
 - `front`: 정면 압박
 - `flank_left`: 왼쪽 측면 점유
 - `flank_right`: 오른쪽 측면 점유
-- `cover`: 다른 액터 뒤 엄폐, 단 goal과 너무 멀면 감점
+- `cover`: 다른 액터 뒤 엄폐, 단 goal이 `sense_radius` 밖이면 감점 및 성공 실패
 - `base_move`: 빠르게 접근
 - `surround`: 포위 반경과 각도 분산
-- `kiting`: goal과 일정 거리를 유지하며 이탈 방향 움직임
+- `kiting`: goal과 `sense_radius - 100`에서 `sense_radius` 사이 거리를 유지하며 이탈 방향 움직임
 
 ### 7. 성공 보상
 
@@ -275,7 +275,8 @@ if success_mask[idx]:
 - `front`: goal 근처에서 정면 압박 형성
 - `flank_left`: 왼쪽 측면 밴드 형성
 - `flank_right`: 오른쪽 측면 밴드 형성
-- `cover`: 다른 몹 뒤 엄폐 위치 형성
+- `cover`: goal이 `sense_radius` 안에 있는 상태에서 다른 몹 뒤 엄폐 위치 형성
+- `kiting`: goal과 `sense_radius - 100`에서 `sense_radius` 사이 거리 유지
 
 ## 종료 조건
 
