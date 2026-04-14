@@ -388,20 +388,20 @@ obs, rewards, terminated, truncated, info
 
 이 최소 조합이 만들어져야 episode success입니다.
 
-학습 로그에는 역할별 성공률도 같이 표시됩니다.
+학습 로그에는 최근 100 episode 기준 역할별 step 성공률도 같이 표시됩니다.
 
 예:
 
 ```text
-role(front/fl/flr/cov)=...
+role_step=front:0.0/flank_left:0.0/flank_right:0.0/cover:12.5/base_move:30.0/surround:8.0/kiting:20.0
+role_step_n=front:0/0/flank_left:0/0/flank_right:0/0/cover:5/40/base_move:30/100/surround:4/50/kiting:10/50
 ```
 
 의미:
 
-- `front` 역할 성공률
-- `flank_left` 역할 성공률
-- `flank_right` 역할 성공률
-- `cover` 역할 성공률
+- `role_step`: 해당 role로 움직인 step 중 `success_mask=True`가 된 비율
+- `role_step_n`: 해당 role의 `성공 step 수 / 시도 step 수`
+- 시도 step이 없는 role은 분모가 0으로 표시될 수 있음
 
 ## 현재 코드 핵심 변경점
 

@@ -493,12 +493,7 @@ def sac_train(env,
         role_bundles = {role_id: init_role_bundle(obs_dim, act_dim, device, actor_lr, critic_lr, succ_buffer_capacity) for role_id in ROLE_IDS}
 
     recent_success: deque[int] = deque(maxlen=100)
-    recent_front_success: deque[int] = deque(maxlen=100)
-    recent_flank_left_success: deque[int] = deque(maxlen=100)
-    recent_flank_right_success: deque[int] = deque(maxlen=100)
-    recent_cover_success: deque[int] = deque(maxlen=100)
-    recent_base_move_success: deque[int] = deque(maxlen=100)
-    recent_surround_success: deque[int] = deque(maxlen=100)
+    recent_role_step_counts = {role_id: deque(maxlen=100) for role_id in ROLE_IDS}
     best_score = -1.0
     alpha_frozen = False
 
@@ -510,8 +505,10 @@ def sac_train(env,
         info: Dict[str, Any] = {}
         obs_arr0 = np.asarray(obs, dtype=np.float32)
         n_agents = int(obs_arr0.shape[0]) if _is_multi_agent_obs(obs_arr0) else 1
-        episode_traj: List[List[Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool, Optional[float], int]]] = [[] for _ in range(n_agents)]
+        episode_traj: List[List[Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool, Optional[float], int, bool]]] = [[] for _ in range(n_agents)]
         ep_horizon = (env.max_steps if (max_steps is None and hasattr(env, "max_steps")) else max_steps)
+        ep_role_attempts = {role_id: 0 for role_id in ROLE_IDS}
+        ep_role_successes = {role_id: 0 for role_id in ROLE_IDS}
 
         while (not done) and (ep_steps < (ep_horizon if ep_horizon is not None else 10**9)):
             obs_arr = np.asarray(obs, dtype=np.float32)
@@ -540,11 +537,27 @@ def sac_train(env,
                     dist_values = np.asarray(info["dist_to_goal"], dtype=np.float32).reshape(-1)
                 except Exception:
                     dist_values = None
+            success_mask_arr = None
+            if isinstance(info, dict) and ("success_mask" in info) and info["success_mask"] is not None:
+                try:
+                    success_mask_arr = np.asarray(info["success_mask"], dtype=bool).reshape(-1)
+                except Exception:
+                    success_mask_arr = None
 
             for agent_idx in range(obs_arr.shape[0]):
                 role_id = int(role_ids_arr[agent_idx]) if agent_idx < len(role_ids_arr) else 0
                 dist = None if dist_values is None or agent_idx >= len(dist_values) else float(dist_values[agent_idx])
+                step_success = bool(success_mask_arr is not None and agent_idx < len(success_mask_arr) and success_mask_arr[agent_idx])
+                if role_id in ep_role_attempts:
+                    ep_role_attempts[role_id] += 1
+                    ep_role_successes[role_id] += int(step_success)
                 role_bundles[role_id]["replay_buffer"].push(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done)
+                if step_success:
+                    succ_replay_buffer = role_bundles[role_id]["succ_replay_buffer"]
+                    if dist is None:
+                        succ_replay_buffer.push(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done)
+                    else:
+                        succ_replay_buffer.push_with_dist(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done, dist)
                 episode_traj[agent_idx].append((
                     np.asarray(obs_arr[agent_idx], dtype=np.float32),
                     np.asarray(act[agent_idx], dtype=np.float32),
@@ -553,6 +566,7 @@ def sac_train(env,
                     bool(done),
                     dist,
                     role_id,
+                    step_success,
                 ))
 
             obs = next_obs
@@ -647,12 +661,13 @@ def sac_train(env,
                     soft_update_(critic_1, target_critic_1, tau)
                     soft_update_(critic_2, target_critic_2, tau)
 
-        role_success = extract_role_success(info)
         episode_success = is_diverse_tactical_success(info)
 
         if episode_success:
             for agent_traj in episode_traj:
-                for (s_, a_, r_, ns_, d_, dist_, role_id_) in agent_traj:
+                for (s_, a_, r_, ns_, d_, dist_, role_id_, step_success_) in agent_traj:
+                    if step_success_:
+                        continue
                     succ_replay_buffer = role_bundles[int(role_id_)]["succ_replay_buffer"]
                     if dist_ is None:
                         succ_replay_buffer.push(s_, a_, r_, ns_, d_)
@@ -660,19 +675,16 @@ def sac_train(env,
                         succ_replay_buffer.push_with_dist(s_, a_, r_, ns_, d_, dist_)
 
         recent_success.append(1 if episode_success else 0)
-        recent_front_success.append(1 if role_success["front"] else 0)
-        recent_flank_left_success.append(1 if role_success["flank_left"] else 0)
-        recent_flank_right_success.append(1 if role_success["flank_right"] else 0)
-        recent_cover_success.append(1 if role_success["cover"] else 0)
-        recent_base_move_success.append(1 if role_success["base_move"] else 0)
-        recent_surround_success.append(1 if role_success["surround"] else 0)
+        for role_id in ROLE_IDS:
+            recent_role_step_counts[role_id].append((ep_role_successes[role_id], ep_role_attempts[role_id]))
         recent_rate = 100.0 * (sum(recent_success) / max(1, len(recent_success)))
-        front_rate = 100.0 * (sum(recent_front_success) / max(1, len(recent_front_success)))
-        flank_left_rate = 100.0 * (sum(recent_flank_left_success) / max(1, len(recent_flank_left_success)))
-        flank_right_rate = 100.0 * (sum(recent_flank_right_success) / max(1, len(recent_flank_right_success)))
-        cover_rate = 100.0 * (sum(recent_cover_success) / max(1, len(recent_cover_success)))
-        base_move_rate = 100.0 * (sum(recent_base_move_success) / max(1, len(recent_base_move_success)))
-        surround_rate = 100.0 * (sum(recent_surround_success) / max(1, len(recent_surround_success)))
+        role_step_rates = {}
+        role_step_counts = {}
+        for role_id in ROLE_IDS:
+            succ_count = sum(s for s, _ in recent_role_step_counts[role_id])
+            attempt_count = sum(a for _, a in recent_role_step_counts[role_id])
+            role_step_counts[role_id] = (succ_count, attempt_count)
+            role_step_rates[role_id] = 100.0 * succ_count / max(1, attempt_count)
 
         if (not alpha_frozen) and (alpha_freeze_recent is not None):
             succ_buf_total = sum(len(role_bundles[r]["succ_replay_buffer"]) for r in ROLE_IDS)
@@ -689,9 +701,12 @@ def sac_train(env,
         if (ep + 1) % 10 == 0:
             alpha_summary = "/".join(f"{role_name(r)}:{role_bundles[r]['alpha']:.3f}" for r in ROLE_IDS)
             succ_summary = "/".join(f"{role_name(r)}:{len(role_bundles[r]['succ_replay_buffer'])}" for r in ROLE_IDS)
+            role_step_summary = "/".join(f"{role_name(r)}:{role_step_rates[r]:4.1f}" for r in ROLE_IDS)
+            role_step_count_summary = "/".join(f"{role_name(r)}:{role_step_counts[r][0]}/{role_step_counts[r][1]}" for r in ROLE_IDS)
             print(f"[EP {ep+1:5d}] steps={ep_steps:3d}  R={ep_reward:8.2f}  succ={int(episode_success)}  "
                   f"recent@{len(recent_success)}={recent_rate:5.1f}%  "
-                  f"| role(front/fl/flr/cov/base/sur)={front_rate:4.1f}/{flank_left_rate:4.1f}/{flank_right_rate:4.1f}/{cover_rate:4.1f}/{base_move_rate:4.1f}/{surround_rate:4.1f} "
+                  f"| role_step={role_step_summary} "
+                  f"| role_step_n={role_step_count_summary} "
                   f"| alpha={alpha_summary} | succ_buf={succ_summary}")
 
         if save_best_online and len(recent_success) >= best_min_episodes:
