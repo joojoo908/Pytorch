@@ -280,16 +280,17 @@ if success_mask[idx]:
 
 ## 종료 조건
 
-환경 종료는 팀 기준입니다.
+현재 환경은 역할 성공으로 조기 종료하지 않습니다.
 
 ```python
-terminated = np.all(success_mask)
+terminated = False
 ```
 
 즉:
 
 - 각 에이전트는 개별 전술 성공 상태를 가짐
-- 전원이 역할 전술을 만족해야 episode 종료
+- 성공한 에이전트는 `success_reward`를 받지만 episode는 계속 진행
+- episode는 시간 제한에 걸릴 때 종료
 
 시간 초과는:
 
@@ -352,7 +353,8 @@ steps >= max_steps
 
 ### 11. 종료 조건 계산
 
-- 전원이 성공하면 `terminated = True`
+- 역할 성공과 무관하게 `terminated = False`
+- 시간 제한이면 `truncated = True`
 
 ### 12. 다음 관측 반환
 
@@ -372,23 +374,7 @@ obs, rewards, terminated, truncated, info
 
 ## 학습 성공률 의미
 
-현재 `Model.py`에서 episode success는 느슨한 “한 명 성공” 기준이 아닙니다.
-
-전술 다양성 조건:
-
-- `front` 성공 1개 이상
-- `flank_left` 또는 `flank_right` 중 하나 이상 성공
-- `cover` 성공 1개 이상
-
-즉:
-
-- 정면 압박
-- 측면 포위
-- 엄폐
-
-이 최소 조합이 만들어져야 episode success입니다.
-
-학습 로그에는 최근 100 episode 기준 역할별 step 성공률도 같이 표시됩니다.
+현재 `Model.py` 학습 로그는 episode 전체 성공률이 아니라 최근 100 episode 기준 역할별 step 성공률을 중심으로 봅니다.
 
 예:
 
@@ -403,6 +389,10 @@ role_step_n=front:0/0/flank_left:0/0/flank_right:0/0/cover:5/40/base_move:30/100
 - `role_step_n`: 해당 role의 `성공 step 수 / 시도 step 수`
 - 시도 step이 없는 role은 분모가 0으로 표시될 수 있음
 
+best 저장은 최근 `best_min_episodes` 범위에서 `succ_replay_buffer` 총량이 얼마나 증가했는지를 기준으로 합니다.
+
+alpha freeze는 `succ_replay_buffer` 총량이 `alpha_freeze_succbuf` 이상이 되었는지만 봅니다.
+
 ## 현재 코드 핵심 변경점
 
 현재 코드 기준 핵심은 다음입니다.
@@ -413,4 +403,5 @@ role_step_n=front:0/0/flank_left:0/0/flank_right:0/0/cover:5/40/base_move:30/100
 - `F=1`일 때 geodesic waypoint fallback
 - 모든 에이전트 이동 속도 동일
 - goal 도달이 아니라 역할 전술 형성이 성공 기준
-- 학습 성공률도 전술 다양성 기준으로 집계
+- 역할 성공으로 episode를 조기 종료하지 않음
+- 학습 로그는 episode success 대신 역할별 step 성공률 중심으로 집계

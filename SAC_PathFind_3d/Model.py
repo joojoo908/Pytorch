@@ -492,8 +492,8 @@ def sac_train(env,
     if role_bundles is None:
         role_bundles = {role_id: init_role_bundle(obs_dim, act_dim, device, actor_lr, critic_lr, succ_buffer_capacity) for role_id in ROLE_IDS}
 
-    recent_success: deque[int] = deque(maxlen=100)
     recent_role_step_counts = {role_id: deque(maxlen=100) for role_id in ROLE_IDS}
+    succ_buf_total_history: deque[int] = deque(maxlen=max(2, int(best_min_episodes)))
     best_score = -1.0
     alpha_frozen = False
 
@@ -504,8 +504,6 @@ def sac_train(env,
         ep_reward = 0.0
         info: Dict[str, Any] = {}
         obs_arr0 = np.asarray(obs, dtype=np.float32)
-        n_agents = int(obs_arr0.shape[0]) if _is_multi_agent_obs(obs_arr0) else 1
-        episode_traj: List[List[Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool, Optional[float], int, bool]]] = [[] for _ in range(n_agents)]
         ep_horizon = (env.max_steps if (max_steps is None and hasattr(env, "max_steps")) else max_steps)
         ep_role_attempts = {role_id: 0 for role_id in ROLE_IDS}
         ep_role_successes = {role_id: 0 for role_id in ROLE_IDS}
@@ -558,16 +556,6 @@ def sac_train(env,
                         succ_replay_buffer.push(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done)
                     else:
                         succ_replay_buffer.push_with_dist(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done, dist)
-                episode_traj[agent_idx].append((
-                    np.asarray(obs_arr[agent_idx], dtype=np.float32),
-                    np.asarray(act[agent_idx], dtype=np.float32),
-                    float(reward_arr[agent_idx]),
-                    np.asarray(next_obs_arr[agent_idx], dtype=np.float32),
-                    bool(done),
-                    dist,
-                    role_id,
-                    step_success,
-                ))
 
             obs = next_obs
 
@@ -596,8 +584,6 @@ def sac_train(env,
                     else:
                         ramp = min(1.0, succ_cov / max(1e-6, succ_ramp_cov))
                         p_eff = float(np.clip(p_succ, 0.0, 1.0)) * ramp
-                        if len(recent_success) >= 10 and (sum(recent_success) / len(recent_success)) < 0.5:
-                            p_eff *= 0.7
                     k = max(0, min(int(round(batch_size * p_eff)), batch_size))
                     if succ_size > 0 and k > 0:
                         S1, A1, R1, NS1, D1 = succ_replay_buffer.sample_by_dist(min(k, succ_size), min_dist=max(0.0, succ_min_dist))
@@ -661,23 +647,8 @@ def sac_train(env,
                     soft_update_(critic_1, target_critic_1, tau)
                     soft_update_(critic_2, target_critic_2, tau)
 
-        episode_success = is_diverse_tactical_success(info)
-
-        if episode_success:
-            for agent_traj in episode_traj:
-                for (s_, a_, r_, ns_, d_, dist_, role_id_, step_success_) in agent_traj:
-                    if step_success_:
-                        continue
-                    succ_replay_buffer = role_bundles[int(role_id_)]["succ_replay_buffer"]
-                    if dist_ is None:
-                        succ_replay_buffer.push(s_, a_, r_, ns_, d_)
-                    else:
-                        succ_replay_buffer.push_with_dist(s_, a_, r_, ns_, d_, dist_)
-
-        recent_success.append(1 if episode_success else 0)
         for role_id in ROLE_IDS:
             recent_role_step_counts[role_id].append((ep_role_successes[role_id], ep_role_attempts[role_id]))
-        recent_rate = 100.0 * (sum(recent_success) / max(1, len(recent_success)))
         role_step_rates = {}
         role_step_counts = {}
         for role_id in ROLE_IDS:
@@ -685,37 +656,44 @@ def sac_train(env,
             attempt_count = sum(a for _, a in recent_role_step_counts[role_id])
             role_step_counts[role_id] = (succ_count, attempt_count)
             role_step_rates[role_id] = 100.0 * succ_count / max(1, attempt_count)
+        succ_buf_total = sum(len(role_bundles[r]["succ_replay_buffer"]) for r in ROLE_IDS)
+        succ_buf_total_history.append(succ_buf_total)
+        if len(succ_buf_total_history) >= 2:
+            succ_buf_growth = succ_buf_total - succ_buf_total_history[0]
+        else:
+            succ_buf_growth = 0
 
-        if (not alpha_frozen) and (alpha_freeze_recent is not None):
-            succ_buf_total = sum(len(role_bundles[r]["succ_replay_buffer"]) for r in ROLE_IDS)
-            cond_recent = (len(recent_success) >= 50) and (recent_rate >= 100.0 * alpha_freeze_recent)
-            cond_succbuf = succ_buf_total >= alpha_freeze_succbuf
-            if cond_recent and cond_succbuf:
+        if not alpha_frozen:
+            if succ_buf_total >= alpha_freeze_succbuf:
                 for role_id in ROLE_IDS:
                     with torch.no_grad():
                         role_bundles[role_id]["log_alpha"].copy_(torch.tensor(math.log(alpha_fixed), device=role_bundles[role_id]["log_alpha"].device))
                         role_bundles[role_id]["alpha"] = alpha_fixed
                 alpha_frozen = True
-                print(f"[α-FROZEN] recent@{len(recent_success)}={recent_rate:.1f}% | succ_buf_total={succ_buf_total} | alpha_fixed={alpha_fixed:.3f}")
+                print(f"[α-FROZEN] succ_buf_total={succ_buf_total} | alpha_fixed={alpha_fixed:.3f}")
 
         if (ep + 1) % 10 == 0:
             alpha_summary = "/".join(f"{role_name(r)}:{role_bundles[r]['alpha']:.3f}" for r in ROLE_IDS)
             succ_summary = "/".join(f"{role_name(r)}:{len(role_bundles[r]['succ_replay_buffer'])}" for r in ROLE_IDS)
             role_step_summary = "/".join(f"{role_name(r)}:{role_step_rates[r]:4.1f}" for r in ROLE_IDS)
             role_step_count_summary = "/".join(f"{role_name(r)}:{role_step_counts[r][0]}/{role_step_counts[r][1]}" for r in ROLE_IDS)
-            print(f"[EP {ep+1:5d}] steps={ep_steps:3d}  R={ep_reward:8.2f}  succ={int(episode_success)}  "
-                  f"recent@{len(recent_success)}={recent_rate:5.1f}%  "
+            print(f"[EP {ep+1:5d}] steps={ep_steps:3d}  R={ep_reward:8.2f}  "
                   f"| role_step={role_step_summary} "
                   f"| role_step_n={role_step_count_summary} "
+                  f"| succ_buf_total={succ_buf_total} growth@{len(succ_buf_total_history)}={succ_buf_growth} "
                   f"| alpha={alpha_summary} | succ_buf={succ_summary}")
 
-        if save_best_online and len(recent_success) >= best_min_episodes:
-            recent_mean = sum(recent_success) / len(recent_success)
-            if recent_mean >= best_score + best_delta:
-                best_score = float(recent_mean)
-                actor_only = save_sac_checkpoint(best_ckpt_path, role_bundles, extra={"best_score": best_score, "episodes": ep + 1})
+        if save_best_online and len(succ_buf_total_history) >= max(2, int(best_min_episodes)):
+            min_growth_delta = max(1.0, float(best_delta))
+            if float(succ_buf_growth) >= best_score + min_growth_delta:
+                best_score = float(succ_buf_growth)
+                actor_only = save_sac_checkpoint(
+                    best_ckpt_path,
+                    role_bundles,
+                    extra={"best_succ_buf_growth": best_score, "succ_buf_total": succ_buf_total, "episodes": ep + 1},
+                )
                 torch.save({"format": "multi_role_actor", "actors": actor_only}, best_actor_path)
-                print(f"[BEST-online] ep={ep+1} mean={recent_mean:.3f} → saved {best_actor_path}")
+                print(f"[BEST-succbuf] ep={ep+1} growth={succ_buf_growth} total={succ_buf_total} → saved {best_actor_path}")
 
     torch.save({"format": "multi_role_actor", "actors": {role_name(role_id): role_bundles[role_id]["actor"].state_dict() for role_id in ROLE_IDS}}, "sac_actor_last.pth")
     return {"role_bundles": role_bundles}

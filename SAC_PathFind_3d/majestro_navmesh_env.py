@@ -1632,7 +1632,7 @@ class MajestroNavMeshEnv(gym.Env):
                 rewards[idx] += self._R_SUCCESS
                 terms_list[idx]["success"] = self._R_SUCCESS
 
-        terminated = bool(np.all(success_mask))
+        terminated = False
 
         self.agent_pos = self.agent_positions[0].copy()
         self.agent_height = float(self.agent_heights[0])
