@@ -124,9 +124,12 @@ ROLE_ID_TO_NAME = {
     6: "kiting",
 }
 ROLE_IDS = tuple(sorted(ROLE_ID_TO_NAME.keys()))
+ROLE_NONE = -1
 
 
 def role_name(role_id: int) -> str:
+    if int(role_id) == ROLE_NONE:
+        return "none"
     return ROLE_ID_TO_NAME.get(int(role_id), f"role_{int(role_id)}")
 
 
@@ -356,8 +359,10 @@ def init_role_bundle(obs_dim: int, act_dim: int, dev: torch.device, actor_lr: fl
 def role_policy_actions(role_bundles: Dict[int, Dict[str, Any]], obs_arr: np.ndarray, role_ids_arr: np.ndarray, deterministic: bool = True) -> np.ndarray:
     act_dim = next(iter(role_bundles.values()))["actor"].act_dim
     actions = np.zeros((obs_arr.shape[0], act_dim), dtype=np.float32)
+    obs_arr = np.asarray(obs_arr, dtype=np.float32)
+    sensor_ok = obs_arr[:, -1] <= 0.5 if obs_arr.ndim >= 2 and obs_arr.shape[-1] > 0 else np.ones((obs_arr.shape[0],), dtype=bool)
     for role_id in ROLE_IDS:
-        idxs = np.where(role_ids_arr == role_id)[0]
+        idxs = np.where((role_ids_arr == role_id) & sensor_ok)[0]
         if idxs.size == 0:
             continue
         actor = role_bundles[int(role_id)]["actor"]
@@ -541,9 +546,17 @@ def sac_train(env,
                     success_mask_arr = np.asarray(info["success_mask"], dtype=bool).reshape(-1)
                 except Exception:
                     success_mask_arr = None
+            info_role_ids_arr = role_ids_arr
+            if isinstance(info, dict) and ("role_ids" in info) and info["role_ids"] is not None:
+                try:
+                    info_role_ids_arr = np.asarray(info["role_ids"], dtype=np.int32).reshape(-1)
+                except Exception:
+                    info_role_ids_arr = role_ids_arr
 
             for agent_idx in range(obs_arr.shape[0]):
-                role_id = int(role_ids_arr[agent_idx]) if agent_idx < len(role_ids_arr) else 0
+                role_id = int(info_role_ids_arr[agent_idx]) if agent_idx < len(info_role_ids_arr) else ROLE_NONE
+                if role_id not in role_bundles:
+                    continue
                 dist = None if dist_values is None or agent_idx >= len(dist_values) else float(dist_values[agent_idx])
                 step_success = bool(success_mask_arr is not None and agent_idx < len(success_mask_arr) and success_mask_arr[agent_idx])
                 if role_id in ep_role_attempts:

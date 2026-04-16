@@ -15,6 +15,7 @@ import torch
 
 
 ROLE_NAMES = {
+    -1: "none",
     0: "front",
     1: "flank_l",
     2: "flank_r",
@@ -33,6 +34,7 @@ HEURISTIC_SHORT = {
 }
 
 ROLE_COLORS = {
+    -1: (120, 120, 120),
     0: (255, 110, 110),
     1: (110, 220, 255),
     2: (255, 210, 90),
@@ -97,7 +99,7 @@ except Exception:
     ROLE_IDS = (0, 1, 2, 3, 4, 5, 6)
 
     def role_name(role_id):
-        return {0: "front", 1: "flank_left", 2: "flank_right", 3: "cover", 4: "base_move", 5: "surround", 6: "kiting"}.get(int(role_id), f"role_{int(role_id)}")
+        return {-1: "none", 0: "front", 1: "flank_left", 2: "flank_right", 3: "cover", 4: "base_move", 5: "surround", 6: "kiting"}.get(int(role_id), f"role_{int(role_id)}")
 
     def get_env_role_ids(env, count):
         role_ids = getattr(env, "agent_role_ids", None)
@@ -108,8 +110,10 @@ except Exception:
     @torch.no_grad()
     def role_policy_actions(role_bundles, obs_arr, role_ids_arr, deterministic=True):
         actions = np.zeros((obs_arr.shape[0], 2), dtype=np.float32)
+        obs_arr = np.asarray(obs_arr, dtype=np.float32)
+        sensor_ok = obs_arr[:, -1] <= 0.5 if obs_arr.ndim >= 2 and obs_arr.shape[-1] > 0 else np.ones((obs_arr.shape[0],), dtype=bool)
         for role_id in ROLE_IDS:
-            idxs = np.where(role_ids_arr == role_id)[0]
+            idxs = np.where((role_ids_arr == role_id) & sensor_ok)[0]
             if idxs.size == 0:
                 continue
             actor = role_bundles[int(role_id)]["actor"]

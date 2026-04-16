@@ -172,14 +172,17 @@ desired_target = current_position + target_offset
 
 ## F=1 fallback
 
-현재는 `sensor_fail_code == 1.0`이면 단순 직선 추적이 아니라, geodesic map 기준 다음 waypoint를 따라갑니다.
+현재는 `sensor_fail_code == 1.0`이면 명시적인 `none` 상태로 처리합니다.
 
 즉:
 
-- 평소: 정책 action 기반 이동
-- `F=1`: goal 방향 직선 추적이 아니라, geodesic 하강 경로 기반 waypoint 이동
+- 평소: role actor의 정책 action 기반 이동
+- `F=1`: role actor를 선택하지 않고 action은 zero로 둠
+- 환경 이동은 goal 방향 Detour waypoint 또는 geodesic waypoint fallback을 사용
+- `info["role_ids"]`에는 해당 agent role이 `-1`, 즉 `none`으로 표시됨
+- 이 step은 role replay buffer와 success replay buffer에 저장되지 않음
 
-이 fallback은 정책이 주변 몹이 안 보이는 상황에서 장거리 추적을 직접 학습하지 않아도, 목표 쪽으로 우회 이동할 수 있게 하기 위한 장치입니다.
+이 fallback은 정책이 주변 몹이 안 보이는 상황에서 장거리 추적을 직접 학습하지 않아도 목표 쪽으로 우회 이동할 수 있게 하기 위한 장치이며, role 학습 샘플과는 분리됩니다.
 
 ## 보상 구조
 
@@ -367,7 +370,7 @@ obs, rewards, terminated, truncated, info
 - `agent_positions`
 - `tactical_target`
 - `role_targets`
-- `role_ids`
+- `role_ids`: `sensor_fail_code == 1.0`인 agent는 `-1`/`none`
 - `success_mask`
 - `sensor_fail_code`
 - `reward_terms`
@@ -388,6 +391,7 @@ role_step_n=front:0/0/flank_left:0/0/flank_right:0/0/cover:5/40/base_move:30/100
 - `role_step`: 해당 role로 움직인 step 중 `success_mask=True`가 된 비율
 - `role_step_n`: 해당 role의 `성공 step 수 / 시도 step 수`
 - 시도 step이 없는 role은 분모가 0으로 표시될 수 있음
+- `none` fallback step은 어떤 role에도 집계되지 않음
 
 best 저장은 최근 `best_min_episodes` 범위에서 `succ_replay_buffer` 총량이 얼마나 증가했는지를 기준으로 합니다.
 

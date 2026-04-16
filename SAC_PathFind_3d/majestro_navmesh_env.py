@@ -55,6 +55,7 @@ ROLE_BASE_MOVE = 4
 ROLE_SURROUND = 5
 ROLE_KITING = 6
 ROLE_COUNT = 7
+ROLE_NONE = -1
 HEURISTIC_NAME_TO_ID = {
     "fixed": 0,
     "melee_dps": 1,
@@ -1604,17 +1605,22 @@ class MajestroNavMeshEnv(gym.Env):
 
             self.agent_role_ids[idx] = step_role_ids[idx]
             self.role_targets[idx] = old_role_targets[idx]
-            role_bonus, role_terms, tactical_success = self._role_reward_bonus(
-                idx,
-                old_positions[idx],
-                self.agent_positions[idx],
-                bool(collisions[idx]),
-                bool(detour_used_codes[idx] > 0.5),
-            )
-            self.role_targets[idx] = self._role_target_for(idx)
-            rewards[idx] += role_bonus
-            terms_list[idx].update(role_terms)
-            success_mask[idx] = bool(tactical_success)
+            if sensor_fail_codes[idx] > 0.5:
+                terms_list[idx]["role_none"] = 1.0
+                terms_list[idx]["tactical_success"] = 0.0
+                success_mask[idx] = False
+            else:
+                role_bonus, role_terms, tactical_success = self._role_reward_bonus(
+                    idx,
+                    old_positions[idx],
+                    self.agent_positions[idx],
+                    bool(collisions[idx]),
+                    bool(detour_used_codes[idx] > 0.5),
+                )
+                self.role_targets[idx] = self._role_target_for(idx)
+                rewards[idx] += role_bonus
+                terms_list[idx].update(role_terms)
+                success_mask[idx] = bool(tactical_success)
 
             best = float(self._stall_best[idx])
             if np.isnan(best) or cur_metric < best - 1.0:
@@ -1637,6 +1643,9 @@ class MajestroNavMeshEnv(gym.Env):
         self.agent_pos = self.agent_positions[0].copy()
         self.agent_height = float(self.agent_heights[0])
 
+        info_role_ids = step_role_ids.copy()
+        info_role_ids[sensor_fail_codes > 0.5] = ROLE_NONE
+
         info = {
             "dist_to_goal": dists.copy(),
             "collided": collisions.copy(),
@@ -1648,7 +1657,7 @@ class MajestroNavMeshEnv(gym.Env):
             "requested_target": requested_targets.copy(),
             "agent_positions": self.agent_positions.copy(),
             "success_mask": success_mask.copy(),
-            "role_ids": step_role_ids.copy(),
+            "role_ids": info_role_ids.copy(),
             "agent_role_rules": list(self.agent_role_rules) if self.agent_role_rules is not None else [self.role_rule] * self.num_agents,
             "role_targets": self.role_targets.copy(),
             "sensor_fail_code": sensor_fail_codes.copy(),
