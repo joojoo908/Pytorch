@@ -193,3 +193,13 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 sac_checkpoint.pth
+performanceTest/BaseMovePerformanceTest/.vs/BaseMovePerformanceTest/v17/DocumentLayout.json
+performanceTest/BaseMovePerformanceTest/.vs/
+performanceTest/BaseMovePerformanceTest/BaseMovePerformanceTest/onnxruntime/
+performanceTest/onnxTest/onnxTest/onnxruntime/
+performanceTest/onnxTest/onnxTest/x64/
+performanceTest/BaseMovePerformanceTest/BaseMovePerformanceTest/native/
+performanceTest/BaseMovePerformanceTest/BaseMovePerformanceTest/x64/
+performanceTest/onnxTest/.vs/
+performanceTest/BaseMovePerformanceTest/x64/
+*.onnx
