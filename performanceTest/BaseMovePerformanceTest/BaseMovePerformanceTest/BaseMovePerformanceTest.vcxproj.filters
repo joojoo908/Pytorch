@@ -18,7 +18,28 @@
     <ClCompile Include="main.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
+    <ClCompile Include="DetourCrowdBenchmark.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
     <ClCompile Include="OnnxBenchmark.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="native\DetourCrowd.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="native\DetourLocalBoundary.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="native\DetourObstacleAvoidance.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="native\DetourPathCorridor.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="native\DetourPathQueue.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="native\DetourProximityGrid.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
     <ClCompile Include="native\detour_navmesh_wrapper.cpp">
@@ -29,7 +50,28 @@
     <ClInclude Include="BenchmarkTypes.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
+    <ClInclude Include="DetourCrowdBenchmark.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
     <ClInclude Include="OnnxBenchmark.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="native\DetourCrowd.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="native\DetourLocalBoundary.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="native\DetourObstacleAvoidance.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="native\DetourPathCorridor.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="native\DetourPathQueue.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="native\DetourProximityGrid.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
     <ClInclude Include="native\detour_navmesh_wrapper.h">

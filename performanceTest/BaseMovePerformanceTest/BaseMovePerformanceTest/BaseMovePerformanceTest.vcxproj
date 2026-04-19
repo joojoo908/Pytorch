@@ -79,6 +79,7 @@
     <OnnxRuntimeLibDir Condition="'$(OnnxRuntimeDir)'!=''">$(OnnxRuntimeDir)\lib;</OnnxRuntimeLibDir>
     <OnnxRuntimePreprocessor Condition="'$(OnnxRuntimeDir)'!=''">HAS_ONNXRUNTIME;</OnnxRuntimePreprocessor>
     <OnnxRuntimeDependency Condition="'$(OnnxRuntimeDir)'!=''">onnxruntime.lib;</OnnxRuntimeDependency>
+    <DetourCrowdPreprocessor Condition="Exists('$(ProjectDir)native\DetourCrowd.h') and Exists('$(ProjectDir)native\DetourCrowd.cpp')">HAS_DETOURCROWD;</DetourCrowdPreprocessor>
   </PropertyGroup>
   <PropertyGroup>
     <LocalDebuggerWorkingDirectory>$(ProjectDir)</LocalDebuggerWorkingDirectory>
@@ -90,7 +91,7 @@
       <SDLCheck>true</SDLCheck>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <AdditionalIncludeDirectories>$(OnnxRuntimeIncludeDir)$(ProjectDir)native;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;$(OnnxRuntimePreprocessor)%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;$(OnnxRuntimePreprocessor)$(DetourCrowdPreprocessor)%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
     </ClCompile>
     <Link>
@@ -111,7 +112,7 @@
       <SDLCheck>true</SDLCheck>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <AdditionalIncludeDirectories>$(OnnxRuntimeIncludeDir)$(ProjectDir)native;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;$(OnnxRuntimePreprocessor)%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;$(OnnxRuntimePreprocessor)$(DetourCrowdPreprocessor)%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
     </ClCompile>
     <Link>
@@ -132,7 +133,7 @@
       <SDLCheck>true</SDLCheck>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <AdditionalIncludeDirectories>$(OnnxRuntimeIncludeDir)$(ProjectDir)native;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;$(OnnxRuntimePreprocessor)%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;$(OnnxRuntimePreprocessor)$(DetourCrowdPreprocessor)%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
     </ClCompile>
     <Link>
@@ -153,7 +154,7 @@
       <SDLCheck>true</SDLCheck>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <AdditionalIncludeDirectories>$(OnnxRuntimeIncludeDir)$(ProjectDir)native;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;$(OnnxRuntimePreprocessor)%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;$(OnnxRuntimePreprocessor)$(DetourCrowdPreprocessor)%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
     </ClCompile>
     <Link>
@@ -171,12 +172,26 @@
 
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="DetourCrowdBenchmark.cpp" />
     <ClCompile Include="OnnxBenchmark.cpp" />
+    <ClCompile Include="native\DetourCrowd.cpp" />
+    <ClCompile Include="native\DetourLocalBoundary.cpp" />
+    <ClCompile Include="native\DetourObstacleAvoidance.cpp" />
+    <ClCompile Include="native\DetourPathCorridor.cpp" />
+    <ClCompile Include="native\DetourPathQueue.cpp" />
+    <ClCompile Include="native\DetourProximityGrid.cpp" />
     <ClCompile Include="native\detour_navmesh_wrapper.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="BenchmarkTypes.h" />
+    <ClInclude Include="DetourCrowdBenchmark.h" />
     <ClInclude Include="OnnxBenchmark.h" />
+    <ClInclude Include="native\DetourCrowd.h" />
+    <ClInclude Include="native\DetourLocalBoundary.h" />
+    <ClInclude Include="native\DetourObstacleAvoidance.h" />
+    <ClInclude Include="native\DetourPathCorridor.h" />
+    <ClInclude Include="native\DetourPathQueue.h" />
+    <ClInclude Include="native\DetourProximityGrid.h" />
     <ClInclude Include="native\detour_navmesh_wrapper.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
