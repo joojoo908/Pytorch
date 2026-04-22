@@ -17,12 +17,10 @@ import torch
 ROLE_NAMES = {
     -1: "none",
     0: "front",
-    1: "flank_l",
-    2: "flank_r",
-    3: "cover",
-    4: "base",
-    5: "surround",
-    6: "kiting",
+    1: "cover",
+    2: "base",
+    3: "surround",
+    4: "kiting",
 }
 
 HEURISTIC_SHORT = {
@@ -36,12 +34,10 @@ HEURISTIC_SHORT = {
 ROLE_COLORS = {
     -1: (120, 120, 120),
     0: (255, 110, 110),
-    1: (110, 220, 255),
-    2: (255, 210, 90),
-    3: (180, 140, 255),
-    4: (160, 255, 160),
-    5: (255, 140, 200),
-    6: (255, 170, 110),
+    1: (180, 140, 255),
+    2: (160, 255, 160),
+    3: (255, 140, 200),
+    4: (255, 170, 110),
 }
 
 DETOUR_PATH_COLOR = (80, 255, 220)
@@ -78,7 +74,6 @@ except Exception:
         role_ids = np.asarray(info.get("role_ids", []), dtype=np.int32).reshape(-1)
         success_mask = np.asarray(info.get("success_mask", []), dtype=bool).reshape(-1)
         front = False
-        flank = False
         cover = False
         surround = False
         for role_id, success in zip(role_ids, success_mask):
@@ -86,20 +81,16 @@ except Exception:
                 continue
             if int(role_id) == 0:
                 front = True
-            elif int(role_id) in (1, 2):
-                flank = True
-            elif int(role_id) == 3:
+            elif int(role_id) == 1:
                 cover = True
-            elif int(role_id) == 5:
+            elif int(role_id) == 3:
                 surround = True
-            elif int(role_id) == 6:
-                pass
-        return bool(front and flank and cover and surround)
+        return bool(front and cover and surround)
 
-    ROLE_IDS = (0, 1, 2, 3, 4, 5, 6)
+    ROLE_IDS = (0, 1, 2, 3, 4)
 
     def role_name(role_id):
-        return {-1: "none", 0: "front", 1: "flank_left", 2: "flank_right", 3: "cover", 4: "base_move", 5: "surround", 6: "kiting"}.get(int(role_id), f"role_{int(role_id)}")
+        return {-1: "none", 0: "front", 1: "cover", 2: "base_move", 3: "surround", 4: "kiting"}.get(int(role_id), f"role_{int(role_id)}")
 
     def get_env_role_ids(env, count):
         role_ids = getattr(env, "agent_role_ids", None)

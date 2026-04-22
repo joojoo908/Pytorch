@@ -48,13 +48,11 @@ except Exception:
 DT_POLYTYPE_GROUND = 0
 
 ROLE_FRONT = 0
-ROLE_FLANK_LEFT = 1
-ROLE_FLANK_RIGHT = 2
-ROLE_COVER = 3
-ROLE_BASE_MOVE = 4
-ROLE_SURROUND = 5
-ROLE_KITING = 6
-ROLE_COUNT = 7
+ROLE_COVER = 1
+ROLE_BASE_MOVE = 2
+ROLE_SURROUND = 3
+ROLE_KITING = 4
+ROLE_COUNT = 5
 ROLE_NONE = -1
 HEURISTIC_NAME_TO_ID = {
     "fixed": 0,
@@ -295,7 +293,6 @@ class MajestroNavMeshEnv(gym.Env):
         ray_count: int = 8,
         ray_length: float = 600.0,
         sense_radius: float | None = None,
-        progress_coef: float = 0.02,
         collision_penalty: float = 0.35,
         stall_penalty: float = 0.05,
         stall_patience: int = 20,
@@ -332,12 +329,14 @@ class MajestroNavMeshEnv(gym.Env):
         self.ray_count = int(ray_count)
         self.ray_length = float(ray_length)
         self.sense_radius = float(ray_length if sense_radius is None else sense_radius)
-        self.progress_coef = float(progress_coef)
         self.collision_penalty = float(collision_penalty)
         self.stall_penalty = float(stall_penalty)
         self.stall_patience = int(stall_patience)
         self.time_penalty = float(time_penalty)
         self._R_SUCCESS = float(success_reward)
+        self._R_SUCCESS_ENTRY = 20.0
+        self._R_SUCCESS_SUSTAIN = 2.0
+        self._R_SUCCESS_DROP = 3.0
         self.role_rule = str(role_rule).strip().lower()
         self.agent_role_rules = None if agent_role_rules is None else [str(x).strip().lower() for x in agent_role_rules]
         self.role_selector = role_selector
@@ -386,6 +385,7 @@ class MajestroNavMeshEnv(gym.Env):
         self._stall_best = None
         self._stall_wait = None
         self._prev_geo = None
+        self._prev_success_mask = np.zeros((self.num_agents,), dtype=bool)
         self.steps = 0
 
         self._build_raster_cache()
@@ -1071,10 +1071,6 @@ class MajestroNavMeshEnv(gym.Env):
 
         if role_id == ROLE_FRONT:
             target = self.goal_pos.copy()
-        elif role_id == ROLE_FLANK_LEFT:
-            target = self.goal_pos + side_dir * max(self.success_radius * 1.8, self.agent_radius * 3.0)
-        elif role_id == ROLE_FLANK_RIGHT:
-            target = self.goal_pos - side_dir * max(self.success_radius * 1.8, self.agent_radius * 3.0)
         elif role_id == ROLE_COVER:
             cover_anchor = self._closest_cover_anchor(agent_index)
             if cover_anchor is None:
@@ -1109,8 +1105,6 @@ class MajestroNavMeshEnv(gym.Env):
     def _fixed_role_for_agent(self, agent_index: int) -> int:
         base_roles = [
             ROLE_FRONT,
-            ROLE_FLANK_LEFT,
-            ROLE_FLANK_RIGHT,
             ROLE_COVER,
             ROLE_BASE_MOVE,
             ROLE_SURROUND,
@@ -1192,7 +1186,16 @@ class MajestroNavMeshEnv(gym.Env):
         new_d = float(np.linalg.norm(target_pos - new_pos))
         return old_d - new_d
 
-    def _role_reward_bonus(self, agent_index: int, old_pos: np.ndarray, new_pos: np.ndarray, collided: bool, detour_used: bool) -> Tuple[float, Dict[str, float], bool]:
+    def _role_reward_bonus(
+        self,
+        agent_index: int,
+        old_pos: np.ndarray,
+        new_pos: np.ndarray,
+        collided: bool,
+        detour_used: bool,
+        old_path_dist: Optional[float] = None,
+        new_path_dist: Optional[float] = None,
+    ) -> Tuple[float, Dict[str, float], bool]:
         role_id = int(self.agent_role_ids[agent_index])
         target = self.role_targets[agent_index]
         terms: Dict[str, float] = {}
@@ -1215,22 +1218,6 @@ class MajestroNavMeshEnv(gym.Env):
             bonus += direct_bonus
             terms["role_front"] = direct_bonus
             tactical_success = bool(goal_dist <= self.success_radius * 1.15 and directness >= 0.45)
-        elif role_id in (ROLE_FLANK_LEFT, ROLE_FLANK_RIGHT):
-            side_sign = 1.0 if role_id == ROLE_FLANK_LEFT else -1.0
-            side_offset = float(np.dot(new_pos - self.goal_pos, side_dir)) * side_sign
-            desired_band = max(self.success_radius * 0.8, self.agent_radius * 1.5)
-            flank_bonus = 0.0
-            if side_offset > 0.0:
-                flank_bonus += 0.08 * min(side_offset / max(desired_band, 1.0), 1.5)
-            front_gap = abs(float(np.dot(new_pos - self.goal_pos, goal_dir)))
-            flank_bonus -= 0.03 * min(front_gap / max(desired_band, 1.0), 1.0)
-            bonus += flank_bonus
-            terms["role_flank"] = flank_bonus
-            tactical_success = bool(
-                side_offset >= desired_band * 0.75
-                and front_gap <= desired_band * 1.1
-                and goal_dist <= self.success_radius * 2.5
-            )
         elif role_id == ROLE_COVER:
             anchor = self._closest_cover_anchor(agent_index)
             cover_bonus = 0.0
@@ -1256,14 +1243,25 @@ class MajestroNavMeshEnv(gym.Env):
             bonus += cover_bonus
             terms["role_cover"] = cover_bonus
         elif role_id == ROLE_BASE_MOVE:
-            base_bonus = 0.05 * min(max(role_progress, 0.0) / max(self.step_size, 1.0), 1.5)
+            old_path = old_path_dist if old_path_dist is not None else self._geo_distance_robust(old_pos, max_search=3)
+            new_path = new_path_dist if new_path_dist is not None else self._geo_distance_robust(new_pos, max_search=3)
+            if old_path is None:
+                old_path = float(np.linalg.norm(self.goal_pos - old_pos))
+            if new_path is None:
+                new_path = float(np.linalg.norm(self.goal_pos - new_pos))
+
+            path_progress = max(0.0, float(old_path) - float(new_path))
+            path_progress_bonus = 0.08 * min(path_progress / max(self.step_size, 1.0), 1.5)
+            base_bonus = path_progress_bonus
+            terms["role_base_path_progress"] = path_progress_bonus
             if detour_used:
-                base_bonus += 0.04
+                base_bonus += 0.02
             if collided:
-                base_bonus -= 0.10
+                base_bonus -= 0.03
             speed = float(np.linalg.norm(self.agent_velocities[agent_index]))
-            if speed >= self.step_size * 0.45:
-                base_bonus += 0.03
+            speed_bonus = 0.04 * min(speed / max(self.step_size, 1.0), 1.0)
+            base_bonus += speed_bonus
+            terms["role_base_speed"] = speed_bonus
             bonus += base_bonus
             terms["role_base_move"] = base_bonus
             tactical_success = bool((not collided) and speed >= self.step_size * 0.45 and goal_dist <= self.success_radius * 2.2)
@@ -1492,6 +1490,7 @@ class MajestroNavMeshEnv(gym.Env):
         self._prev_geo = np.full((self.num_agents,), np.nan, dtype=np.float32)
         self._stall_best = np.full((self.num_agents,), np.nan, dtype=np.float32)
         self._stall_wait = np.zeros((self.num_agents,), dtype=np.int32)
+        self._prev_success_mask = np.zeros((self.num_agents,), dtype=bool)
         for idx in range(self.num_agents):
             geo = self._geo_distance(self.agent_positions[idx])
             self._prev_geo[idx] = np.nan if geo is None else geo
@@ -1616,6 +1615,8 @@ class MajestroNavMeshEnv(gym.Env):
                     self.agent_positions[idx],
                     bool(collisions[idx]),
                     bool(detour_used_codes[idx] > 0.5),
+                    old_path_dist=(float(old_geo) if old_geo is not None else None),
+                    new_path_dist=(float(new_geo) if new_geo is not None else None),
                 )
                 self.role_targets[idx] = self._role_target_for(idx)
                 rewards[idx] += role_bonus
@@ -1634,9 +1635,17 @@ class MajestroNavMeshEnv(gym.Env):
 
             self._prev_geo[idx] = np.nan if new_geo is None else float(new_geo)
 
-            if success_mask[idx]:
-                rewards[idx] += self._R_SUCCESS
-                terms_list[idx]["success"] = self._R_SUCCESS
+            was_success = bool(self._prev_success_mask[idx])
+            is_success = bool(success_mask[idx])
+            if is_success and not was_success:
+                rewards[idx] += self._R_SUCCESS_ENTRY
+                terms_list[idx]["success_entry"] = self._R_SUCCESS_ENTRY
+            elif is_success:
+                rewards[idx] += self._R_SUCCESS_SUSTAIN
+                terms_list[idx]["success_sustain"] = self._R_SUCCESS_SUSTAIN
+            elif was_success:
+                rewards[idx] -= self._R_SUCCESS_DROP
+                terms_list[idx]["success_drop"] = -self._R_SUCCESS_DROP
 
         terminated = False
 
@@ -1668,6 +1677,7 @@ class MajestroNavMeshEnv(gym.Env):
             "detour_enabled": bool(self._detour_enabled),
             "detour_error": self._detour_last_error,
         }
+        self._prev_success_mask = success_mask.copy()
         self.agent_role_ids[:] = self._compute_assigned_roles()
         self._update_role_targets()
         return self._pack_observation(), rewards.astype(np.float32), terminated, truncated, info

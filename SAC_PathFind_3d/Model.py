@@ -70,8 +70,6 @@ def infer_single_agent_act_dim(env) -> int:
 def extract_role_success(info: Dict[str, Any]) -> Dict[str, bool]:
     result = {
         "front": False,
-        "flank_left": False,
-        "flank_right": False,
         "cover": False,
         "base_move": False,
         "surround": False,
@@ -94,34 +92,27 @@ def extract_role_success(info: Dict[str, Any]) -> Dict[str, bool]:
         if int(role_id) == 0:
             result["front"] = True
         elif int(role_id) == 1:
-            result["flank_left"] = True
-        elif int(role_id) == 2:
-            result["flank_right"] = True
-        elif int(role_id) == 3:
             result["cover"] = True
-        elif int(role_id) == 4:
+        elif int(role_id) == 2:
             result["base_move"] = True
-        elif int(role_id) == 5:
+        elif int(role_id) == 3:
             result["surround"] = True
-        elif int(role_id) == 6:
+        elif int(role_id) == 4:
             result["kiting"] = True
     return result
 
 
 def is_diverse_tactical_success(info: Dict[str, Any]) -> bool:
     role_success = extract_role_success(info)
-    flank_ok = role_success["flank_left"] or role_success["flank_right"]
-    return bool(role_success["front"] and flank_ok and role_success["cover"] and role_success["surround"])
+    return bool(role_success["front"] and role_success["cover"] and role_success["surround"])
 
 
 ROLE_ID_TO_NAME = {
     0: "front",
-    1: "flank_left",
-    2: "flank_right",
-    3: "cover",
-    4: "base_move",
-    5: "surround",
-    6: "kiting",
+    1: "cover",
+    2: "base_move",
+    3: "surround",
+    4: "kiting",
 }
 ROLE_IDS = tuple(sorted(ROLE_ID_TO_NAME.keys()))
 ROLE_NONE = -1

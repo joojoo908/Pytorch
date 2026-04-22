@@ -169,16 +169,18 @@ python ModelTest.py --no-visualize
 현재 역할 색상:
 
 - `front`: `(255, 110, 110)`
-- `flank_l`: `(110, 220, 255)`
-- `flank_r`: `(255, 210, 90)`
 - `cover`: `(180, 140, 255)`
+- `base`: `(160, 255, 160)`
+- `surround`: `(255, 140, 200)`
+- `kiting`: `(255, 170, 110)`
 
 화면상 의미:
 
 - `front`: 빨강
-- `flank_l`: 하늘색
-- `flank_r`: 노랑
 - `cover`: 보라
+- `base`: 연두
+- `surround`: 분홍
+- `kiting`: 주황
 
 이 색은 다음 요소들에 공통으로 사용됩니다.
 

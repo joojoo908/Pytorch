@@ -42,9 +42,10 @@
 각 에이전트는 아래 역할 중 하나를 가집니다.
 
 - `0`: `front`
-- `1`: `flank_left`
-- `2`: `flank_right`
-- `3`: `cover`
+- `1`: `cover`
+- `2`: `base_move`
+- `3`: `surround`
+- `4`: `kiting`
 
 역할은:
 
@@ -202,24 +203,7 @@ desired_target = current_position + target_offset
 
 - `0.01`
 
-### 2. 목표 접근 보상
-
-가능하면 geodesic 거리 감소량, 아니면 유클리드 거리 감소량을 씁니다.
-
-```python
-progress_coef * (old_dist - new_dist)
-```
-
-기본값:
-
-- `progress_coef = 0.02`
-
-주의:
-
-- 이 값은 여전히 `goal_pos` 기준 거리 감소량입니다
-- 하지만 이것만으로 성공은 아닙니다
-
-### 3. 충돌 패널티
+### 2. 충돌 패널티
 
 ```python
 -collision_penalty
@@ -229,11 +213,7 @@ progress_coef * (old_dist - new_dist)
 
 - `0.35`
 
-### 4. Separation 패널티
-
-다른 에이전트와 너무 가까우면 감점합니다.
-
-### 5. Stall 패널티
+### 3. Stall 패널티
 
 진전이 없으면 감점합니다.
 
@@ -242,19 +222,17 @@ progress_coef * (old_dist - new_dist)
 - `stall_penalty = 0.05`
 - `stall_patience = 20`
 
-### 6. 역할 보상
+### 4. 역할 보상
 
 역할별 shaping reward를 추가합니다.
 
 - `front`: 정면 압박
-- `flank_left`: 왼쪽 측면 점유
-- `flank_right`: 오른쪽 측면 점유
 - `cover`: 다른 액터 뒤 엄폐, 단 goal이 `sense_radius` 밖이면 감점 및 성공 실패
 - `base_move`: 빠르게 접근
 - `surround`: 포위 반경과 각도 분산
 - `kiting`: goal과 `sense_radius - 100`에서 `sense_radius` 사이 거리를 유지하며 이탈 방향 움직임
 
-### 7. 성공 보상
+### 5. 성공 보상
 
 큰 성공 보상은 goal 도달이 아니라 역할별 전술 위치 형성 시 지급됩니다.
 
@@ -276,9 +254,9 @@ if success_mask[idx]:
 대략:
 
 - `front`: goal 근처에서 정면 압박 형성
-- `flank_left`: 왼쪽 측면 밴드 형성
-- `flank_right`: 오른쪽 측면 밴드 형성
 - `cover`: goal이 `sense_radius` 안에 있는 상태에서 다른 몹 뒤 엄폐 위치 형성
+- `base_move`: 충돌 없이 빠르게 접근하고 goal 근처까지 진입
+- `surround`: goal 주위 반경과 각도 분산 형성
 - `kiting`: goal과 `sense_radius - 100`에서 `sense_radius` 사이 거리 유지
 
 ## 종료 조건
@@ -341,8 +319,7 @@ steps >= max_steps
 ### 8. 기본 보상 계산
 
 - 시간 패널티
-- 목표 접근 보상
-- 충돌/분리/stall 패널티
+- 충돌/stall 패널티
 
 ### 9. 역할 보상 및 역할 성공 판정
 
@@ -382,8 +359,8 @@ obs, rewards, terminated, truncated, info
 예:
 
 ```text
-role_step=front:0.0/flank_left:0.0/flank_right:0.0/cover:12.5/base_move:30.0/surround:8.0/kiting:20.0
-role_step_n=front:0/0/flank_left:0/0/flank_right:0/0/cover:5/40/base_move:30/100/surround:4/50/kiting:10/50
+role_step=front:0.0/cover:12.5/base_move:30.0/surround:8.0/kiting:20.0
+role_step_n=front:0/0/cover:5/40/base_move:30/100/surround:4/50/kiting:10/50
 ```
 
 의미:
