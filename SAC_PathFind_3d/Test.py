@@ -3,6 +3,18 @@ import argparse
 import numpy as np
 import torch
 
+
+ROLE_RULE_ALIASES = {
+    "mdps": "melee_dps",
+    "melee_dps": "melee_dps",
+    "meleedps": "melee_dps",
+    "rdps": "ranged_dps",
+    "ranged_dps": "ranged_dps",
+    "rangeddps": "ranged_dps",
+    "fix": "fixed",
+    "fixed": "fixed",
+}
+
 # ---- Build env from user's ENV module if present ----
 def build_env(**env_kwargs):
     try:
@@ -28,6 +40,40 @@ def set_global_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def _normalize_rule_name(name: str) -> str:
+    key = str(name).strip().lower()
+    if not key:
+        raise ValueError("Empty role rule is not allowed.")
+    return ROLE_RULE_ALIASES.get(key, key)
+
+
+def parse_agent_role_rules(text: str | None, num_agents: int):
+    if not text:
+        return None
+    parts = [_normalize_rule_name(part) for part in str(text).split(",") if part.strip()]
+    if not parts:
+        return None
+    if len(parts) > num_agents:
+        raise ValueError(f"agent_role_rules length must be <= num_agents ({num_agents}), got {len(parts)}")
+    if len(parts) < num_agents:
+        parts.extend([parts[-1]] * (num_agents - len(parts)))
+    return parts
+
+
+def parse_agent_role_rule_pool(text: str | None, num_agents: int):
+    if not text:
+        return None
+    pool = []
+    for chunk in str(text).split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        rules = [_normalize_rule_name(part) for part in chunk.split(",") if part.strip()]
+        if rules:
+            pool.append(rules)
+    return pool or None
 
 def main():
     ap = argparse.ArgumentParser(description="PyCharm-friendly training runner (no CMD args needed).")
@@ -86,12 +132,22 @@ def main():
     ap.add_argument("--role-rule", type=str, default="fixed", choices=["fixed", "melee_dps", "ranged_dps"])
     ap.add_argument("--agent-role-rules", type=str, default="melee_dps,melee_dps,melee_dps,ranged_dps,ranged_dps",
                     help="Comma-separated per-agent heuristic list. Length must be 1 or num_agents. Example: fixed,melee_dps,ranged_dps")
+    ap.add_argument(
+        "--agent-role-rule-pool",
+        type=str,
+        default="melee_dps,melee_dps,melee_dps,ranged_dps,ranged_dps;"
+                "rdps,rdps,rdps;"
+                "mdps,mdps,mdps,mdps;"
+                "mdps;"
+                "rdps,rdps,mdps,mdps,mdps",
+        help="Semicolon-separated pool of per-episode heuristic sets. Each set is comma-separated. Shorter sets are expanded by repeating the last rule.",
+    )
 
     args = ap.parse_args()
 
-    agent_role_rules = None
-    if args.agent_role_rules:
-        agent_role_rules = [part.strip() for part in args.agent_role_rules.split(",") if part.strip()]
+    num_agents = 1 + int(args.num_other_agents)
+    agent_role_rules = parse_agent_role_rules(args.agent_role_rules, num_agents)
+    agent_role_rule_pool = parse_agent_role_rule_pool(args.agent_role_rule_pool, num_agents)
 
     # Set seeds
     set_global_seed(args.seed)
@@ -114,6 +170,8 @@ def main():
         role_rule=args.role_rule,
         agent_role_rules=agent_role_rules,
     )
+    if agent_role_rule_pool is not None:
+        env.agent_role_rule_pool = [list(rules) for rules in agent_role_rule_pool]
     # Apply dynamic horizon params if supported
     if hasattr(env, "dynamic_horizon"):
         env.dynamic_horizon = bool(args.dyn_horizon)
@@ -154,6 +212,9 @@ def main():
     auto = " (auto)" if auto_resume else ""
     print(f"[MODE] {mode}{auto} | episodes={args.episodes} | batch={args.batch_size} | max_steps={args.max_steps} | dyn_horizon={getattr(env, 'dynamic_horizon', 'N/A')}")
     print(f"[ENV] agents={getattr(env, 'num_agents', 'N/A')} move_step={args.move_step_size} target_radius={args.tactical_target_radius} observed_others={args.observed_other_agents}")
+    if agent_role_rule_pool is not None:
+        pool_summary = " ; ".join(",".join(rules) for rules in agent_role_rule_pool)
+        print(f"[ROLE-POOL] {len(agent_role_rule_pool)} sets | {pool_summary}")
     print(f"[CKPT] in/out: {args.ckpt} | best_ckpt={args.best_ckpt_path} | best_actor={args.best_actor_path}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

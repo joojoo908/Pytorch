@@ -433,6 +433,40 @@ def save_sac_checkpoint(path: str, role_bundles: Dict[int, Dict[str, Any]], extr
     return actor_only
 
 
+def _snapshot_role_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "actor": bundle["actor"].state_dict(),
+        "critic_1": bundle["critic_1"].state_dict(),
+        "critic_2": bundle["critic_2"].state_dict(),
+        "target_critic_1": bundle["target_critic_1"].state_dict(),
+        "target_critic_2": bundle["target_critic_2"].state_dict(),
+        "actor_opt": bundle["actor_opt"].state_dict(),
+        "critic_1_opt": bundle["critic_1_opt"].state_dict(),
+        "critic_2_opt": bundle["critic_2_opt"].state_dict(),
+        "replay": _save_replay(bundle["replay_buffer"]),
+        "succ_replay": _save_succ_replay(bundle["succ_replay_buffer"]),
+        "alpha": float(bundle["alpha"]),
+        "target_entropy": float(bundle["target_entropy"]),
+    }
+
+
+def _save_best_role_snapshots(
+    ckpt_path: str,
+    actor_path: str,
+    best_role_snapshots: Dict[int, Dict[str, Any]],
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    roles_obj: Dict[str, Any] = {}
+    actor_only: Dict[str, Any] = {}
+    for role_id in ROLE_IDS:
+        key = role_name(role_id)
+        snap = best_role_snapshots[role_id]
+        roles_obj[key] = snap
+        actor_only[key] = snap["actor"]
+    torch.save({"format": "multi_role_sac", "roles": roles_obj, "extra": (extra or {})}, ckpt_path)
+    torch.save({"format": "multi_role_actor", "actors": actor_only}, actor_path)
+
+
 def load_sac_checkpoint(path: str, obs_dim: int, act_dim: int, device: Optional[torch.device] = None):
     dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(path, map_location=dev, weights_only=False)
@@ -504,8 +538,11 @@ def sac_train(env,
         role_bundles = {role_id: init_role_bundle(obs_dim, act_dim, device, actor_lr, critic_lr, succ_buffer_capacity) for role_id in ROLE_IDS}
 
     recent_role_step_counts = {role_id: deque(maxlen=100) for role_id in ROLE_IDS}
+    recent_role_succbuf_totals = {role_id: deque(maxlen=max(2, int(best_min_episodes))) for role_id in ROLE_IDS}
     succ_buf_total_history: deque[int] = deque(maxlen=max(2, int(best_min_episodes)))
     best_score = -1.0
+    best_role_scores = {role_id: -1.0 for role_id in ROLE_IDS}
+    best_role_snapshots = {role_id: _snapshot_role_bundle(role_bundles[role_id]) for role_id in ROLE_IDS}
     alpha_frozen = False
 
     for ep in range(episodes):
@@ -678,6 +715,17 @@ def sac_train(env,
             role_step_rates[role_id] = 100.0 * succ_count / max(1, attempt_count)
         succ_buf_total = sum(len(role_bundles[r]["succ_replay_buffer"]) for r in ROLE_IDS)
         succ_buf_total_history.append(succ_buf_total)
+        role_succ_buf_totals = {}
+        role_succ_buf_growths = {}
+        for role_id in ROLE_IDS:
+            role_total = len(role_bundles[role_id]["succ_replay_buffer"])
+            role_succ_buf_totals[role_id] = role_total
+            recent_role_succbuf_totals[role_id].append(role_total)
+            role_succ_buf_growths[role_id] = (
+                role_total - recent_role_succbuf_totals[role_id][0]
+                if len(recent_role_succbuf_totals[role_id]) >= 2
+                else 0
+            )
         if len(succ_buf_total_history) >= 2:
             succ_buf_growth = succ_buf_total - succ_buf_total_history[0]
         else:
@@ -695,6 +743,7 @@ def sac_train(env,
         if (ep + 1) % 10 == 0:
             alpha_summary = "/".join(f"{role_name(r)}:{role_bundles[r]['alpha']:.3f}" for r in ROLE_IDS)
             succ_summary = "/".join(f"{role_name(r)}:{len(role_bundles[r]['succ_replay_buffer'])}" for r in ROLE_IDS)
+            succ_growth_summary = "/".join(f"{role_name(r)}:{role_succ_buf_growths[r]}" for r in ROLE_IDS)
             role_step_summary = "/".join(f"{role_name(r)}:{role_step_rates[r]:4.1f}" for r in ROLE_IDS)
             role_step_count_summary = "/".join(f"{role_name(r)}:{role_step_counts[r][0]}/{role_step_counts[r][1]}" for r in ROLE_IDS)
             rule_summary = ""
@@ -704,19 +753,33 @@ def sac_train(env,
                   f"| role_step={role_step_summary} "
                   f"| role_step_n={role_step_count_summary} "
                   f"| succ_buf_total={succ_buf_total} growth@{len(succ_buf_total_history)}={succ_buf_growth} "
+                  f"| succ_growth={succ_growth_summary} "
                   f"| alpha={alpha_summary} | succ_buf={succ_summary}{rule_summary}")
 
         if save_best_online and len(succ_buf_total_history) >= max(2, int(best_min_episodes)):
             min_growth_delta = max(1.0, float(best_delta))
             if float(succ_buf_growth) >= best_score + min_growth_delta:
                 best_score = float(succ_buf_growth)
-                actor_only = save_sac_checkpoint(
+            improved_roles = []
+            for role_id in ROLE_IDS:
+                role_growth = float(role_succ_buf_growths[role_id])
+                if role_growth >= best_role_scores[role_id] + min_growth_delta:
+                    best_role_scores[role_id] = role_growth
+                    best_role_snapshots[role_id] = _snapshot_role_bundle(role_bundles[role_id])
+                    improved_roles.append(f"{role_name(role_id)}:{int(role_growth)}")
+            if improved_roles:
+                _save_best_role_snapshots(
                     best_ckpt_path,
-                    role_bundles,
-                    extra={"best_succ_buf_growth": best_score, "succ_buf_total": succ_buf_total, "episodes": ep + 1},
+                    best_actor_path,
+                    best_role_snapshots,
+                    extra={
+                        "best_succ_buf_growth_total": float(best_score),
+                        "best_role_succ_buf_growth": {role_name(r): float(best_role_scores[r]) for r in ROLE_IDS},
+                        "succ_buf_total": succ_buf_total,
+                        "episodes": ep + 1,
+                    },
                 )
-                torch.save({"format": "multi_role_actor", "actors": actor_only}, best_actor_path)
-                print(f"[BEST-succbuf] ep={ep+1} growth={succ_buf_growth} total={succ_buf_total} → saved {best_actor_path}")
+                print(f"[BEST-role] ep={ep+1} updated={','.join(improved_roles)} → saved {best_actor_path}")
 
     torch.save({"format": "multi_role_actor", "actors": {role_name(role_id): role_bundles[role_id]["actor"].state_dict() for role_id in ROLE_IDS}}, "sac_actor_last.pth")
     return {"role_bundles": role_bundles}

@@ -2,101 +2,99 @@
 
 ## 요약
 
-현재 환경은 navmesh 위에서 동작하는 shared-policy 멀티에이전트 환경입니다.
+현재 환경은 navmesh 위에서 동작하는 멀티에이전트 전술 이동 환경입니다.
 
-- 환경 파일: `majestro_navmesh_env.py`
-- 학습 파일: `Model.py`
-- 학습 실행 파일: `Test.py`
-- 평가 실행 파일: `ModelTest.py`
-
-현재 기준:
-
-- 에이전트 1명 기준 관측 크기: `24`
-- 에이전트 1명 기준 행동 크기: `2`
-- 전체 관측 shape: `(num_agents, 24)`
-- 전체 행동 shape: `(num_agents, 2)`
+- 환경: `majestro_navmesh_env.py`
+- 학습: `Model.py`
+- 학습 실행: `Test.py`
+- 평가 실행: `ModelTest.py`
 
 기본값 기준:
 
-- `num_other_agents = 4`
-- `num_agents = 5`
+- 기본 에이전트 수: `5`
+- 단일 에이전트 관측 크기: `24`
+- 단일 에이전트 행동 크기: `2`
+- 관측 shape: `(num_agents, 24)`
+- 행동 shape: `(num_agents, 2)`
 
-## 기본 구조
+주의:
 
-이 환경은 이동을 수평 평면 기준으로 처리합니다.
+- 학습과 평가는 episode마다 선택된 heuristic 조합 길이에 따라 실제 `num_agents`가 달라질 수 있습니다.
+- `agent_role_rule_pool`을 쓰면 `1`, `3`, `4`, `5`명처럼 가변 agent 수로 episode가 돌아갈 수 있습니다.
+
+## 좌표와 상태
+
+이 환경은 수평 평면 `(x, z)` 기준으로 이동을 처리합니다.
 
 - 실제 이동 위치: `(x, z)`
 - 높이 정보: `y`
 
-내부 상태:
+주요 내부 상태:
 
 - `agent_positions`: `(num_agents, 2)`
 - `agent_heights`: `(num_agents,)`
+- `agent_velocities`: `(num_agents, 2)`
 - `goal_pos`: `(2,)`
 - `goal_height`: 스칼라
 
-즉 모델은 수평 이동만 제어하고, 높이는 navmesh에서 정해집니다.
+## 역할과 heuristic
 
-## 역할 시스템
-
-각 에이전트는 아래 역할 중 하나를 가집니다.
+현재 역할 ID는 다음과 같습니다.
 
 - `0`: `front`
 - `1`: `cover`
 - `2`: `base_move`
 - `3`: `surround`
 - `4`: `kiting`
+- `-1`: `none` (`sensor_fail_code == 1.0`인 fallback step)
 
-역할은:
-
-- 관측에 `role_id`로 들어가고
-- 역할별 보상에 사용되고
-- 역할별 성공 판정에도 사용됩니다
-
-휴리스틱 규칙도 에이전트별로 따로 가질 수 있습니다.
-
-- 공통 규칙: `role_rule`
-- 개별 규칙: `agent_role_rules`
-
-현재 지원 규칙:
+현재 heuristic 규칙은 다음 세 가지입니다.
 
 - `fixed`
 - `melee_dps`
 - `ranged_dps`
 
-## 로컬 탐지
+역할은 heuristic과 현재 배치에 따라 정해집니다.
 
-현재 로컬 탐지는 `sense_radius` 안의 주변 몹만 봅니다.
+### `fixed`
 
-- `sense_radius` 안의 다른 에이전트만 관측에 포함
-- 반경 안에 주변 몹이 하나도 없으면 탐지 실패
+에이전트 순서대로 아래 역할을 반복합니다.
 
-기본값:
+- `front`
+- `cover`
+- `base_move`
+- `surround`
+- `kiting`
 
-- `sense_radius = 600.0`
+### `melee_dps`
 
-실행 시 조절:
+- goal이 `sense_radius` 밖이면 `base_move`
+- goal이 `sense_radius` 안이고 주변에 다른 `melee_dps` actor가 있으면 `surround`
+- 아니면 `front`
 
-```bash
-python Test.py --sense-radius 500
-python ModelTest.py --sense-radius 500
-```
+### `ranged_dps`
 
-## 입력 24개
+- goal이 `sense_radius` 밖이면 `base_move`
+- goal이 `sense_radius` 안이고 주변에 `melee_dps` actor가 있으면 `cover`
+- 아니면 `kiting`
 
-### 0-2: 현재 위치
+## 관측 구조
+
+단일 에이전트 관측은 총 `24`개입니다.
+
+### 0-2: 내 위치
 
 - `agent_norm_x`
 - `agent_norm_y`
 - `agent_norm_z`
 
-### 3-5: 목표 위치
+### 3-5: goal 위치
 
 - `goal_norm_x`
 - `goal_norm_y`
 - `goal_norm_z`
 
-### 6-8: 목표까지 상대 벡터
+### 6-8: goal까지 상대 벡터
 
 - `delta_norm_x`
 - `delta_norm_y`
@@ -107,83 +105,48 @@ python ModelTest.py --sense-radius 500
 - `velocity_x`
 - `velocity_z`
 
-### 11-22: 주변 몹 정보 + 휴리스틱
+### 11-22: 주변 에이전트 정보
 
-- `other_0_rel_x`
-- `other_0_rel_z`
-- `other_0_dist`
-- `other_0_heuristic`
-- `other_1_rel_x`
-- `other_1_rel_z`
-- `other_1_dist`
-- `other_1_heuristic`
-- `other_2_rel_x`
-- `other_2_rel_z`
-- `other_2_dist`
-- `other_2_heuristic`
+최대 `observed_other_agents`명, 기본 `3`명까지 들어갑니다.
 
-의미:
+각 슬롯은:
 
-- `sense_radius` 안의 다른 에이전트 중 가장 가까운 최대 3명의 상대 위치/거리/휴리스틱
-- 부족한 슬롯은 `0`으로 채워짐
+- `rel_x`
+- `rel_z`
+- `dist`
+- `heuristic_id`
+
+형태입니다.
 
 ### 23: 센서 실패 코드
 
-- `sensor_fail_code`
-- `0.0`: 반경 안에 주변 몹 있음
-- `1.0`: 반경 안에 주변 몹 없음
+- `0.0`: 반경 안에 다른 에이전트가 있음
+- `1.0`: 반경 안에 다른 에이전트가 없음
 
-현재는 자기 자신의 휴리스틱을 따로 넣지 않고, 관측한 다른 에이전트 슬롯에 그 에이전트의 휴리스틱을 함께 넣습니다.
+## 행동 구조
 
-휴리스틱 정규화 규칙:
-
-- `fixed -> 0.00`
-- `melee_dps -> 0.50`
-- `ranged_dps -> 1.00`
-
-즉 정책은 "내가 무슨 heuristic인가"보다 "내 주변에 보이는 다른 에이전트들이 어떤 heuristic인가"를 입력으로 받습니다.
-
-`melee_dps`의 역할 선택 규칙은 현재 다음과 같습니다.
-
-- goal이 sense radius 밖이면 `base_move`
-- goal이 sense radius 안이고 주변에 다른 `melee_dps` actor가 있으면 `surround`
-- goal이 sense radius 안이고 주변에 다른 `melee_dps` actor가 없으면 `front`
-
-`ranged_dps`의 역할 선택 규칙은 현재 다음과 같습니다.
-
-- goal이 sense radius 밖이면 `base_move`
-- goal이 sense radius 안이고 주변에 `melee_dps` actor가 있으면 `cover`
-- goal이 sense radius 안이고 주변에 `melee_dps` actor가 없으면 `kiting`
-
-## 출력 2개
-
-- `action[0]`: `dx`
-- `action[1]`: `dz`
-
-의미:
-
-- navmesh 평면에서의 로컬 이동 오프셋
-
-기본 해석:
+행동은 `(dx, dz)` 두 값입니다.
 
 ```python
 target_offset = clip(action, -1, 1) * tactical_target_radius
 desired_target = current_position + target_offset
 ```
 
-## F=1 fallback
+즉 행동은 즉시 이동량이 아니라 로컬 tactical target offset입니다.
 
-현재는 `sensor_fail_code == 1.0`이면 명시적인 `none` 상태로 처리합니다.
+## 센서 실패와 fallback
 
-즉:
+`sensor_fail_code == 1.0`이면 해당 step은 역할 actor를 직접 쓰지 않고 fallback 이동으로 처리됩니다.
 
-- 평소: role actor의 정책 action 기반 이동
-- `F=1`: role actor를 선택하지 않고 action은 zero로 둠
-- 환경 이동은 goal 방향 Detour waypoint 또는 geodesic waypoint fallback을 사용
-- `info["role_ids"]`에는 해당 agent role이 `-1`, 즉 `none`으로 표시됨
-- 이 step은 role replay buffer와 success replay buffer에 저장되지 않음
+동작:
 
-이 fallback은 정책이 주변 몹이 안 보이는 상황에서 장거리 추적을 직접 학습하지 않아도 목표 쪽으로 우회 이동할 수 있게 하기 위한 장치이며, role 학습 샘플과는 분리됩니다.
+- `desired_target`은 `goal_pos`
+- Detour가 켜져 있으면 Detour waypoint 사용
+- 아니면 geodesic waypoint fallback 사용
+- `info["role_ids"]`에는 `-1` (`none`)으로 들어감
+- 이 step은 role success 집계에서 빠짐
+
+`ModelTest.py`에서는 이런 step에 대해 fallback 경로를 화면에 따로 그립니다.
 
 ## 보상 구조
 
@@ -191,9 +154,11 @@ desired_target = current_position + target_offset
 
 - `rewards.shape == (num_agents,)`
 
-구성:
+각 step 보상은 대략 다음 항목들의 합입니다.
 
 ### 1. 시간 패널티
+
+모든 에이전트에 기본 적용:
 
 ```python
 -time_penalty
@@ -201,9 +166,11 @@ desired_target = current_position + target_offset
 
 기본값:
 
-- `0.01`
+- `time_penalty = 0.01`
 
 ### 2. 충돌 패널티
+
+충돌 시:
 
 ```python
 -collision_penalty
@@ -211,178 +178,205 @@ desired_target = current_position + target_offset
 
 기본값:
 
-- `0.35`
+- `collision_penalty = 0.35`
 
 ### 3. Stall 패널티
 
-진전이 없으면 감점합니다.
+geodesic 거리 기준 진전이 충분히 없으면:
+
+```python
+-stall_penalty
+```
 
 기본값:
 
 - `stall_penalty = 0.05`
 - `stall_patience = 20`
 
-### 4. 역할 보상
+### 4. 공통 role progress 보상
 
-역할별 shaping reward를 추가합니다.
-
-- `front`: 정면 압박
-- `cover`: 다른 액터 뒤 엄폐, 단 goal이 `sense_radius` 밖이면 감점 및 성공 실패
-- `base_move`: 빠르게 접근
-- `surround`: 포위 반경과 각도 분산
-- `kiting`: goal과 `sense_radius - 100`에서 `sense_radius` 사이 거리를 유지하며 이탈 방향 움직임
-
-### 5. 성공 보상
-
-큰 성공 보상은 goal 도달이 아니라 역할별 전술 위치 형성 시 지급됩니다.
+모든 역할 공통으로 현재 role target에 가까워지면 보상을 받습니다.
 
 ```python
-if success_mask[idx]:
-    rewards[idx] += self._R_SUCCESS
+role_progress_reward = 0.03 * (old_dist_to_role_target - new_dist_to_role_target)
 ```
 
-기본값:
+### 5. 역할별 shaping
 
-- `success_reward = 50.0`
+#### `front`
 
-## 성공 기준
+- goal 방향 직접 압박
+- `directness`가 좋을수록 가산
 
-현재 성공은 goal 반경 도달 기준이 아닙니다.
+#### `cover`
 
-`success_mask[idx]`는 “그 에이전트가 자기 역할 전술을 만족했는가”를 뜻합니다.
+- 다른 actor 뒤쪽 엄폐 형성
+- goal이 `sense_radius` 밖이면 불리
 
-대략:
+#### `base_move`
 
-- `front`: goal 근처에서 정면 압박 형성
-- `cover`: goal이 `sense_radius` 안에 있는 상태에서 다른 몹 뒤 엄폐 위치 형성
-- `base_move`: 충돌 없이 빠르게 접근하고 goal 근처까지 진입
-- `surround`: goal 주위 반경과 각도 분산 형성
-- `kiting`: goal과 `sense_radius - 100`에서 `sense_radius` 사이 거리 유지
+- goal 직선 거리가 아니라 `경로 잔여 길이` 감소를 기준으로 보상
+- geodesic 경로 길이 감소량을 `role_base_path_progress`로 반영
+- 실제 이동 속도도 `role_base_speed`로 보상
+- 충돌은 전역 패널티 외에 role 내부에서도 약하게 감점
 
-## 종료 조건
+#### `surround`
 
-현재 환경은 역할 성공으로 조기 종료하지 않습니다.
+- goal 주위 적정 반경 형성
+- ally와의 각도 분산 확보
+
+#### `kiting`
+
+- `sense_radius - 100`부터 `sense_radius` 사이 거리 band 유지
+- goal 반대 방향 이동 성분 보상
+
+## 성공 보상 구조
+
+현재 성공 보상은 한 값 반복 지급이 아니라 `entry / sustain / drop` 구조입니다.
+
+### 1. 성공 첫 진입
 
 ```python
-terminated = False
+success_entry = +20
+```
+
+### 2. 성공 유지
+
+```python
+success_sustain = +2
+```
+
+### 3. 성공 상태 이탈
+
+```python
+success_drop = -3
 ```
 
 즉:
 
-- 각 에이전트는 개별 전술 성공 상태를 가짐
-- 성공한 에이전트는 `success_reward`를 받지만 episode는 계속 진행
-- episode는 시간 제한에 걸릴 때 종료
+- 처음 전술 성공 상태에 들어가면 크게 보상
+- 유지 중에는 작은 보상
+- 성공 상태였다가 이탈하면 작은 패널티
 
-시간 초과는:
+예전의 `step마다 +50 반복 지급` 구조는 제거되었습니다.
 
-```python
-steps >= max_steps
-```
+## 역할별 성공 기준
 
-## 한 턴 처리 순서
+현재 성공은 goal 반경 도달이 아니라 역할 전술 성공입니다.
 
-### 1. 행동 입력 받기
+대략:
 
-- shape: `(num_agents, 2)`
-- 1차원 입력이면 전원에 복제
+- `front`: goal 근처에서 정면 압박 + 이동 방향성 확보
+- `cover`: anchor 뒤 엄폐 위치 형성
+- `base_move`: 충돌 없이 빠르게 이동하면서 goal 근처 진입
+- `surround`: 반경/각도 분산 만족
+- `kiting`: 거리 band 유지 + 후퇴 방향성 확보
 
-### 2. 이전 상태 저장
+## 종료 조건
 
-- 이전 위치
-- 이전 geodesic 거리
-- 이전 역할 목표점
-
-### 3. 주변 몹 탐지
-
-- `sense_radius` 안의 주변 몹 최대 3개 수집
-- 하나도 없으면 `sensor_fail_code = 1.0`
-
-### 4. 목표점 결정
-
-- 기본: `old_pos + action offset`
-- `F=1`: geodesic map 기준 다음 waypoint
-
-### 5. Navmesh 유효 위치로 스냅
-
-- invalid target이면 유효한 근처 점으로 보정
-
-### 6. 한 step 이동량 제한
-
-- 모든 에이전트는 같은 `move_step_size` 사용
-
-### 7. 실제 이동
-
-- navmesh 유효성 검사
-- 높이 샘플링
-- 에이전트 간 충돌 회피
-
-### 8. 기본 보상 계산
-
-- 시간 패널티
-- 충돌/stall 패널티
-
-### 9. 역할 보상 및 역할 성공 판정
-
-- 역할별 전술 평가
-- 역할 shaping reward 추가
-- `success_mask[idx]` 결정
-
-### 10. 성공 보상 지급
-
-- 전술 성공한 에이전트만 큰 보상 지급
-
-### 11. 종료 조건 계산
-
-- 역할 성공과 무관하게 `terminated = False`
-- 시간 제한이면 `truncated = True`
-
-### 12. 다음 관측 반환
+역할 성공으로는 조기 종료하지 않습니다.
 
 ```python
-obs, rewards, terminated, truncated, info
+terminated = False
+truncated = (steps >= max_steps)
 ```
 
-`info`에는 다음 같은 값이 들어갑니다.
+즉:
 
-- `agent_positions`
-- `tactical_target`
-- `role_targets`
-- `role_ids`: `sensor_fail_code == 1.0`인 agent는 `-1`/`none`
-- `success_mask`
-- `sensor_fail_code`
+- 성공해도 episode는 계속 진행
+- 시간 제한으로만 episode가 끝납니다
+
+## step 처리 순서
+
+한 step은 대략 다음 순서입니다.
+
+1. 행동 입력 수신
+2. tactical target 계산
+3. navmesh 유효 위치 스냅
+4. Detour 또는 geodesic waypoint 선택
+5. 이동량 제한 적용
+6. 실제 이동 및 agent 회피
+7. 충돌/role shaping/stall/success 전이 보상 계산
+8. `info` 구성
+9. 다음 step용 역할 재할당
+
+## `info` 주요 항목
+
+`env.step()`은 다음과 같은 정보를 돌려줍니다.
+
+- `dist_to_goal`
+- `geo_dist`
+- `collided`
 - `reward_terms`
+- `tactical_target`
+- `requested_target`
+- `agent_positions`
+- `success_mask`
+- `role_ids`
+- `agent_role_rules`
+- `role_targets`
+- `sensor_fail_code`
+- `detour_used`
+- `detour_attempted`
+- `detour_target`
+- `detour_waypoint`
+- `detour_enabled`
+- `detour_error`
 
-## 학습 성공률 의미
+`reward_terms`에는 예를 들면 아래와 같은 key가 들어갑니다.
 
-현재 `Model.py` 학습 로그는 episode 전체 성공률이 아니라 최근 100 episode 기준 역할별 step 성공률을 중심으로 봅니다.
+- `time_penalty`
+- `collision_penalty`
+- `stall_penalty`
+- `role_progress`
+- `role_front`
+- `role_cover`
+- `role_base_move`
+- `role_base_path_progress`
+- `role_base_speed`
+- `role_surround`
+- `role_kiting`
+- `success_entry`
+- `success_sustain`
+- `success_drop`
+
+## 학습 로그 의미
+
+학습 로그는 episode 전체 success율이 아니라 최근 100 episode 기준 role별 step 성공률을 중심으로 봅니다.
 
 예:
 
 ```text
-role_step=front:0.0/cover:12.5/base_move:30.0/surround:8.0/kiting:20.0
-role_step_n=front:0/0/cover:5/40/base_move:30/100/surround:4/50/kiting:10/50
+role_step=front:12.0/cover:25.0/base_move:48.0/surround:8.0/kiting:30.0
+role_step_n=front:12/100/cover:25/100/base_move:48/100/surround:8/100/kiting:30/100
+succ_growth=front:10/cover:4/base_move:30/surround:2/kiting:7
 ```
 
 의미:
 
-- `role_step`: 해당 role로 움직인 step 중 `success_mask=True`가 된 비율
-- `role_step_n`: 해당 role의 `성공 step 수 / 시도 step 수`
-- 시도 step이 없는 role은 분모가 0으로 표시될 수 있음
-- `none` fallback step은 어떤 role에도 집계되지 않음
+- `role_step`: 해당 role step 중 성공 비율
+- `role_step_n`: 성공 step 수 / 시도 step 수
+- `succ_growth`: 최근 구간에서 role별 success replay buffer 증가량
 
-best 저장은 최근 `best_min_episodes` 범위에서 `succ_replay_buffer` 총량이 얼마나 증가했는지를 기준으로 합니다.
+## best 저장 방식
 
-alpha freeze는 `succ_replay_buffer` 총량이 `alpha_freeze_succbuf` 이상이 되었는지만 봅니다.
+현재 best 저장은 role별로 따로 갱신됩니다.
 
-## 현재 코드 핵심 변경점
+- 어떤 role의 success buffer 증가량이 자기 최고 기록보다 좋아지면
+- 그 role snapshot만 best 묶음 안에서 갱신
+- 저장 파일은 여전히 전체 multi-role 파일 형태를 유지
 
-현재 코드 기준 핵심은 다음입니다.
+즉 `sac_actor_best.pth`는 전체 actor 묶음이지만, 내부적으로는 role별 최신 best 조합입니다.
 
-- 장애물 ray 관측 제거
-- 주변 몹 반경 탐지 도입
-- `sensor_fail_code` 도입
-- `F=1`일 때 geodesic waypoint fallback
-- 모든 에이전트 이동 속도 동일
-- goal 도달이 아니라 역할 전술 형성이 성공 기준
-- 역할 성공으로 episode를 조기 종료하지 않음
-- 학습 로그는 episode success 대신 역할별 step 성공률 중심으로 집계
+## 현재 핵심 변경점
+
+현재 코드 기준으로 예전 문서와 달라진 핵심은 다음입니다.
+
+- `flank_left`, `flank_right` 삭제
+- goal progress reward 제거
+- separation penalty 미사용
+- `base_move`는 경로 잔여 길이 감소 기준
+- 성공 보상은 `entry / sustain / drop`
+- role pool로 episode마다 heuristic 조합 샘플링 가능
+- role pool 길이에 따라 실제 agent 수가 episode마다 달라질 수 있음
+- best 저장은 role별 갱신 방식
