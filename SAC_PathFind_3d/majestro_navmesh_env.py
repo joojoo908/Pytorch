@@ -391,17 +391,36 @@ class MajestroNavMeshEnv(gym.Env):
         self._build_raster_cache()
         self._init_detour_wrapper()
 
-        if self.agent_role_rules is not None:
-            if len(self.agent_role_rules) == 1:
-                self.agent_role_rules = self.agent_role_rules * self.num_agents
-            elif len(self.agent_role_rules) != self.num_agents:
-                raise ValueError(
-                    f"agent_role_rules length must be 1 or num_agents ({self.num_agents}), got {len(self.agent_role_rules)}"
-                )
-
         obs_dim = 3 + 3 + 3 + 2 + self.observed_other_agents * 4 + 1
         self.single_agent_obs_dim = int(obs_dim)
         self.single_agent_act_dim = 2
+        self._apply_agent_config(self.num_agents, self.agent_role_rules)
+
+    def _normalize_agent_role_rules(self, rules: Optional[Sequence[str]], num_agents: int) -> Optional[List[str]]:
+        if rules is None:
+            return None
+        out = [str(x).strip().lower() for x in rules if str(x).strip()]
+        if not out:
+            return None
+        if len(out) == 1:
+            out = out * int(num_agents)
+        elif len(out) != int(num_agents):
+            raise ValueError(
+                f"agent_role_rules length must be 1 or num_agents ({int(num_agents)}), got {len(out)}"
+            )
+        return out
+
+    def _apply_agent_config(self, num_agents: int, agent_role_rules: Optional[Sequence[str]]) -> None:
+        self.num_agents = int(max(1, num_agents))
+        self.num_other_agents = int(max(0, self.num_agents - 1))
+        self.agent_role_rules = self._normalize_agent_role_rules(agent_role_rules, self.num_agents)
+        self.agent_positions = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self.agent_heights = np.zeros((self.num_agents,), dtype=np.float32)
+        self.agent_velocities = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self.last_target_offsets = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self.agent_role_ids = np.zeros((self.num_agents,), dtype=np.int32)
+        self.role_targets = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self._prev_success_mask = np.zeros((self.num_agents,), dtype=bool)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -414,6 +433,11 @@ class MajestroNavMeshEnv(gym.Env):
             shape=(self.num_agents, self.single_agent_act_dim),
             dtype=np.float32,
         )
+
+    def configure_agent_group(self, agent_role_rules: Optional[Sequence[str]]) -> None:
+        rules = None if agent_role_rules is None else [str(x).strip().lower() for x in agent_role_rules if str(x).strip()]
+        num_agents = 1 if not rules else len(rules)
+        self._apply_agent_config(num_agents, rules)
 
     def _init_detour_wrapper(self) -> None:
         self._detour_wrapper = None

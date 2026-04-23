@@ -124,6 +124,21 @@ def role_name(role_id: int) -> str:
     return ROLE_ID_TO_NAME.get(int(role_id), f"role_{int(role_id)}")
 
 
+def maybe_sample_agent_role_rules(env) -> Optional[List[str]]:
+    pool = getattr(env, "agent_role_rule_pool", None)
+    if not pool:
+        return None
+    idx = int(np.random.randint(0, len(pool)))
+    chosen = [str(x).strip().lower() for x in pool[idx]]
+    if hasattr(env, "configure_agent_group") and callable(env.configure_agent_group):
+        env.configure_agent_group(chosen)
+    else:
+        env.agent_role_rules = list(chosen)
+    setattr(env, "_current_agent_role_rule_sample", list(chosen))
+    setattr(env, "_current_agent_role_rule_sample_index", idx)
+    return chosen
+
+
 def get_env_role_ids(env, count: int) -> np.ndarray:
     role_ids = getattr(env, "agent_role_ids", None)
     if role_ids is None:
@@ -494,6 +509,7 @@ def sac_train(env,
     alpha_frozen = False
 
     for ep in range(episodes):
+        sampled_rules = maybe_sample_agent_role_rules(env)
         obs = reset_env(env)
         done = False
         ep_steps = 0
@@ -681,11 +697,14 @@ def sac_train(env,
             succ_summary = "/".join(f"{role_name(r)}:{len(role_bundles[r]['succ_replay_buffer'])}" for r in ROLE_IDS)
             role_step_summary = "/".join(f"{role_name(r)}:{role_step_rates[r]:4.1f}" for r in ROLE_IDS)
             role_step_count_summary = "/".join(f"{role_name(r)}:{role_step_counts[r][0]}/{role_step_counts[r][1]}" for r in ROLE_IDS)
+            rule_summary = ""
+            if sampled_rules is not None:
+                rule_summary = f" | agents={len(sampled_rules)} rules={','.join(sampled_rules)}"
             print(f"[EP {ep+1:5d}] steps={ep_steps:3d}  R={ep_reward:8.2f}  "
                   f"| role_step={role_step_summary} "
                   f"| role_step_n={role_step_count_summary} "
                   f"| succ_buf_total={succ_buf_total} growth@{len(succ_buf_total_history)}={succ_buf_growth} "
-                  f"| alpha={alpha_summary} | succ_buf={succ_summary}")
+                  f"| alpha={alpha_summary} | succ_buf={succ_summary}{rule_summary}")
 
         if save_best_online and len(succ_buf_total_history) >= max(2, int(best_min_episodes)):
             min_growth_delta = max(1.0, float(best_delta))

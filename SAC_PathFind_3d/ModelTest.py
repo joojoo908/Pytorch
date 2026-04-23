@@ -14,6 +14,18 @@ except Exception:
 import torch
 
 
+ROLE_RULE_ALIASES = {
+    "mdps": "melee_dps",
+    "melee_dps": "melee_dps",
+    "meleedps": "melee_dps",
+    "rdps": "ranged_dps",
+    "ranged_dps": "ranged_dps",
+    "rangeddps": "ranged_dps",
+    "fix": "fixed",
+    "fixed": "fixed",
+}
+
+
 ROLE_NAMES = {
     -1: "none",
     0: "front",
@@ -41,6 +53,55 @@ ROLE_COLORS = {
 }
 
 DETOUR_PATH_COLOR = (80, 255, 220)
+
+
+def _normalize_rule_name(name: str) -> str:
+    key = str(name).strip().lower()
+    if not key:
+        raise ValueError("Empty role rule is not allowed.")
+    return ROLE_RULE_ALIASES.get(key, key)
+
+
+def parse_agent_role_rules(text: str | None, num_agents: int):
+    if not text:
+        return None
+    parts = [_normalize_rule_name(part) for part in str(text).split(",") if part.strip()]
+    if not parts:
+        return None
+    if len(parts) > num_agents:
+        raise ValueError(f"agent_role_rules length must be <= num_agents ({num_agents}), got {len(parts)}")
+    if len(parts) < num_agents:
+        parts.extend([parts[-1]] * (num_agents - len(parts)))
+    return parts
+
+
+def parse_agent_role_rule_pool(text: str | None, num_agents: int):
+    if not text:
+        return None
+    pool = []
+    for chunk in str(text).split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        rules = [_normalize_rule_name(part) for part in chunk.split(",") if part.strip()]
+        if rules:
+            pool.append(rules)
+    return pool or None
+
+
+def maybe_sample_agent_role_rules(env):
+    pool = getattr(env, "agent_role_rule_pool", None)
+    if not pool:
+        return None
+    idx = int(np.random.randint(0, len(pool)))
+    chosen = [str(x).strip().lower() for x in pool[idx]]
+    if hasattr(env, "configure_agent_group") and callable(env.configure_agent_group):
+        env.configure_agent_group(chosen)
+    else:
+        env.agent_role_rules = list(chosen)
+    setattr(env, "_current_agent_role_rule_sample", list(chosen))
+    setattr(env, "_current_agent_role_rule_sample_index", idx)
+    return chosen
 
 
 def make_world_to_screen(bounds_min, bounds_max, scale):
@@ -426,6 +487,7 @@ def run_multiple_evaluations(env, role_bundles, episodes=10, max_steps=None, sca
     screen_bundle = None
 
     for ep in range(episodes):
+        sampled_rules = maybe_sample_agent_role_rules(env)
         vis = visualize and ((ep % visualize_every) == 0)
         save_csv = save_last_csv if ep == episodes - 1 else None
         ret, succ, outcome, screen_bundle = evaluate_once(
@@ -439,7 +501,8 @@ def run_multiple_evaluations(env, role_bundles, episodes=10, max_steps=None, sca
         )
         returns.append(ret)
         successes += int(succ)
-        print(f"[Episode {ep + 1}/{episodes}] return={ret:.3f} outcome={outcome}")
+        rule_summary = "" if sampled_rules is None else f" agents={len(sampled_rules)} rules={','.join(sampled_rules)}"
+        print(f"[Episode {ep + 1}/{episodes}] return={ret:.3f} outcome={outcome}{rule_summary}")
 
         if outcome == "aborted":
             print("[Info] Evaluation stopped by user.")
@@ -472,13 +535,19 @@ if __name__ == "__main__":
     ap.add_argument("--role-rule", type=str, default="fixed", choices=["fixed", "melee_dps", "ranged_dps"])
     ap.add_argument("--agent-role-rules", type=str, default="melee_dps,melee_dps,melee_dps,ranged_dps,ranged_dps",
                     help="Comma-separated per-agent heuristic list. Length must be 1 or num_agents. Example: fixed,melee_dps,ranged_dps,fixed,fixed")
+    ap.add_argument(
+        "--agent-role-rule-pool",
+        type=str,
+        default="melee_dps,melee_dps,melee_dps,ranged_dps,ranged_dps;rdps,rdps,rdps;mdps,mdps,mdps,mdps;mdps;rdps,rdps,mdps,mdps,mdps",
+        help="Semicolon-separated pool of per-episode heuristic sets. Each set is comma-separated. Shorter sets are expanded by repeating the last rule.",
+    )
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     actor_path = args.actor_path
-    agent_role_rules = None
-    if args.agent_role_rules:
-        agent_role_rules = [part.strip() for part in args.agent_role_rules.split(",") if part.strip()]
+    num_agents = 1 + int(args.num_other_agents)
+    agent_role_rules = parse_agent_role_rules(args.agent_role_rules, num_agents)
+    agent_role_rule_pool = parse_agent_role_rule_pool(args.agent_role_rule_pool, num_agents)
 
     env = build_env(
         seed=args.seed,
@@ -494,6 +563,10 @@ if __name__ == "__main__":
         role_rule=args.role_rule,
         agent_role_rules=agent_role_rules,
     )
+    if agent_role_rule_pool is not None:
+        env.agent_role_rule_pool = [list(rules) for rules in agent_role_rule_pool]
+        pool_summary = " ; ".join(",".join(rules) for rules in agent_role_rule_pool)
+        print(f"[ROLE-POOL] {len(agent_role_rule_pool)} sets | {pool_summary}")
 
     if not os.path.exists(actor_path):
         print(f"[WARN] {actor_path} not found. Train with Test.py first.")
