@@ -813,7 +813,9 @@ class MajestroNavMeshEnv(gym.Env):
     def _sense_local_space(self, agent_index: int, scale: float) -> Tuple[np.ndarray, float]:
         sense_limit = max(1.0, float(self.sense_radius))
         other_obs, sensed_agents = self._other_agent_observation(agent_index, scale, max_distance=sense_limit)
-        fail_code = 1.0 if sensed_agents == 0 else 0.0
+        goal_dist = float(np.linalg.norm(self.goal_pos - self.agent_positions[agent_index]))
+        goal_in_sense = bool(goal_dist <= sense_limit)
+        fail_code = 1.0 if (sensed_agents == 0 and not goal_in_sense) else 0.0
         return other_obs, fail_code
 
     def _geo_next_waypoint(self, pos: np.ndarray, max_search: int = 3) -> Optional[np.ndarray]:
@@ -1267,6 +1269,7 @@ class MajestroNavMeshEnv(gym.Env):
             bonus += cover_bonus
             terms["role_cover"] = cover_bonus
         elif role_id == ROLE_BASE_MOVE:
+            old_goal_dist = float(np.linalg.norm(self.goal_pos - old_pos))
             old_path = old_path_dist if old_path_dist is not None else self._geo_distance_robust(old_pos, max_search=3)
             new_path = new_path_dist if new_path_dist is not None else self._geo_distance_robust(new_pos, max_search=3)
             if old_path is None:
@@ -1278,6 +1281,10 @@ class MajestroNavMeshEnv(gym.Env):
             path_progress_bonus = 0.08 * min(path_progress / max(self.step_size, 1.0), 1.5)
             base_bonus = path_progress_bonus
             terms["role_base_path_progress"] = path_progress_bonus
+            entered_sense_radius = bool(old_goal_dist > float(self.sense_radius) and goal_dist <= float(self.sense_radius))
+            if entered_sense_radius:
+                base_bonus += 0.12
+                terms["role_base_enter_radius"] = 0.12
             if detour_used:
                 base_bonus += 0.02
             if collided:
@@ -1288,7 +1295,11 @@ class MajestroNavMeshEnv(gym.Env):
             terms["role_base_speed"] = speed_bonus
             bonus += base_bonus
             terms["role_base_move"] = base_bonus
-            tactical_success = bool((not collided) and speed >= self.step_size * 0.45 and goal_dist <= self.success_radius * 2.2)
+            tactical_success = bool(
+                entered_sense_radius
+                and (not collided)
+                and speed >= self.step_size * 0.45
+            )
         elif role_id == ROLE_SURROUND:
             surround_radius = max(self.success_radius * 1.6, self.agent_radius * 2.2)
             my_dist, angle_gap, ally_count = self._surround_stats(agent_index, pos=new_pos)
