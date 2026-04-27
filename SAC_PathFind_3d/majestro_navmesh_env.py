@@ -1057,34 +1057,36 @@ class MajestroNavMeshEnv(gym.Env):
                 best = other.copy()
         return best
 
-    def _surround_stats(self, agent_index: int, pos: Optional[np.ndarray] = None) -> Tuple[float, float, int]:
+    def _surround_stats(self, agent_index: int, pos: Optional[np.ndarray] = None) -> Tuple[float, int, int]:
         center = self.goal_pos
+        surround_radius = max(self.success_radius * 1.6, self.agent_radius * 2.2)
+        ring_tolerance = max(self.agent_radius * 1.5, self.success_radius * 0.4)
+        ray_count = 8
+        ray_step = (2.0 * math.pi) / float(ray_count)
+        half_step = 0.5 * ray_step
         my_pos = self.agent_positions[agent_index] if pos is None else np.asarray(pos, dtype=np.float32)
         my_rel = my_pos - center
         my_dist = float(np.linalg.norm(my_rel))
-        if my_dist <= 1e-6:
-            my_angle = 0.0
-        else:
-            my_angle = math.atan2(float(my_rel[1]), float(my_rel[0]))
-
-        ally_angles: List[float] = []
+        occupied = [False] * ray_count
+        participant_count = 0
         for idx, other in enumerate(self.agent_positions):
-            if idx == agent_index:
-                continue
-            rel = other - center
+            other_pos = my_pos if idx == agent_index and pos is not None else other
+            rel = np.asarray(other_pos, dtype=np.float32) - center
             dist = float(np.linalg.norm(rel))
-            if dist <= self.success_radius * 0.8:
+            if abs(dist - surround_radius) > ring_tolerance:
                 continue
-            ally_angles.append(math.atan2(float(rel[1]), float(rel[0])))
-
-        if not ally_angles:
-            return my_dist, math.pi, 0
-
-        min_gap = min(
-            abs(((my_angle - ang + math.pi) % (2.0 * math.pi)) - math.pi)
-            for ang in ally_angles
-        )
-        return my_dist, float(min_gap), len(ally_angles)
+            participant_count += 1
+            if dist <= 1e-6:
+                angle = 0.0
+            else:
+                angle = math.atan2(float(rel[1]), float(rel[0]))
+            for ray_idx in range(ray_count):
+                ray_angle = -math.pi + ray_idx * ray_step
+                delta = abs(((angle - ray_angle + math.pi) % (2.0 * math.pi)) - math.pi)
+                if delta <= half_step:
+                    occupied[ray_idx] = True
+        covered_rays = sum(1 for flag in occupied if flag)
+        return my_dist, covered_rays, participant_count
 
     def _role_target_for(self, agent_index: int) -> np.ndarray:
         role_id = int(self.agent_role_ids[agent_index])
@@ -1302,18 +1304,21 @@ class MajestroNavMeshEnv(gym.Env):
             )
         elif role_id == ROLE_SURROUND:
             surround_radius = max(self.success_radius * 1.6, self.agent_radius * 2.2)
-            my_dist, angle_gap, ally_count = self._surround_stats(agent_index, pos=new_pos)
+            my_dist, covered_rays, participant_count = self._surround_stats(agent_index, pos=new_pos)
             ring_error = abs(my_dist - surround_radius)
             surround_bonus = 0.10 * max(0.0, 1.0 - ring_error / max(surround_radius, 1.0))
-            surround_bonus += 0.08 * min(angle_gap / (math.pi / 2.0), 1.0)
-            if ally_count >= 2:
+            target_rays = max(1, min(8, participant_count))
+            ray_coverage = float(covered_rays) / float(target_rays)
+            surround_bonus += 0.12 * min(ray_coverage, 1.0)
+            terms["role_surround_coverage"] = 0.12 * min(ray_coverage, 1.0)
+            if participant_count >= 3:
                 surround_bonus += 0.04
             bonus += surround_bonus
             terms["role_surround"] = surround_bonus
             tactical_success = bool(
-                ally_count >= 2
+                participant_count >= 3
                 and ring_error <= self.agent_radius * 1.5
-                and angle_gap >= 0.70
+                and covered_rays >= target_rays
             )
         else:
             kiting_min_dist = max(0.0, float(self.sense_radius) - 100.0)
