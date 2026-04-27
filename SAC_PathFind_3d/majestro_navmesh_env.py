@@ -337,6 +337,9 @@ class MajestroNavMeshEnv(gym.Env):
         self._R_SUCCESS_ENTRY = 20.0
         self._R_SUCCESS_SUSTAIN = 2.0
         self._R_SUCCESS_DROP = 3.0
+        self._R_SENSE_ENTRY = 3.0
+        self._R_SENSE_SUSTAIN = 0.5
+        self._R_SENSE_DROP = 1.5
         self.role_rule = str(role_rule).strip().lower()
         self.agent_role_rules = None if agent_role_rules is None else [str(x).strip().lower() for x in agent_role_rules]
         self.role_selector = role_selector
@@ -386,6 +389,7 @@ class MajestroNavMeshEnv(gym.Env):
         self._stall_wait = None
         self._prev_geo = None
         self._prev_success_mask = np.zeros((self.num_agents,), dtype=bool)
+        self._prev_in_sense_mask = np.zeros((self.num_agents,), dtype=bool)
         self.steps = 0
 
         self._build_raster_cache()
@@ -421,6 +425,7 @@ class MajestroNavMeshEnv(gym.Env):
         self.agent_role_ids = np.zeros((self.num_agents,), dtype=np.int32)
         self.role_targets = np.zeros((self.num_agents, 2), dtype=np.float32)
         self._prev_success_mask = np.zeros((self.num_agents,), dtype=bool)
+        self._prev_in_sense_mask = np.zeros((self.num_agents,), dtype=bool)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -1531,10 +1536,12 @@ class MajestroNavMeshEnv(gym.Env):
         self._stall_best = np.full((self.num_agents,), np.nan, dtype=np.float32)
         self._stall_wait = np.zeros((self.num_agents,), dtype=np.int32)
         self._prev_success_mask = np.zeros((self.num_agents,), dtype=bool)
+        self._prev_in_sense_mask = np.zeros((self.num_agents,), dtype=bool)
         for idx in range(self.num_agents):
             geo = self._geo_distance(self.agent_positions[idx])
             self._prev_geo[idx] = np.nan if geo is None else geo
             self._stall_best[idx] = geo if geo is not None else float(np.linalg.norm(self.goal_pos - self.agent_positions[idx]))
+            self._prev_in_sense_mask[idx] = bool(np.linalg.norm(self.goal_pos - self.agent_positions[idx]) <= float(self.sense_radius))
 
         if self.dynamic_horizon:
             self.max_steps = self._compute_dynamic_horizon()
@@ -1675,6 +1682,20 @@ class MajestroNavMeshEnv(gym.Env):
 
             self._prev_geo[idx] = np.nan if new_geo is None else float(new_geo)
 
+            role_id = int(step_role_ids[idx])
+            was_in_sense = bool(self._prev_in_sense_mask[idx])
+            is_in_sense = bool(dists[idx] <= float(self.sense_radius))
+            if role_id != ROLE_BASE_MOVE and role_id != ROLE_NONE:
+                if is_in_sense and not was_in_sense:
+                    rewards[idx] += self._R_SENSE_ENTRY
+                    terms_list[idx]["sense_entry"] = self._R_SENSE_ENTRY
+                elif is_in_sense:
+                    rewards[idx] += self._R_SENSE_SUSTAIN
+                    terms_list[idx]["sense_sustain"] = self._R_SENSE_SUSTAIN
+                elif was_in_sense:
+                    rewards[idx] -= self._R_SENSE_DROP
+                    terms_list[idx]["sense_drop"] = -self._R_SENSE_DROP
+
             was_success = bool(self._prev_success_mask[idx])
             is_success = bool(success_mask[idx])
             if is_success and not was_success:
@@ -1718,6 +1739,7 @@ class MajestroNavMeshEnv(gym.Env):
             "detour_error": self._detour_last_error,
         }
         self._prev_success_mask = success_mask.copy()
+        self._prev_in_sense_mask = (dists <= float(self.sense_radius))
         self.agent_role_ids[:] = self._compute_assigned_roles()
         self._update_role_targets()
         return self._pack_observation(), rewards.astype(np.float32), terminated, truncated, info
