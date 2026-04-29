@@ -171,6 +171,7 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
+    <ClCompile Include="ArrivalBenchmark.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="DetourCrowdBenchmark.cpp" />
     <ClCompile Include="OnnxBenchmark.cpp" />
@@ -183,6 +184,7 @@
     <ClCompile Include="native\detour_navmesh_wrapper.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="ArrivalBenchmark.h" />
     <ClInclude Include="BenchmarkTypes.h" />
     <ClInclude Include="DetourCrowdBenchmark.h" />
     <ClInclude Include="OnnxBenchmark.h" />
