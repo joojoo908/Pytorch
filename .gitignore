@@ -203,3 +203,4 @@ performanceTest/BaseMovePerformanceTest/BaseMovePerformanceTest/x64/
 performanceTest/onnxTest/.vs/
 performanceTest/BaseMovePerformanceTest/x64/
 *.onnx
+SAC_Tactical_BaseMove/native/
