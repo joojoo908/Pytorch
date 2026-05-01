@@ -383,6 +383,8 @@ class MajestroNavMeshEnv(gym.Env):
         self.agent_heights = np.zeros((self.num_agents,), dtype=np.float32)
         self.agent_velocities = np.zeros((self.num_agents, 2), dtype=np.float32)
         self.last_target_offsets = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self.current_detour_waypoints = np.full((self.num_agents, 2), np.nan, dtype=np.float32)
+        self.current_detour_waypoint_heights = np.full((self.num_agents,), np.nan, dtype=np.float32)
         self.agent_role_ids = np.zeros((self.num_agents,), dtype=np.int32)
         self.role_targets = np.zeros((self.num_agents, 2), dtype=np.float32)
         self._stall_best = None
@@ -422,6 +424,8 @@ class MajestroNavMeshEnv(gym.Env):
         self.agent_heights = np.zeros((self.num_agents,), dtype=np.float32)
         self.agent_velocities = np.zeros((self.num_agents, 2), dtype=np.float32)
         self.last_target_offsets = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self.current_detour_waypoints = np.full((self.num_agents, 2), np.nan, dtype=np.float32)
+        self.current_detour_waypoint_heights = np.full((self.num_agents,), np.nan, dtype=np.float32)
         self.agent_role_ids = np.zeros((self.num_agents,), dtype=np.int32)
         self.role_targets = np.zeros((self.num_agents, 2), dtype=np.float32)
         self._prev_success_mask = np.zeros((self.num_agents,), dtype=bool)
@@ -872,7 +876,7 @@ class MajestroNavMeshEnv(gym.Env):
             return self.goal_pos.copy()
         return self._grid_rc_to_world(best[0], best[1]).astype(np.float32)
 
-    def _detour_next_waypoint_to_target(
+    def _detour_next_waypoint3_to_target(
         self,
         pos: np.ndarray,
         target_pos: np.ndarray,
@@ -902,7 +906,23 @@ class MajestroNavMeshEnv(gym.Env):
             return None
 
         wx, wy, wz = waypoint
-        world3 = self._detour_xyz_to_world3(wx, wy, wz)
+        return self._detour_xyz_to_world3(wx, wy, wz).astype(np.float32)
+
+    def _detour_next_waypoint_to_target(
+        self,
+        pos: np.ndarray,
+        target_pos: np.ndarray,
+        height: Optional[float] = None,
+        target_height: Optional[float] = None,
+    ) -> Optional[np.ndarray]:
+        world3 = self._detour_next_waypoint3_to_target(
+            pos,
+            target_pos,
+            height=height,
+            target_height=target_height,
+        )
+        if world3 is None:
+            return None
         return world3[[0, 2]].astype(np.float32)
 
     def _detour_next_waypoint(self, pos: np.ndarray, height: Optional[float] = None) -> Optional[np.ndarray]:
@@ -912,6 +932,43 @@ class MajestroNavMeshEnv(gym.Env):
             height=height,
             target_height=float(self.goal_height),
         )
+
+    def _detour_next_waypoint_with_min_progress(
+        self,
+        pos: np.ndarray,
+        target_pos: np.ndarray,
+        min_progress: float,
+        height: Optional[float] = None,
+        target_height: Optional[float] = None,
+        max_hops: int = 4,
+    ) -> Optional[Tuple[np.ndarray, float]]:
+        cur_pos = np.asarray(pos, dtype=np.float32).reshape(-1)[:2].copy()
+        cur_height = float(self.agent_height if height is None else height)
+        min_progress = float(max(0.0, min_progress))
+        seen = set()
+
+        for _ in range(max(1, int(max_hops))):
+            key = (round(float(cur_pos[0]), 2), round(float(cur_pos[1]), 2))
+            if key in seen:
+                break
+            seen.add(key)
+
+            waypoint3 = self._detour_next_waypoint3_to_target(
+                cur_pos,
+                target_pos,
+                height=cur_height,
+                target_height=target_height,
+            )
+            if waypoint3 is None:
+                return None
+            waypoint = waypoint3[[0, 2]].astype(np.float32)
+            waypoint_height = float(waypoint3[1])
+            if float(np.linalg.norm(waypoint - pos)) > min_progress:
+                return waypoint, waypoint_height
+            cur_pos = waypoint
+            cur_height = waypoint_height
+
+        return (waypoint.astype(np.float32), waypoint_height) if 'waypoint' in locals() else None
 
     def recover_fallback_path_world(
         self,
@@ -1449,6 +1506,8 @@ class MajestroNavMeshEnv(gym.Env):
         self.agent_heights = np.zeros((self.num_agents,), dtype=np.float32)
         self.agent_velocities = np.zeros((self.num_agents, 2), dtype=np.float32)
         self.last_target_offsets = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self.current_detour_waypoints = np.full((self.num_agents, 2), np.nan, dtype=np.float32)
+        self.current_detour_waypoint_heights = np.full((self.num_agents,), np.nan, dtype=np.float32)
         self.role_targets = np.zeros((self.num_agents, 2), dtype=np.float32)
 
         self.agent_positions[0] = self.agent_pos.copy()
@@ -1566,6 +1625,8 @@ class MajestroNavMeshEnv(gym.Env):
         detour_attempt_codes = np.zeros((self.num_agents,), dtype=np.float32)
         detour_targets = np.zeros_like(self.agent_positions)
         detour_waypoints = np.full_like(self.agent_positions, np.nan, dtype=np.float32)
+        detour_forced_step_codes = np.zeros((self.num_agents,), dtype=np.float32)
+        detour_priority_step_codes = np.zeros((self.num_agents,), dtype=np.float32)
         tactical_targets = np.zeros_like(self.agent_positions)
         requested_targets = np.zeros_like(self.agent_positions)
         collisions = np.zeros((self.num_agents,), dtype=bool)
@@ -1579,21 +1640,42 @@ class MajestroNavMeshEnv(gym.Env):
             target_offset = np.clip(acts[idx], -1.0, 1.0) * self.tactical_target_radius
             if fail_code > 0.5:
                 desired_target = self.goal_pos.copy()
+                snapped_target = self.goal_pos.copy()
+                snapped_height = float(self.goal_height)
             else:
                 desired_target = old_pos + target_offset
-            snapped = self._nearest_valid_point(desired_target, max_radius=6)
-            snapped_target = old_pos.copy() if snapped is None else snapped[0]
-            snapped_height = None if snapped is None else float(snapped[1])
+                snapped = self._nearest_valid_point(desired_target, max_radius=6)
+                snapped_target = old_pos.copy() if snapped is None else snapped[0]
+                snapped_height = None if snapped is None else float(snapped[1])
             detour_targets[idx] = snapped_target
 
             if self._detour_enabled:
                 detour_attempt_codes[idx] = 1.0
-                waypoint = self._detour_next_waypoint_to_target(
-                    old_pos,
-                    snapped_target,
-                    height=float(self.agent_heights[idx]),
-                    target_height=snapped_height,
-                )
+                waypoint = None
+                waypoint_height = float("nan")
+                reach_tol = max(self._grid_cell_size * 0.50, self.step_size * 0.35)
+                cached_waypoint = self.current_detour_waypoints[idx]
+                cached_waypoint_height = float(self.current_detour_waypoint_heights[idx])
+                if np.all(np.isfinite(cached_waypoint)):
+                    cached_dist = float(np.linalg.norm(cached_waypoint - old_pos))
+                    if cached_dist > reach_tol and math.isfinite(cached_waypoint_height):
+                        waypoint = cached_waypoint.astype(np.float32)
+                        waypoint_height = cached_waypoint_height
+                if waypoint is None:
+                    detour_result = self._detour_next_waypoint_with_min_progress(
+                        old_pos,
+                        snapped_target,
+                        min_progress=max(self._grid_cell_size * 0.50, self.step_size * 0.25),
+                        height=float(self.agent_heights[idx]),
+                        target_height=snapped_height,
+                    )
+                    if detour_result is not None:
+                        waypoint, waypoint_height = detour_result
+                        self.current_detour_waypoints[idx] = waypoint.astype(np.float32)
+                        self.current_detour_waypoint_heights[idx] = float(waypoint_height)
+                    else:
+                        self.current_detour_waypoints[idx] = np.array([np.nan, np.nan], dtype=np.float32)
+                        self.current_detour_waypoint_heights[idx] = np.float32(np.nan)
                 detour_used_codes[idx] = 1.0 if waypoint is not None else 0.0
                 if waypoint is not None:
                     detour_waypoints[idx] = waypoint
@@ -1612,15 +1694,54 @@ class MajestroNavMeshEnv(gym.Env):
             else:
                 movement_target = tactical_target
 
-            new_pos, new_height, collided = self._move_with_agent_avoidance(
-                old_pos,
-                movement_target,
-                ignore_index=idx,
-                start_height=float(self.agent_heights[idx]),
+            detour_priority_allowed = waypoint is not None and (
+                fail_code > 0.5 or int(step_role_ids[idx]) == ROLE_BASE_MOVE
             )
+            if detour_priority_allowed:
+                move_ratio = 1.0 if target_dist <= 1e-6 else min(1.0, step_size / max(target_dist, 1e-6))
+                detour_height = float(self.agent_heights[idx]) + (float(waypoint_height) - float(self.agent_heights[idx])) * move_ratio
+                if math.isfinite(detour_height) and not self._collides_with_other_agents(movement_target, ignore_index=idx):
+                    new_pos = movement_target.astype(np.float32)
+                    new_height = float(detour_height)
+                    collided = False
+                    detour_priority_step_codes[idx] = 1.0
+                else:
+                    new_pos, new_height, collided = self._move_with_agent_avoidance(
+                        old_pos,
+                        movement_target,
+                        ignore_index=idx,
+                        start_height=float(self.agent_heights[idx]),
+                    )
+            else:
+                new_pos, new_height, collided = self._move_with_agent_avoidance(
+                    old_pos,
+                    movement_target,
+                    ignore_index=idx,
+                    start_height=float(self.agent_heights[idx]),
+                )
+            moved_dist = float(np.linalg.norm(new_pos - old_pos))
+            min_progress = max(self._grid_cell_size * 0.50, self.step_size * 0.25)
+            if (
+                detour_priority_allowed
+                and moved_dist < min_progress
+                and detour_priority_step_codes[idx] <= 0.5
+                and not self._collides_with_other_agents(movement_target, ignore_index=idx)
+            ):
+                move_ratio = 1.0 if target_dist <= 1e-6 else min(1.0, step_size / max(target_dist, 1e-6))
+                detour_height = float(self.agent_heights[idx]) + (float(waypoint_height) - float(self.agent_heights[idx])) * move_ratio
+                if math.isfinite(detour_height):
+                    new_pos = movement_target.astype(np.float32)
+                    new_height = float(detour_height)
+                    collided = False
+                    detour_forced_step_codes[idx] = 1.0
             self.agent_positions[idx] = new_pos
             self.agent_heights[idx] = new_height
             self.agent_velocities[idx] = new_pos - old_pos
+            current_wp = self.current_detour_waypoints[idx]
+            if np.all(np.isfinite(current_wp)):
+                if float(np.linalg.norm(current_wp - new_pos)) <= max(self._grid_cell_size * 0.50, self.step_size * 0.20):
+                    self.current_detour_waypoints[idx] = np.array([np.nan, np.nan], dtype=np.float32)
+                    self.current_detour_waypoint_heights[idx] = np.float32(np.nan)
             self.last_target_offsets[idx] = target_offset.astype(np.float32)
             tactical_targets[idx] = tactical_target
             requested_targets[idx] = desired_target
@@ -1735,6 +1856,8 @@ class MajestroNavMeshEnv(gym.Env):
             "detour_attempted": detour_attempt_codes.copy(),
             "detour_target": detour_targets.copy(),
             "detour_waypoint": detour_waypoints.copy(),
+            "detour_forced_step": detour_forced_step_codes.copy(),
+            "detour_priority_step": detour_priority_step_codes.copy(),
             "detour_enabled": bool(self._detour_enabled),
             "detour_error": self._detour_last_error,
         }

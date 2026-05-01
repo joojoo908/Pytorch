@@ -164,6 +164,17 @@ def soft_update_(src: nn.Module, dst: nn.Module, tau: float):
             tp.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
 
 
+def _push_success_sample(
+    succ_replay_buffer,
+    sample: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[float]],
+) -> None:
+    s, a, r, ns, d, dist = sample
+    if dist is None:
+        succ_replay_buffer.push(s, a, r, ns, d)
+    else:
+        succ_replay_buffer.push_with_dist(s, a, r, ns, d, dist)
+
+
 # ----------------------------
 # Replay Buffers
 # ----------------------------
@@ -544,6 +555,7 @@ def sac_train(env,
     best_role_scores = {role_id: -1.0 for role_id in ROLE_IDS}
     best_role_snapshots = {role_id: _snapshot_role_bundle(role_bundles[role_id]) for role_id in ROLE_IDS}
     alpha_frozen = False
+    base_move_success_horizon = max(1, int(kwargs.get("base_move_success_horizon", 8)))
 
     for ep in range(episodes):
         sampled_rules = maybe_sample_agent_role_rules(env)
@@ -556,6 +568,7 @@ def sac_train(env,
         ep_horizon = (env.max_steps if (max_steps is None and hasattr(env, "max_steps")) else max_steps)
         ep_role_attempts = {role_id: 0 for role_id in ROLE_IDS}
         ep_role_successes = {role_id: 0 for role_id in ROLE_IDS}
+        recent_success_traces: Dict[Tuple[int, int], deque] = {}
 
         while (not done) and (ep_steps < (ep_horizon if ep_horizon is not None else 10**9)):
             obs_arr = np.asarray(obs, dtype=np.float32)
@@ -603,16 +616,29 @@ def sac_train(env,
                     continue
                 dist = None if dist_values is None or agent_idx >= len(dist_values) else float(dist_values[agent_idx])
                 step_success = bool(success_mask_arr is not None and agent_idx < len(success_mask_arr) and success_mask_arr[agent_idx])
+                sample = (
+                    obs_arr[agent_idx],
+                    act[agent_idx],
+                    reward_arr[agent_idx],
+                    next_obs_arr[agent_idx],
+                    done,
+                    dist,
+                )
                 if role_id in ep_role_attempts:
                     ep_role_attempts[role_id] += 1
                     ep_role_successes[role_id] += int(step_success)
                 role_bundles[role_id]["replay_buffer"].push(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done)
+                trace_key = (agent_idx, role_id)
+                if trace_key not in recent_success_traces:
+                    recent_success_traces[trace_key] = deque(maxlen=base_move_success_horizon)
+                recent_success_traces[trace_key].append(sample)
                 if step_success:
                     succ_replay_buffer = role_bundles[role_id]["succ_replay_buffer"]
-                    if dist is None:
-                        succ_replay_buffer.push(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done)
+                    if role_id == 2:
+                        for trace_sample in recent_success_traces[trace_key]:
+                            _push_success_sample(succ_replay_buffer, trace_sample)
                     else:
-                        succ_replay_buffer.push_with_dist(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done, dist)
+                        _push_success_sample(succ_replay_buffer, sample)
 
             obs = next_obs
 

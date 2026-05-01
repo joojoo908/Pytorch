@@ -204,3 +204,10 @@ performanceTest/onnxTest/.vs/
 performanceTest/BaseMovePerformanceTest/x64/
 *.onnx
 SAC_Tactical_BaseMove/native/
+PPO/checkpoints/ma_ppo_final.pth
+PPO/checkpoints/ma_ppo_latest.pth
+SAC/sac_actor_best.pth
+SAC/sac_actor_last.pth
+SAC/sac_best.pth
+SAC_PathFind_3d/last_eval_traj.csv
+SAC_Tactical_BaseMove/last_eval_traj.csv

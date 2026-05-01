@@ -274,11 +274,6 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
 
             sensor_fail_codes = final_info.get("sensor_fail_code")
             fail_arr = None if sensor_fail_codes is None else np.asarray(sensor_fail_codes, dtype=np.float32).reshape(-1)
-            agent_role_rules = final_info.get("agent_role_rules")
-            if agent_role_rules is None:
-                agent_role_rules = ["base_move_only"] * len(agent_trajs)
-            else:
-                agent_role_rules = list(agent_role_rules)
             if fail_arr is not None:
                 for idx, pos in enumerate(np.asarray(env.agent_positions, dtype=np.float32)):
                     if idx >= len(fail_arr) or fail_arr[idx] <= 0.5:
@@ -321,10 +316,7 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
                     color = ROLE_COLORS.get(role_id, (200, 140, 70))
                     sx, sy = world_to_screen(other)
                     pygame.draw.circle(screen, color, (sx, sy), 4)
-                    rule_name = str(agent_role_rules[idx]) if idx < len(agent_role_rules) else "base_move_only"
-                    rule_short = HEURISTIC_SHORT.get(rule_name, rule_name[:3])
-                    role_label = ROLE_NAMES.get(role_id, str(role_id))
-                    label = f"{rule_short}->{role_label}"
+                    label = f"A{idx}"
                     surf = font.render(label, True, color)
                     screen.blit(surf, (sx + 6, sy - 10))
 
@@ -339,8 +331,10 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
                 f"Pos: ({env.agent_pos[0]:.1f}, {env.agent_height:.1f}, {env.agent_pos[1]:.1f})",
             ]
             if role_ids is not None:
-                role_labels = [ROLE_NAMES.get(int(r), str(int(r))) for r in role_ids]
-                lines.append(f"Roles: {', '.join(role_labels)}")
+                role_ids_arr = np.asarray(role_ids, dtype=np.int32).reshape(-1)
+                none_count = int(np.sum(role_ids_arr == -1))
+                base_move_count = int(np.sum(role_ids_arr == 2))
+                lines.append(f"Roles: none={none_count} base_move={base_move_count}")
             y = 8
             for line in lines:
                 surf = font.render(line, True, (220, 220, 220))
@@ -396,7 +390,7 @@ def run_multiple_evaluations(env, actor, episodes=10, max_steps=None, scale=0.03
         )
         returns.append(ret)
         successes += int(succ)
-        rule_summary = "" if sampled_rules is None else f" agents={len(sampled_rules)} rules={','.join(sampled_rules)}"
+        rule_summary = "" if sampled_rules is None else f" agents={len(sampled_rules)}"
         print(f"[Episode {ep + 1}/{episodes}] return={ret:.3f} outcome={outcome}{rule_summary}")
 
         if outcome == "aborted":

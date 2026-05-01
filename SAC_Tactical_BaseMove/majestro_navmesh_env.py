@@ -1444,7 +1444,8 @@ class MajestroNavMeshEnv(gym.Env):
             else:
                 movement_target = tactical_target
 
-            if fail_code > 0.5 and waypoint is not None:
+            detour_priority_allowed = waypoint is not None
+            if detour_priority_allowed:
                 move_ratio = 1.0 if target_dist <= 1e-6 else min(1.0, step_size / max(target_dist, 1e-6))
                 detour_height = float(self.agent_heights[idx]) + (float(waypoint_height) - float(self.agent_heights[idx])) * move_ratio
                 if math.isfinite(detour_height) and not self._collides_with_other_agents(movement_target, ignore_index=idx):
@@ -1469,8 +1470,7 @@ class MajestroNavMeshEnv(gym.Env):
             moved_dist = float(np.linalg.norm(new_pos - old_pos))
             min_progress = max(self._grid_cell_size * 0.50, self.step_size * 0.25)
             if (
-                fail_code > 0.5
-                and waypoint is not None
+                detour_priority_allowed
                 and moved_dist < min_progress
                 and detour_priority_step_codes[idx] <= 0.5
                 and not self._collides_with_other_agents(movement_target, ignore_index=idx)

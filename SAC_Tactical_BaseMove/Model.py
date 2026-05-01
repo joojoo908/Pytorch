@@ -553,7 +553,7 @@ def sac_train(
                 f"| base_step={step_rate:4.1f} ({succ_count}/{attempt_count}) "
                 f"| succ_buf={succ_buf_total} growth@{len(succ_buf_total_history)}={succ_buf_growth} "
                 f"| alpha={base_bundle['alpha']:.3f}"
-                + (f" | agents={len(sampled_rules)} rules={','.join(sampled_rules)}" if sampled_rules is not None else "")
+                + (f" | agents={len(sampled_rules)}" if sampled_rules is not None else "")
             )
 
         if save_best_online and len(succ_buf_total_history) >= max(2, int(best_min_episodes)):

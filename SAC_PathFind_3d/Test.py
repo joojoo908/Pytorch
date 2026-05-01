@@ -89,7 +89,7 @@ def main():
                     help="If set, never auto-resume even if ckpt exists.")
 
     # Success mixing
-    ap.add_argument("--p-succ", type=float, default=0.10)
+    ap.add_argument("--p-succ", type=float, default=0.00)
     ap.add_argument("--succ-buffer-cap", type=int, default=200_000)
     ap.add_argument("--succ-gate-min", type=int, default=8192)
     ap.add_argument("--succ-ramp-cov", type=float, default=0.25)
