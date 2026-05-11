@@ -211,6 +211,23 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
     start_pos = np.array(env.agent_pos, dtype=np.float32).copy()
     goal_pos = np.array(env.goal_pos, dtype=np.float32).copy()
     max_steps = int(max_steps or getattr(env, "max_steps", 300))
+    initial_dists = np.linalg.norm(
+        np.asarray(env.goal_pos, dtype=np.float32)[None, :] - np.asarray(env.agent_positions, dtype=np.float32),
+        axis=1,
+    )
+    initial_total_agents = int(len(initial_dists))
+    initial_in_sense = int(np.count_nonzero(initial_dists <= float(getattr(env, "sense_radius", 0.0))))
+    farthest_agent_idx = int(np.argmax(initial_dists)) if initial_total_agents > 0 else -1
+    farthest_agent_dist = float(initial_dists[farthest_agent_idx]) if initial_total_agents > 0 else 0.0
+    farthest_agent_geo_dist = float("nan")
+    geo_distance_fn = getattr(env, "_geo_distance", None)
+    if initial_total_agents > 0 and callable(geo_distance_fn):
+        try:
+            geo_val = geo_distance_fn(np.asarray(env.agent_positions, dtype=np.float32)[farthest_agent_idx])
+            if geo_val is not None:
+                farthest_agent_geo_dist = float(geo_val)
+        except Exception:
+            farthest_agent_geo_dist = float("nan")
 
     agent_trajs = [[np.array(pos, dtype=np.float32).copy()] for pos in np.asarray(env.agent_positions, dtype=np.float32)]
     traj = [start_pos.copy()]
@@ -327,8 +344,9 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
             lines = [
                 f"Step: {step + 1}/{max_steps}",
                 f"Return: {ep_ret:.3f}",
-                f"Dist: {dist:.2f}",
-                f"Pos: ({env.agent_pos[0]:.1f}, {env.agent_height:.1f}, {env.agent_pos[1]:.1f})",
+                f"Farthest: A{farthest_agent_idx}",
+                f"Straight: {farthest_agent_dist:.1f}  Geo: {farthest_agent_geo_dist:.1f}",
+                f"Entered: {int(np.count_nonzero(np.asarray(final_info.get('in_sense_mask', np.zeros((initial_total_agents,), dtype=bool)), dtype=bool).reshape(-1)))}/{initial_total_agents}",
             ]
             if role_ids is not None:
                 role_ids_arr = np.asarray(role_ids, dtype=np.int32).reshape(-1)
@@ -366,20 +384,42 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
     else:
         outcome = "failed"
 
-    print(f"[Eval] {outcome} | return={ep_ret:.3f}")
-    return ep_ret, success, outcome, screen_bundle
+    terminal_mask = np.asarray(final_info.get("in_sense_mask", np.zeros((0,), dtype=bool)), dtype=bool).reshape(-1)
+    terminal_total_agents = int(len(terminal_mask)) if len(terminal_mask) > 0 else initial_total_agents
+    terminal_in_sense = int(np.count_nonzero(terminal_mask))
+    terminal_rate = 100.0 * terminal_in_sense / max(1, terminal_total_agents)
+
+    print(
+        f"[Eval] {outcome} | return={ep_ret:.3f} "
+        f"| start_in_sense={initial_in_sense:3d}/{initial_total_agents:3d} "
+        f"| farthest=A{farthest_agent_idx} straight={farthest_agent_dist:.1f} geo={farthest_agent_geo_dist:.1f} "
+        f"| in_sense_end={terminal_in_sense:3d}/{terminal_total_agents:3d} ({terminal_rate:5.1f}%)"
+    )
+    metrics = {
+        "start_in_sense": initial_in_sense,
+        "end_in_sense": terminal_in_sense,
+        "total_agents": terminal_total_agents,
+        "end_rate": terminal_rate,
+        "farthest_agent_idx": farthest_agent_idx,
+        "farthest_agent_dist": farthest_agent_dist,
+        "farthest_agent_geo_dist": farthest_agent_geo_dist,
+    }
+    return ep_ret, success, outcome, screen_bundle, metrics
 
 
 def run_multiple_evaluations(env, actor, episodes=10, max_steps=None, scale=0.03, visualize=True, visualize_every=1, auto_quit=True, save_last_csv=None):
     returns = []
     successes = 0
+    total_start_in_sense = 0
+    total_end_in_sense = 0
+    total_agents = 0
     screen_bundle = None
 
     for ep in range(episodes):
         sampled_rules = maybe_sample_agent_role_rules(env)
         vis = visualize and ((ep % visualize_every) == 0)
         save_csv = save_last_csv if ep == episodes - 1 else None
-        ret, succ, outcome, screen_bundle = evaluate_once(
+        ret, succ, outcome, screen_bundle, metrics = evaluate_once(
             env,
             actor,
             max_steps=max_steps,
@@ -390,8 +430,19 @@ def run_multiple_evaluations(env, actor, episodes=10, max_steps=None, scale=0.03
         )
         returns.append(ret)
         successes += int(succ)
+        total_start_in_sense += int(metrics["start_in_sense"])
+        total_end_in_sense += int(metrics["end_in_sense"])
+        total_agents += int(metrics["total_agents"])
         rule_summary = "" if sampled_rules is None else f" agents={len(sampled_rules)}"
-        print(f"[Episode {ep + 1}/{episodes}] return={ret:.3f} outcome={outcome}{rule_summary}")
+        print(
+            f"[Episode {ep + 1}/{episodes}] return={ret:.3f} outcome={outcome}"
+            f" start_in_sense={int(metrics['start_in_sense'])}/{int(metrics['total_agents'])}"
+            f" farthest=A{int(metrics['farthest_agent_idx'])}"
+            f" straight={float(metrics['farthest_agent_dist']):.1f}"
+            f" geo={float(metrics['farthest_agent_geo_dist']):.1f}"
+            f" in_sense_end={int(metrics['end_in_sense'])}/{int(metrics['total_agents'])}"
+            f" ({float(metrics['end_rate']):.1f}%){rule_summary}"
+        )
 
         if outcome == "aborted":
             print("[Info] Evaluation stopped by user.")
@@ -401,7 +452,13 @@ def run_multiple_evaluations(env, actor, episodes=10, max_steps=None, scale=0.03
         pygame.quit()
 
     avg_ret = float(np.mean(returns)) if returns else 0.0
-    print(f"[Summary] episodes={len(returns)} success={successes} ({100.0 * successes / max(1, len(returns)):.1f}%) avg_return={avg_ret:.3f}")
+    end_rate = 100.0 * total_end_in_sense / max(1, total_agents)
+    print(
+        f"[Summary] episodes={len(returns)} success={successes} ({100.0 * successes / max(1, len(returns)):.1f}%) "
+        f"start_in_sense={total_start_in_sense}/{total_agents} "
+        f"in_sense_end={total_end_in_sense}/{total_agents} ({end_rate:.1f}%) "
+        f"avg_return={avg_ret:.3f}"
+    )
     return returns
 
 

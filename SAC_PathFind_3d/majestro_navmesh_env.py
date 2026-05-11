@@ -1694,9 +1694,7 @@ class MajestroNavMeshEnv(gym.Env):
             else:
                 movement_target = tactical_target
 
-            detour_priority_allowed = waypoint is not None and (
-                fail_code > 0.5 or int(step_role_ids[idx]) == ROLE_BASE_MOVE
-            )
+            detour_priority_allowed = waypoint is not None
             if detour_priority_allowed:
                 move_ratio = 1.0 if target_dist <= 1e-6 else min(1.0, step_size / max(target_dist, 1e-6))
                 detour_height = float(self.agent_heights[idx]) + (float(waypoint_height) - float(self.agent_heights[idx])) * move_ratio

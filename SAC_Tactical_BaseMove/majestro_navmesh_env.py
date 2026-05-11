@@ -332,6 +332,7 @@ class MajestroNavMeshEnv(gym.Env):
         self._R_SUCCESS_ENTRY = 20.0
         self._R_SUCCESS_SUSTAIN = 2.0
         self._R_SUCCESS_DROP = 3.0
+        self._R_EXIT_PENALTY = 12.0
         self.role_rule = str(role_rule).strip().lower()
         self.agent_role_rules = None if agent_role_rules is None else [str(x).strip().lower() for x in agent_role_rules]
         self.role_selector = role_selector
@@ -776,10 +777,21 @@ class MajestroNavMeshEnv(gym.Env):
         return self._world_to_grid_rc(pos)
 
     def _compute_dynamic_horizon(self) -> int:
-        if self.dynamic_horizon_use_geodesic:
-            d_world = self._geo_distance(self.agent_pos)
-        else:
-            d_world = None
+        d_world = None
+        positions = np.asarray(self.agent_positions, dtype=np.float32)
+        if positions.ndim == 2 and positions.shape[0] > 0:
+            effective_dists = []
+            for pos in positions:
+                if self.dynamic_horizon_use_geodesic:
+                    gd = self._geo_distance(pos)
+                else:
+                    gd = None
+                if gd is None:
+                    effective_dists.append(float(np.linalg.norm(self.goal_pos - pos)))
+                else:
+                    effective_dists.append(float(gd))
+            if effective_dists:
+                d_world = max(effective_dists)
         if d_world is None:
             d_world = float(np.linalg.norm(self.goal_pos - self.agent_pos))
         t_min = int(math.ceil(d_world / max(self.step_size, 1e-6)))
@@ -1113,6 +1125,7 @@ class MajestroNavMeshEnv(gym.Env):
         new_pos: np.ndarray,
         collided: bool,
         detour_used: bool,
+        allow_success_entry: bool = True,
         old_path_dist: Optional[float] = None,
         new_path_dist: Optional[float] = None,
     ) -> Tuple[float, Dict[str, float], bool]:
@@ -1137,15 +1150,14 @@ class MajestroNavMeshEnv(gym.Env):
             new_path = float(np.linalg.norm(self.goal_pos - new_pos))
 
         path_progress = max(0.0, float(old_path) - float(new_path))
-        path_progress_bonus = 0.08 * min(path_progress / max(self.step_size, 1.0), 1.5)
+        path_progress_bonus = 0.12 * min(path_progress / max(self.step_size, 1.0), 1.5)
         base_bonus = path_progress_bonus
         terms["role_base_path_progress"] = path_progress_bonus
         entered_sense_radius = bool(old_goal_dist > float(self.sense_radius) and goal_dist <= float(self.sense_radius))
-        if entered_sense_radius:
+        rewarded_entry = bool(entered_sense_radius and allow_success_entry)
+        if rewarded_entry:
             base_bonus += 0.12
             terms["role_base_enter_radius"] = 0.12
-        if detour_used:
-            base_bonus += 0.02
         if collided:
             base_bonus -= 0.03
         speed = float(np.linalg.norm(self.agent_velocities[agent_index]))
@@ -1154,11 +1166,7 @@ class MajestroNavMeshEnv(gym.Env):
         terms["role_base_speed"] = speed_bonus
         bonus += base_bonus
         terms["role_base_move"] = base_bonus
-        tactical_success = bool(
-            entered_sense_radius
-            and (not collided)
-            and speed >= self.step_size * 0.45
-        )
+        tactical_success = bool(rewarded_entry)
 
         terms["tactical_success"] = 1.0 if tactical_success else 0.0
         return float(bonus), terms, tactical_success
@@ -1347,10 +1355,14 @@ class MajestroNavMeshEnv(gym.Env):
         self._stall_best = np.full((self.num_agents,), np.nan, dtype=np.float32)
         self._stall_wait = np.zeros((self.num_agents,), dtype=np.int32)
         self._prev_success_mask = np.zeros((self.num_agents,), dtype=bool)
+        self._prev_in_sense_mask = np.zeros((self.num_agents,), dtype=bool)
+        self._episode_success_rewarded = np.zeros((self.num_agents,), dtype=bool)
         for idx in range(self.num_agents):
             geo = self._geo_distance(self.agent_positions[idx])
             self._prev_geo[idx] = np.nan if geo is None else geo
             self._stall_best[idx] = geo if geo is not None else float(np.linalg.norm(self.goal_pos - self.agent_positions[idx]))
+            self._prev_in_sense_mask[idx] = bool(np.linalg.norm(self.goal_pos - self.agent_positions[idx]) <= float(self.sense_radius))
+            self._episode_success_rewarded[idx] = self._prev_in_sense_mask[idx]
 
         if self.dynamic_horizon:
             self.max_steps = self._compute_dynamic_horizon()
@@ -1531,6 +1543,7 @@ class MajestroNavMeshEnv(gym.Env):
                     self.agent_positions[idx],
                     bool(collisions[idx]),
                     bool(detour_used_codes[idx] > 0.5),
+                    allow_success_entry=(not bool(self._episode_success_rewarded[idx])),
                     old_path_dist=(float(old_geo) if old_geo is not None else None),
                     new_path_dist=(float(new_geo) if new_geo is not None else None),
                 )
@@ -1553,15 +1566,19 @@ class MajestroNavMeshEnv(gym.Env):
 
             was_success = bool(self._prev_success_mask[idx])
             is_success = bool(success_mask[idx])
+            was_in_sense = bool(self._prev_in_sense_mask[idx])
+            is_in_sense = bool(dists[idx] <= float(self.sense_radius))
             if is_success and not was_success:
                 rewards[idx] += self._R_SUCCESS_ENTRY
                 terms_list[idx]["success_entry"] = self._R_SUCCESS_ENTRY
-            elif is_success:
+                self._episode_success_rewarded[idx] = True
+            elif was_in_sense and is_in_sense:
                 rewards[idx] += self._R_SUCCESS_SUSTAIN
                 terms_list[idx]["success_sustain"] = self._R_SUCCESS_SUSTAIN
-            elif was_success:
-                rewards[idx] -= self._R_SUCCESS_DROP
-                terms_list[idx]["success_drop"] = -self._R_SUCCESS_DROP
+            if was_in_sense and not is_in_sense:
+                rewards[idx] -= self._R_EXIT_PENALTY
+                terms_list[idx]["exit_penalty"] = -self._R_EXIT_PENALTY
+            self._prev_in_sense_mask[idx] = is_in_sense
 
         terminated = False
 
@@ -1581,7 +1598,9 @@ class MajestroNavMeshEnv(gym.Env):
             "tactical_target": tactical_targets.copy(),
             "requested_target": requested_targets.copy(),
             "agent_positions": self.agent_positions.copy(),
+            "in_sense_mask": dists <= float(self.sense_radius),
             "success_mask": success_mask.copy(),
+            "success_count": int(np.count_nonzero(success_mask)),
             "role_ids": info_role_ids.copy(),
             "agent_role_rules": list(self.agent_role_rules) if self.agent_role_rules is not None else [self.role_rule] * self.num_agents,
             "role_targets": self.role_targets.copy(),

@@ -392,7 +392,7 @@ def sac_train(
     if base_bundle is None:
         base_bundle = _finalize_bundle(init_bundle(obs_dim, act_dim, device, actor_lr, critic_lr, succ_buffer_capacity))
 
-    recent_step_counts: deque[Tuple[int, int]] = deque(maxlen=100)
+    recent_terminal_counts: deque[Tuple[int, int]] = deque(maxlen=100)
     succ_buf_total_history: deque[int] = deque(maxlen=max(2, int(best_min_episodes)))
     best_score = -1.0
     alpha_frozen = False
@@ -405,9 +405,15 @@ def sac_train(
         done = False
         ep_steps = 0
         ep_reward = 0.0
-        ep_attempts = 0
-        ep_successes = 0
+        ep_initial_in_sense = 0
+        ep_terminal_in_sense = 0
+        ep_total_agents = 0
         recent_success_traces: Dict[int, deque] = {}
+        final_info: Dict[str, object] = {}
+        if hasattr(env, "agent_positions") and hasattr(env, "goal_pos") and hasattr(env, "sense_radius"):
+            init_dists = np.linalg.norm(np.asarray(env.goal_pos, dtype=np.float32)[None, :] - np.asarray(env.agent_positions, dtype=np.float32), axis=1)
+            ep_total_agents = int(len(init_dists))
+            ep_initial_in_sense = int(np.count_nonzero(init_dists <= float(env.sense_radius)))
 
         while (not done) and (ep_steps < (env.max_steps if max_steps is None else max_steps)):
             obs_arr = np.asarray(obs, dtype=np.float32)
@@ -428,14 +434,13 @@ def sac_train(
                 act = np.asarray(act, dtype=np.float32).reshape(1, -1)
 
             ep_reward += float(np.mean(reward_arr))
+            final_info = info if isinstance(info, dict) else {}
             success_mask_arr = np.asarray(info.get("success_mask", np.zeros((obs_arr.shape[0],), dtype=bool)), dtype=bool).reshape(-1)
             dist_values = np.asarray(info.get("dist_to_goal", np.full((obs_arr.shape[0],), -1.0, dtype=np.float32)), dtype=np.float32).reshape(-1)
 
             for agent_idx in range(obs_arr.shape[0]):
                 dist = None if agent_idx >= len(dist_values) else float(dist_values[agent_idx])
                 step_success = bool(agent_idx < len(success_mask_arr) and success_mask_arr[agent_idx])
-                ep_attempts += 1
-                ep_successes += int(step_success)
                 base_bundle["replay_buffer"].push(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done)
                 sample = (obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done, dist)
                 if agent_idx not in recent_success_traces:
@@ -532,10 +537,14 @@ def sac_train(
                 soft_update_(critic_1, target_critic_1, tau)
                 soft_update_(critic_2, target_critic_2, tau)
 
-        recent_step_counts.append((ep_successes, ep_attempts))
-        succ_count = sum(s for s, _ in recent_step_counts)
-        attempt_count = sum(a for _, a in recent_step_counts)
-        step_rate = 100.0 * succ_count / max(1, attempt_count)
+        terminal_mask = np.asarray(final_info.get("in_sense_mask", np.zeros((0,), dtype=bool)), dtype=bool).reshape(-1)
+        ep_total_agents = int(len(terminal_mask))
+        ep_terminal_in_sense = int(np.count_nonzero(terminal_mask))
+        ep_terminal_rate = 100.0 * ep_terminal_in_sense / max(1, ep_total_agents)
+        recent_terminal_counts.append((ep_terminal_in_sense, ep_total_agents))
+        recent_terminal_in_sense = sum(s for s, _ in recent_terminal_counts)
+        recent_terminal_agents = sum(a for _, a in recent_terminal_counts)
+        recent_terminal_rate = 100.0 * recent_terminal_in_sense / max(1, recent_terminal_agents)
         succ_buf_total = len(base_bundle["succ_replay_buffer"])
         succ_buf_total_history.append(succ_buf_total)
         succ_buf_growth = succ_buf_total - succ_buf_total_history[0] if len(succ_buf_total_history) >= 2 else 0
@@ -550,7 +559,9 @@ def sac_train(
         if (ep + 1) % 10 == 0:
             print(
                 f"[EP {ep + 1:5d}] steps={ep_steps:3d} R={ep_reward:8.2f} "
-                f"| base_step={step_rate:4.1f} ({succ_count}/{attempt_count}) "
+                f"| start_in_sense={ep_initial_in_sense:3d}/{ep_total_agents:3d} "
+                f"| in_sense_end={ep_terminal_in_sense:3d}/{ep_total_agents:3d} ({ep_terminal_rate:5.1f}%) "
+                f"| recent100={recent_terminal_in_sense:4d}/{recent_terminal_agents:4d} ({recent_terminal_rate:5.1f}%) "
                 f"| succ_buf={succ_buf_total} growth@{len(succ_buf_total_history)}={succ_buf_growth} "
                 f"| alpha={base_bundle['alpha']:.3f}"
                 + (f" | agents={len(sampled_rules)}" if sampled_rules is not None else "")

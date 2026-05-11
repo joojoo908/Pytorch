@@ -64,8 +64,8 @@ def main():
 
     # Dynamic horizon (ENV-side) — default ON for PyCharm convenience
     ap.add_argument("--dyn-horizon", action="store_true", default=True)
-    ap.add_argument("--dyn-kappa", type=float, default=1.6)
-    ap.add_argument("--dyn-tmin", type=int, default=64)
+    ap.add_argument("--dyn-kappa", type=float, default=2.5)
+    ap.add_argument("--dyn-tmin", type=int, default=128)
     ap.add_argument("--dyn-tmax", type=int, default=2048)
     ap.add_argument("--dyn-geo", action="store_true", default=True)
 
