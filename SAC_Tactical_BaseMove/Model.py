@@ -567,18 +567,21 @@ def sac_train(
                 + (f" | agents={len(sampled_rules)}" if sampled_rules is not None else "")
             )
 
-        if save_best_online and len(succ_buf_total_history) >= max(2, int(best_min_episodes)):
-            min_growth_delta = max(1.0, float(best_delta))
-            if float(succ_buf_growth) >= best_score + min_growth_delta:
-                best_score = float(succ_buf_growth)
+        if save_best_online and len(recent_terminal_counts) >= max(2, int(best_min_episodes)):
+            min_rate_delta = float(best_delta)
+            if float(recent_terminal_rate) >= best_score + min_rate_delta:
+                best_score = float(recent_terminal_rate)
                 best_snapshot = {
                     "episodes": ep + 1,
-                    "best_succ_buf_growth": best_score,
+                    "best_in_sense_end_rate": best_score,
+                    "recent_in_sense_end_rate": recent_terminal_rate,
+                    "recent_in_sense_end": recent_terminal_in_sense,
+                    "recent_total_agents": recent_terminal_agents,
                     "succ_buf_total": succ_buf_total,
                 }
                 save_sac_checkpoint(best_ckpt_path, base_bundle, extra=best_snapshot)
                 save_actor_checkpoint(best_actor_path, base_bundle)
-                print(f"[BEST] ep={ep + 1} growth={int(succ_buf_growth)} -> saved {best_actor_path}")
+                print(f"[BEST] ep={ep + 1} in_sense_end={recent_terminal_rate:.1f}% -> saved {best_actor_path}")
 
     save_actor_checkpoint("sac_actor_last.pth", base_bundle)
     return {"bundle": base_bundle}
