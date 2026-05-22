@@ -247,6 +247,7 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
             screen, clock, font, world_to_screen = screen_bundle
 
     ep_ret = 0.0
+    total_collisions = 0
     final_info = {}
     env_terminated = False
     env_truncated = False
@@ -266,6 +267,7 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
         action = policy_act(actor, obs)
         obs, reward, env_terminated, env_truncated, final_info = env.step(action)
         ep_ret += float(np.mean(np.asarray(reward, dtype=np.float32)))
+        total_collisions += int(np.count_nonzero(np.asarray(final_info.get("collided", False), dtype=bool)))
         traj.append(np.array(env.agent_pos, dtype=np.float32).copy())
         for idx, pos in enumerate(np.asarray(env.agent_positions, dtype=np.float32)):
             if idx < len(agent_trajs):
@@ -347,6 +349,7 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
                 f"Farthest: A{farthest_agent_idx}",
                 f"Straight: {farthest_agent_dist:.1f}  Geo: {farthest_agent_geo_dist:.1f}",
                 f"Entered: {int(np.count_nonzero(np.asarray(final_info.get('in_sense_mask', np.zeros((initial_total_agents,), dtype=bool)), dtype=bool).reshape(-1)))}/{initial_total_agents}",
+                f"Collisions: {total_collisions}",
             ]
             if role_ids is not None:
                 role_ids_arr = np.asarray(role_ids, dtype=np.int32).reshape(-1)
@@ -393,13 +396,15 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
         f"[Eval] {outcome} | return={ep_ret:.3f} "
         f"| start_in_sense={initial_in_sense:3d}/{initial_total_agents:3d} "
         f"| farthest=A{farthest_agent_idx} straight={farthest_agent_dist:.1f} geo={farthest_agent_geo_dist:.1f} "
-        f"| in_sense_end={terminal_in_sense:3d}/{terminal_total_agents:3d} ({terminal_rate:5.1f}%)"
+        f"| in_sense_end={terminal_in_sense:3d}/{terminal_total_agents:3d} ({terminal_rate:5.1f}%) "
+        f"| collisions={total_collisions}"
     )
     metrics = {
         "start_in_sense": initial_in_sense,
         "end_in_sense": terminal_in_sense,
         "total_agents": terminal_total_agents,
         "end_rate": terminal_rate,
+        "collisions": total_collisions,
         "farthest_agent_idx": farthest_agent_idx,
         "farthest_agent_dist": farthest_agent_dist,
         "farthest_agent_geo_dist": farthest_agent_geo_dist,
@@ -412,6 +417,7 @@ def run_multiple_evaluations(env, actor, episodes=10, max_steps=None, scale=0.03
     successes = 0
     total_start_in_sense = 0
     total_end_in_sense = 0
+    total_collisions = 0
     total_agents = 0
     screen_bundle = None
 
@@ -432,6 +438,7 @@ def run_multiple_evaluations(env, actor, episodes=10, max_steps=None, scale=0.03
         successes += int(succ)
         total_start_in_sense += int(metrics["start_in_sense"])
         total_end_in_sense += int(metrics["end_in_sense"])
+        total_collisions += int(metrics["collisions"])
         total_agents += int(metrics["total_agents"])
         rule_summary = "" if sampled_rules is None else f" agents={len(sampled_rules)}"
         print(
@@ -441,6 +448,7 @@ def run_multiple_evaluations(env, actor, episodes=10, max_steps=None, scale=0.03
             f" straight={float(metrics['farthest_agent_dist']):.1f}"
             f" geo={float(metrics['farthest_agent_geo_dist']):.1f}"
             f" in_sense_end={int(metrics['end_in_sense'])}/{int(metrics['total_agents'])}"
+            f" collisions={int(metrics['collisions'])}"
             f" ({float(metrics['end_rate']):.1f}%){rule_summary}"
         )
 
@@ -457,6 +465,7 @@ def run_multiple_evaluations(env, actor, episodes=10, max_steps=None, scale=0.03
         f"[Summary] episodes={len(returns)} success={successes} ({100.0 * successes / max(1, len(returns)):.1f}%) "
         f"start_in_sense={total_start_in_sense}/{total_agents} "
         f"in_sense_end={total_end_in_sense}/{total_agents} ({end_rate:.1f}%) "
+        f"collisions={total_collisions} "
         f"avg_return={avg_ret:.3f}"
     )
     return returns
@@ -472,11 +481,12 @@ if __name__ == "__main__":
     ap.add_argument("--move-step-size", type=float, default=120.0)
     ap.add_argument("--tactical-target-radius", type=float, default=600.0)
     ap.add_argument("--num-other-agents", type=int, default=4)
-    ap.add_argument("--random-agent-count-min", type=int, default=3)
+    ap.add_argument("--random-agent-count-min", type=int, default=18)
     ap.add_argument("--random-agent-count-max", type=int, default=20)
     ap.add_argument("--observed-other-agents", type=int, default=3)
     ap.add_argument("--agent-radius", type=float, default=90.0)
     ap.add_argument("--sense-radius", type=float, default=1000.0)
+    ap.add_argument("--resolve-agent-collisions", action="store_true", default=False)
     ap.add_argument("--goal-spawn-min-scale", type=float, default=4.0)
     ap.add_argument("--agent-spawn-min-scale", type=float, default=2.0)
     ap.add_argument("--agent-spawn-max-scale", type=float, default=3.0)
@@ -495,6 +505,7 @@ if __name__ == "__main__":
         observed_other_agents=args.observed_other_agents,
         agent_radius=args.agent_radius,
         sense_radius=args.sense_radius,
+        resolve_agent_collisions=args.resolve_agent_collisions,
         goal_spawn_min_scale=args.goal_spawn_min_scale,
         agent_spawn_min_scale=args.agent_spawn_min_scale,
         agent_spawn_max_scale=args.agent_spawn_max_scale,
@@ -504,6 +515,7 @@ if __name__ == "__main__":
     env.random_agent_count_min = int(args.random_agent_count_min)
     env.random_agent_count_max = int(max(args.random_agent_count_min, args.random_agent_count_max))
     print(f"[AGENT-COUNT] random total agents per episode: {env.random_agent_count_min}..{env.random_agent_count_max}")
+    print(f"[ENV] resolve_agent_collisions={bool(args.resolve_agent_collisions)}")
 
     if not os.path.exists(actor_path):
         print(f"[WARN] {actor_path} not found. Train with Test.py first.")

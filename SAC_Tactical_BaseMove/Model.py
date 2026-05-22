@@ -195,7 +195,7 @@ def mlp(in_dim: int, hidden: Tuple[int, ...], out_dim: int, act=nn.ReLU) -> nn.S
 
 
 class GaussianPolicy(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, hidden: Tuple[int, ...] = (512, 512, 512), log_std_bounds=(-5.0, 2.0)):
+    def __init__(self, obs_dim: int, act_dim: int, hidden: Tuple[int, ...] = (768, 768, 768), log_std_bounds=(-5.0, 2.0)):
         super().__init__()
         self.net = mlp(obs_dim, hidden, 2 * act_dim)
         self.act_dim = act_dim
@@ -225,7 +225,7 @@ class GaussianPolicy(nn.Module):
 
 
 class QNetwork(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, hidden: Tuple[int, ...] = (512, 512, 512)):
+    def __init__(self, obs_dim: int, act_dim: int, hidden: Tuple[int, ...] = (768, 768, 768)):
         super().__init__()
         self.net = mlp(obs_dim + act_dim, hidden, 1)
 
@@ -405,6 +405,7 @@ def sac_train(
         done = False
         ep_steps = 0
         ep_reward = 0.0
+        ep_collision_total = 0
         ep_initial_in_sense = 0
         ep_terminal_in_sense = 0
         ep_total_agents = 0
@@ -437,6 +438,8 @@ def sac_train(
             final_info = info if isinstance(info, dict) else {}
             success_mask_arr = np.asarray(info.get("success_mask", np.zeros((obs_arr.shape[0],), dtype=bool)), dtype=bool).reshape(-1)
             dist_values = np.asarray(info.get("dist_to_goal", np.full((obs_arr.shape[0],), -1.0, dtype=np.float32)), dtype=np.float32).reshape(-1)
+            collided_arr = np.asarray(info.get("collided", np.zeros((obs_arr.shape[0],), dtype=bool)), dtype=bool).reshape(-1)
+            ep_collision_total += int(np.count_nonzero(collided_arr))
 
             for agent_idx in range(obs_arr.shape[0]):
                 dist = None if agent_idx >= len(dist_values) else float(dist_values[agent_idx])
@@ -561,6 +564,7 @@ def sac_train(
                 f"[EP {ep + 1:5d}] steps={ep_steps:3d} R={ep_reward:8.2f} "
                 f"| start_in_sense={ep_initial_in_sense:3d}/{ep_total_agents:3d} "
                 f"| in_sense_end={ep_terminal_in_sense:3d}/{ep_total_agents:3d} ({ep_terminal_rate:5.1f}%) "
+                f"| collisions={ep_collision_total:4d} "
                 f"| recent100={recent_terminal_in_sense:4d}/{recent_terminal_agents:4d} ({recent_terminal_rate:5.1f}%) "
                 f"| succ_buf={succ_buf_total} growth@{len(succ_buf_total_history)}={succ_buf_growth} "
                 f"| alpha={base_bundle['alpha']:.3f}"

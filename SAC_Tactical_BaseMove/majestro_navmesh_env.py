@@ -288,6 +288,7 @@ class MajestroNavMeshEnv(gym.Env):
         ray_count: int = 8,
         ray_length: float = 600.0,
         sense_radius: float | None = None,
+        resolve_agent_collisions: bool = False,
         collision_penalty: float = 0.35,
         stall_penalty: float = 0.05,
         stall_patience: int = 20,
@@ -324,6 +325,7 @@ class MajestroNavMeshEnv(gym.Env):
         self.ray_count = int(ray_count)
         self.ray_length = float(ray_length)
         self.sense_radius = float(ray_length if sense_radius is None else sense_radius)
+        self.resolve_agent_collisions = bool(resolve_agent_collisions)
         self.collision_penalty = float(collision_penalty)
         self.stall_penalty = float(stall_penalty)
         self.stall_patience = int(stall_patience)
@@ -688,27 +690,28 @@ class MajestroNavMeshEnv(gym.Env):
         agent_blocked = False
         if self._collides_with_other_agents(moved, ignore_index=ignore_index):
             agent_blocked = True
-            direction = moved - start
-            dist = float(np.linalg.norm(direction))
-            if dist > 1e-6:
-                lo = start.copy()
-                hi = moved.copy()
-                best = start.copy()
-                best_height = float(start_height if start_height is not None else moved_height)
-                for _ in range(7):
-                    mid = (lo + hi) * 0.5
-                    mid_h = self._sample_height(mid)
-                    if mid_h is None or self._collides_with_other_agents(mid, ignore_index=ignore_index):
-                        hi = mid
-                    else:
-                        best = mid
-                        best_height = float(mid_h)
-                        lo = mid
-                moved = best.astype(np.float32)
-                moved_height = best_height
-            else:
-                moved = start.copy()
-                moved_height = float(start_height if start_height is not None else saved_height)
+            if self.resolve_agent_collisions:
+                direction = moved - start
+                dist = float(np.linalg.norm(direction))
+                if dist > 1e-6:
+                    lo = start.copy()
+                    hi = moved.copy()
+                    best = start.copy()
+                    best_height = float(start_height if start_height is not None else moved_height)
+                    for _ in range(7):
+                        mid = (lo + hi) * 0.5
+                        mid_h = self._sample_height(mid)
+                        if mid_h is None or self._collides_with_other_agents(mid, ignore_index=ignore_index):
+                            hi = mid
+                        else:
+                            best = mid
+                            best_height = float(mid_h)
+                            lo = mid
+                    moved = best.astype(np.float32)
+                    moved_height = best_height
+                else:
+                    moved = start.copy()
+                    moved_height = float(start_height if start_height is not None else saved_height)
 
         self.agent_height = saved_height
         return moved, float(moved_height), bool(nav_collided or agent_blocked)
@@ -1612,6 +1615,7 @@ class MajestroNavMeshEnv(gym.Env):
             "detour_forced_step": detour_forced_step_codes.copy(),
             "detour_priority_step": detour_priority_step_codes.copy(),
             "detour_enabled": bool(self._detour_enabled),
+            "resolve_agent_collisions": bool(self.resolve_agent_collisions),
             "detour_error": self._detour_last_error,
         }
         self._prev_success_mask = success_mask.copy()
