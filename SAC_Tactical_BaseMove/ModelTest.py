@@ -22,7 +22,7 @@ ROLE_COLORS = {
     2: (160, 255, 160),
 }
 
-DETOUR_PATH_COLOR = (80, 255, 220)
+DETOUR_PATH_COLOR = (150, 150, 150)
 
 
 def maybe_sample_agent_role_rules(env):
@@ -52,16 +52,16 @@ def maybe_sample_agent_role_rules(env):
     return chosen
 
 
-def make_world_to_screen(bounds_min, bounds_max, scale):
+def make_world_to_screen(bounds_min, bounds_max, scale, y_scale=1.0):
     min_x, min_z = float(bounds_min[0]), float(bounds_min[1])
     max_x, max_z = float(bounds_max[0]), float(bounds_max[1])
     width = max(1, int((max_x - min_x) * scale))
-    height = max(1, int((max_z - min_z) * scale))
+    height = max(1, int((max_z - min_z) * scale * y_scale))
 
     def world_to_screen(p):
         x, z = float(p[0]), float(p[1])
         sx = int((x - min_x) * scale)
-        sy = int((max_z - z) * scale)
+        sy = int((max_z - z) * scale * y_scale)
         return sx, sy
 
     return width, height, world_to_screen
@@ -204,7 +204,245 @@ def draw_navmesh_overlay(screen, env, world_to_screen):
             pygame.draw.circle(screen, color, (sx, sy), step)
 
 
-def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, visualize=True, save_csv_path=None):
+def _snapshot_env_sim_state(env):
+    return {
+        "agent_positions": np.asarray(env.agent_positions, dtype=np.float32).copy(),
+        "agent_heights": np.asarray(env.agent_heights, dtype=np.float32).copy(),
+        "agent_velocities": np.asarray(env.agent_velocities, dtype=np.float32).copy(),
+        "current_detour_waypoints": np.asarray(env.current_detour_waypoints, dtype=np.float32).copy(),
+        "current_detour_waypoint_heights": np.asarray(env.current_detour_waypoint_heights, dtype=np.float32).copy(),
+        "agent_pos": np.asarray(env.agent_pos, dtype=np.float32).copy(),
+        "agent_height": float(env.agent_height),
+    }
+
+
+def _apply_env_sim_state(env, state):
+    env.agent_positions = np.asarray(state["agent_positions"], dtype=np.float32).copy()
+    env.agent_heights = np.asarray(state["agent_heights"], dtype=np.float32).copy()
+    env.agent_velocities = np.asarray(state["agent_velocities"], dtype=np.float32).copy()
+    env.current_detour_waypoints = np.asarray(state["current_detour_waypoints"], dtype=np.float32).copy()
+    env.current_detour_waypoint_heights = np.asarray(state["current_detour_waypoint_heights"], dtype=np.float32).copy()
+    env.agent_pos = np.asarray(state["agent_pos"], dtype=np.float32).copy()
+    env.agent_height = float(state["agent_height"])
+
+
+def _init_detour_reference_state(env):
+    return {
+        "agent_positions": np.asarray(env.agent_positions, dtype=np.float32).copy(),
+        "agent_heights": np.asarray(env.agent_heights, dtype=np.float32).copy(),
+        "agent_velocities": np.zeros_like(np.asarray(env.agent_velocities, dtype=np.float32)),
+        "current_detour_waypoints": np.full_like(np.asarray(env.current_detour_waypoints, dtype=np.float32), np.nan),
+        "current_detour_waypoint_heights": np.full_like(np.asarray(env.current_detour_waypoint_heights, dtype=np.float32), np.nan),
+        "agent_pos": np.asarray(env.agent_pos, dtype=np.float32).copy(),
+        "agent_height": float(env.agent_height),
+        "collision_total": 0,
+    }
+
+
+def _compute_detour_preview_paths(env):
+    preview_paths = []
+    positions = np.asarray(env.agent_positions, dtype=np.float32)
+    heights = np.asarray(env.agent_heights, dtype=np.float32)
+    for idx, pos in enumerate(positions):
+        start_height = float(heights[idx]) if idx < len(heights) else None
+        path = recover_descent_path_world(env, pos, start_height=start_height, max_len=256)
+        preview_paths.append([np.asarray(p, dtype=np.float32).copy() for p in path])
+    return preview_paths
+
+
+def _step_detour_reference(env, ref_state):
+    saved = _snapshot_env_sim_state(env)
+    working = {
+        "agent_positions": np.asarray(ref_state["agent_positions"], dtype=np.float32).copy(),
+        "agent_heights": np.asarray(ref_state["agent_heights"], dtype=np.float32).copy(),
+        "agent_velocities": np.asarray(ref_state["agent_velocities"], dtype=np.float32).copy(),
+        "current_detour_waypoints": np.asarray(ref_state["current_detour_waypoints"], dtype=np.float32).copy(),
+        "current_detour_waypoint_heights": np.asarray(ref_state["current_detour_waypoint_heights"], dtype=np.float32).copy(),
+        "agent_pos": np.asarray(ref_state["agent_pos"], dtype=np.float32).copy(),
+        "agent_height": float(ref_state["agent_height"]),
+    }
+    _apply_env_sim_state(env, working)
+
+    old_positions = env.agent_positions.copy()
+    collisions = np.zeros((env.num_agents,), dtype=bool)
+    tactical_targets = np.zeros_like(env.agent_positions)
+    goal_targets = np.repeat(np.asarray(env.goal_pos, dtype=np.float32).reshape(1, 2), env.num_agents, axis=0)
+
+    for idx in range(env.num_agents):
+        old_pos = old_positions[idx]
+        waypoint = None
+        waypoint_height = float("nan")
+        if getattr(env, "_detour_enabled", False):
+            reach_tol = max(env._grid_cell_size * 0.50, env.step_size * 0.35)
+            cached_waypoint = env.current_detour_waypoints[idx]
+            cached_waypoint_height = float(env.current_detour_waypoint_heights[idx])
+            if np.all(np.isfinite(cached_waypoint)):
+                cached_dist = float(np.linalg.norm(cached_waypoint - old_pos))
+                if cached_dist > reach_tol and np.isfinite(cached_waypoint_height):
+                    waypoint = cached_waypoint.astype(np.float32)
+                    waypoint_height = cached_waypoint_height
+            if waypoint is None:
+                detour_result = env._detour_next_waypoint_with_min_progress(
+                    old_pos,
+                    np.asarray(env.goal_pos, dtype=np.float32),
+                    min_progress=max(env._grid_cell_size * 0.50, env.step_size * 0.25),
+                    height=float(env.agent_heights[idx]),
+                    target_height=float(env.goal_height),
+                )
+                if detour_result is not None:
+                    waypoint, waypoint_height = detour_result
+                    env.current_detour_waypoints[idx] = waypoint.astype(np.float32)
+                    env.current_detour_waypoint_heights[idx] = float(waypoint_height)
+                else:
+                    env.current_detour_waypoints[idx] = np.array([np.nan, np.nan], dtype=np.float32)
+                    env.current_detour_waypoint_heights[idx] = np.float32(np.nan)
+        else:
+            waypoint = env._geo_next_waypoint(old_pos, max_search=3)
+
+        tactical_target = np.asarray(env.goal_pos, dtype=np.float32) if waypoint is None else np.asarray(waypoint, dtype=np.float32)
+        to_target = tactical_target - old_pos
+        target_dist = float(np.linalg.norm(to_target))
+        if target_dist > env.step_size and target_dist > 1e-6:
+            movement_target = old_pos + (to_target / target_dist) * env.step_size
+        else:
+            movement_target = tactical_target
+
+        detour_priority_allowed = waypoint is not None and np.isfinite(waypoint_height)
+        if detour_priority_allowed:
+            move_ratio = 1.0 if target_dist <= 1e-6 else min(1.0, env.step_size / max(target_dist, 1e-6))
+            detour_height = float(env.agent_heights[idx]) + (float(waypoint_height) - float(env.agent_heights[idx])) * move_ratio
+            if np.isfinite(detour_height) and not env._collides_with_other_agents(movement_target, ignore_index=idx):
+                new_pos = movement_target.astype(np.float32)
+                new_height = float(detour_height)
+                collided = False
+            else:
+                new_pos, new_height, collided = env._move_with_agent_avoidance(
+                    old_pos,
+                    movement_target,
+                    ignore_index=idx,
+                    start_height=float(env.agent_heights[idx]),
+                )
+        else:
+            new_pos, new_height, collided = env._move_with_agent_avoidance(
+                old_pos,
+                movement_target,
+                ignore_index=idx,
+                start_height=float(env.agent_heights[idx]),
+            )
+
+        env.agent_positions[idx] = new_pos
+        env.agent_heights[idx] = new_height
+        env.agent_velocities[idx] = new_pos - old_pos
+        tactical_targets[idx] = tactical_target
+        collisions[idx] = collided
+
+        current_wp = env.current_detour_waypoints[idx]
+        if np.all(np.isfinite(current_wp)):
+            if float(np.linalg.norm(current_wp - new_pos)) <= max(env._grid_cell_size * 0.50, env.step_size * 0.20):
+                env.current_detour_waypoints[idx] = np.array([np.nan, np.nan], dtype=np.float32)
+                env.current_detour_waypoint_heights[idx] = np.float32(np.nan)
+
+    env.agent_pos = env.agent_positions[0].copy()
+    env.agent_height = float(env.agent_heights[0])
+
+    dists = np.linalg.norm(np.asarray(env.goal_pos, dtype=np.float32)[None, :] - env.agent_positions, axis=1).astype(np.float32)
+    in_sense_mask = dists <= float(env.sense_radius)
+    ref_state["agent_positions"] = env.agent_positions.copy()
+    ref_state["agent_heights"] = env.agent_heights.copy()
+    ref_state["agent_velocities"] = env.agent_velocities.copy()
+    ref_state["current_detour_waypoints"] = env.current_detour_waypoints.copy()
+    ref_state["current_detour_waypoint_heights"] = env.current_detour_waypoint_heights.copy()
+    ref_state["agent_pos"] = env.agent_pos.copy()
+    ref_state["agent_height"] = float(env.agent_height)
+    ref_state["collision_total"] = int(ref_state.get("collision_total", 0)) + int(np.count_nonzero(collisions))
+
+    info = {
+        "agent_positions": env.agent_positions.copy(),
+        "agent_heights": env.agent_heights.copy(),
+        "agent_velocities": env.agent_velocities.copy(),
+        "collided": collisions.copy(),
+        "collision_total": int(ref_state["collision_total"]),
+        "goal_pos": np.asarray(env.goal_pos, dtype=np.float32).copy(),
+        "in_sense_mask": in_sense_mask.copy(),
+        "role_ids": np.full((env.num_agents,), 2, dtype=np.int32),
+        "tactical_target": tactical_targets.copy(),
+        "role_targets": goal_targets.copy(),
+    }
+
+    _apply_env_sim_state(env, saved)
+    return info
+
+
+def _draw_sim_panel(screen, env, world_to_screen, x_offset, font, title, trajs, sim_info, step, max_steps, extra_lines, scale):
+    def panel_world_to_screen(p):
+        sx, sy = world_to_screen(p)
+        return sx + x_offset, sy
+
+    draw_navmesh_overlay(screen, env, panel_world_to_screen)
+
+    sense_px = max(1, int(round(float(getattr(env, "sense_radius", 0.0)) * float(scale))))
+
+    positions = np.asarray(sim_info.get("agent_positions", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+    role_ids = np.asarray(sim_info.get("role_ids", np.zeros((len(trajs),), dtype=np.int32)), dtype=np.int32).reshape(-1)
+    tactical_target = np.asarray(sim_info.get("tactical_target", np.zeros_like(positions)), dtype=np.float32)
+    role_targets = np.asarray(sim_info.get("role_targets", np.zeros_like(positions)), dtype=np.float32)
+    preview_paths = sim_info.get("preview_paths") or []
+
+    if len(positions) > 0:
+        for idx, pos in enumerate(positions):
+            role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
+            color = ROLE_COLORS.get(role_id, (160, 160, 160))
+            pygame.draw.circle(screen, color, panel_world_to_screen(pos), sense_px, 1)
+
+    for path in preview_paths:
+        if len(path) < 2:
+            continue
+        pygame.draw.lines(screen, DETOUR_PATH_COLOR, False, [panel_world_to_screen(p) for p in path], 3)
+
+    for idx, points in enumerate(trajs):
+        if len(points) < 2:
+            continue
+        role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
+        color = ROLE_COLORS.get(role_id, (160, 160, 160))
+        pygame.draw.lines(screen, color, False, [panel_world_to_screen(p) for p in points], 2)
+
+    if tactical_target.size > 0:
+        for idx, target in enumerate(np.asarray(tactical_target, dtype=np.float32)):
+            color = (120, 120, 240) if idx == 0 else (110, 110, 170)
+            pygame.draw.circle(screen, color, panel_world_to_screen(target), 4 if idx == 0 else 3)
+
+    if role_targets.size > 0:
+        for idx, role_target in enumerate(np.asarray(role_targets, dtype=np.float32)):
+            role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
+            color = ROLE_COLORS.get(role_id, (170, 110, 110))
+            pygame.draw.circle(screen, color, panel_world_to_screen(role_target), 3, 1)
+
+    for idx, other in enumerate(positions):
+        role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
+        color = ROLE_COLORS.get(role_id, (200, 140, 70))
+        sx, sy = panel_world_to_screen(other)
+        pygame.draw.circle(screen, color, (sx, sy), 4)
+        surf = font.render(f"A{idx}", True, color)
+        screen.blit(surf, (sx + 6, sy - 10))
+
+    goal_pos = np.asarray(sim_info.get("goal_pos", np.asarray(env.goal_pos, dtype=np.float32)), dtype=np.float32)
+    if goal_pos.size >= 2:
+        pygame.draw.circle(screen, (230, 90, 90), panel_world_to_screen(goal_pos), 6)
+    if len(positions) > 0:
+        pygame.draw.circle(screen, (255, 255, 255), panel_world_to_screen(positions[0]), 5, 1)
+
+    pygame.draw.line(screen, (55, 60, 66), (x_offset, 0), (x_offset, screen.get_height()), 1)
+    title_surf = font.render(title, True, (255, 220, 140))
+    screen.blit(title_surf, (x_offset + 8, 8))
+
+    y = 28
+    for line in [f"Step: {step + 1}/{max_steps}", *extra_lines]:
+        surf = font.render(line, True, (220, 220, 220))
+        screen.blit(surf, (x_offset + 8, y))
+        y += 18
+
+
+def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, visualize=True, save_csv_path=None, visualize_detour_compare=True):
     obs, info = reset_env_compat(env)
     actor.eval()
 
@@ -230,6 +468,20 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
             farthest_agent_geo_dist = float("nan")
 
     agent_trajs = [[np.array(pos, dtype=np.float32).copy()] for pos in np.asarray(env.agent_positions, dtype=np.float32)]
+    detour_ref_state = _init_detour_reference_state(env)
+    detour_trajs = [[np.array(pos, dtype=np.float32).copy()] for pos in np.asarray(env.agent_positions, dtype=np.float32)]
+    detour_preview_paths = _compute_detour_preview_paths(env)
+    detour_info = {
+        "agent_positions": np.asarray(env.agent_positions, dtype=np.float32).copy(),
+        "goal_pos": np.asarray(env.goal_pos, dtype=np.float32).copy(),
+        "in_sense_mask": initial_dists <= float(getattr(env, "sense_radius", 0.0)),
+        "collided": np.zeros((initial_total_agents,), dtype=bool),
+        "collision_total": 0,
+        "role_ids": np.full((initial_total_agents,), 2, dtype=np.int32),
+        "tactical_target": np.repeat(np.asarray(env.goal_pos, dtype=np.float32).reshape(1, 2), initial_total_agents, axis=0),
+        "role_targets": np.repeat(np.asarray(env.goal_pos, dtype=np.float32).reshape(1, 2), initial_total_agents, axis=0),
+        "preview_paths": detour_preview_paths,
+    }
     traj = [start_pos.copy()]
     screen = clock = font = None
     world_to_screen = None
@@ -237,14 +489,15 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
     if visualize and HAS_PYGAME:
         if screen_bundle is None:
             pygame.init()
-            width, height, world_to_screen = make_world_to_screen(env.bounds_min, env.bounds_max, scale)
-            screen = pygame.display.set_mode((width, height))
+            width, height, world_to_screen = make_world_to_screen(env.bounds_min, env.bounds_max, scale, y_scale=0.90)
+            compare_enabled = bool(visualize_detour_compare)
+            screen = pygame.display.set_mode((width * (2 if compare_enabled else 1), height))
             pygame.display.set_caption("ModelTest - Majestro NavMesh")
             clock = pygame.time.Clock()
             font = pygame.font.SysFont("consolas", 16)
-            screen_bundle = (screen, clock, font, world_to_screen)
+            screen_bundle = (screen, clock, font, world_to_screen, width, compare_enabled)
         else:
-            screen, clock, font, world_to_screen = screen_bundle
+            screen, clock, font, world_to_screen, width, compare_enabled = screen_bundle
 
     ep_ret = 0.0
     total_collisions = 0
@@ -268,6 +521,12 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
         obs, reward, env_terminated, env_truncated, final_info = env.step(action)
         ep_ret += float(np.mean(np.asarray(reward, dtype=np.float32)))
         total_collisions += int(np.count_nonzero(np.asarray(final_info.get("collided", False), dtype=bool)))
+        if visualize_detour_compare:
+            detour_info = _step_detour_reference(env, detour_ref_state)
+            detour_info["preview_paths"] = detour_preview_paths
+            for idx, pos in enumerate(np.asarray(detour_info.get("agent_positions", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)):
+                if idx < len(detour_trajs):
+                    detour_trajs[idx].append(pos.copy())
         traj.append(np.array(env.agent_pos, dtype=np.float32).copy())
         for idx, pos in enumerate(np.asarray(env.agent_positions, dtype=np.float32)):
             if idx < len(agent_trajs):
@@ -275,76 +534,13 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
 
         if visualize and HAS_PYGAME and screen is not None:
             screen.fill((14, 16, 20))
-            draw_navmesh_overlay(screen, env, world_to_screen)
-
             role_ids = final_info.get("role_ids")
             if role_ids is None:
                 role_ids = np.zeros((len(agent_trajs),), dtype=np.int32)
             else:
                 role_ids = np.asarray(role_ids).reshape(-1)
 
-            sense_radius = float(getattr(env, "sense_radius", 0.0))
-            sense_px = max(1, int(round(sense_radius * scale)))
-            if sense_px > 0:
-                for idx, pos in enumerate(np.asarray(env.agent_positions, dtype=np.float32)):
-                    role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
-                    color = ROLE_COLORS.get(role_id, (160, 160, 160))
-                    pygame.draw.circle(screen, color, world_to_screen(pos), sense_px, 1)
-
-            sensor_fail_codes = final_info.get("sensor_fail_code")
-            fail_arr = None if sensor_fail_codes is None else np.asarray(sensor_fail_codes, dtype=np.float32).reshape(-1)
-            if fail_arr is not None:
-                for idx, pos in enumerate(np.asarray(env.agent_positions, dtype=np.float32)):
-                    if idx >= len(fail_arr) or fail_arr[idx] <= 0.5:
-                        continue
-                    start_height = None
-                    if idx < len(env.agent_heights):
-                        start_height = float(env.agent_heights[idx])
-                    path = recover_descent_path_world(env, pos, start_height=start_height, max_len=256)
-                    if len(path) >= 2:
-                        pygame.draw.lines(screen, DETOUR_PATH_COLOR, False, [world_to_screen(p) for p in path], 2)
-
-            for idx, points in enumerate(agent_trajs):
-                if len(points) < 2:
-                    continue
-                role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
-                color = ROLE_COLORS.get(role_id, (160, 160, 160))
-                pygame.draw.lines(screen, color, False, [world_to_screen(p) for p in points], 2)
-
-            tactical_target = final_info.get("tactical_target")
-            if tactical_target is not None:
-                tactical_target = np.asarray(tactical_target, dtype=np.float32)
-                if tactical_target.ndim == 1:
-                    pygame.draw.circle(screen, (120, 120, 240), world_to_screen(tactical_target), 4)
-                else:
-                    pygame.draw.circle(screen, (120, 120, 240), world_to_screen(tactical_target[0]), 4)
-                    for other_target in tactical_target[1:]:
-                        pygame.draw.circle(screen, (110, 110, 170), world_to_screen(other_target), 3)
-
-            role_targets = final_info.get("role_targets")
-            if role_targets is not None:
-                for idx, role_target in enumerate(np.asarray(role_targets, dtype=np.float32)):
-                    role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
-                    color = ROLE_COLORS.get(role_id, (170, 110, 110))
-                    pygame.draw.circle(screen, color, world_to_screen(role_target), 3, 1)
-
-            agent_positions = final_info.get("agent_positions")
-            if agent_positions is not None:
-                for idx, other in enumerate(np.asarray(agent_positions, dtype=np.float32)):
-                    role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
-                    color = ROLE_COLORS.get(role_id, (200, 140, 70))
-                    sx, sy = world_to_screen(other)
-                    pygame.draw.circle(screen, color, (sx, sy), 4)
-                    label = f"A{idx}"
-                    surf = font.render(label, True, color)
-                    screen.blit(surf, (sx + 6, sy - 10))
-
-            pygame.draw.circle(screen, (230, 90, 90), world_to_screen(goal_pos), 6)
-            pygame.draw.circle(screen, (255, 255, 255), world_to_screen(env.agent_pos), 5, 1)
-
-            dist = float(np.linalg.norm(env.goal_pos - env.agent_pos))
-            lines = [
-                f"Step: {step + 1}/{max_steps}",
+            actor_lines = [
                 f"Return: {ep_ret:.3f}",
                 f"Farthest: A{farthest_agent_idx}",
                 f"Straight: {farthest_agent_dist:.1f}  Geo: {farthest_agent_geo_dist:.1f}",
@@ -355,12 +551,53 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
                 role_ids_arr = np.asarray(role_ids, dtype=np.int32).reshape(-1)
                 none_count = int(np.sum(role_ids_arr == -1))
                 base_move_count = int(np.sum(role_ids_arr == 2))
-                lines.append(f"Roles: none={none_count} base_move={base_move_count}")
-            y = 8
-            for line in lines:
-                surf = font.render(line, True, (220, 220, 220))
-                screen.blit(surf, (8, y))
-                y += 18
+                actor_lines.append(f"Roles: none={none_count} base_move={base_move_count}")
+
+            actor_panel_info = {
+                "agent_positions": np.asarray(final_info.get("agent_positions", env.agent_positions), dtype=np.float32),
+                "goal_pos": np.asarray(goal_pos, dtype=np.float32),
+                "in_sense_mask": np.asarray(final_info.get("in_sense_mask", np.zeros((initial_total_agents,), dtype=bool)), dtype=bool),
+                "collided": np.asarray(final_info.get("collided", np.zeros((initial_total_agents,), dtype=bool)), dtype=bool),
+                "collision_total": total_collisions,
+                "role_ids": role_ids.copy(),
+                "tactical_target": np.asarray(final_info.get("tactical_target", np.asarray(goal_pos, dtype=np.float32)), dtype=np.float32),
+                "role_targets": np.asarray(final_info.get("role_targets", np.repeat(np.asarray(goal_pos, dtype=np.float32).reshape(1, 2), initial_total_agents, axis=0)), dtype=np.float32),
+            }
+            _draw_sim_panel(
+                screen,
+                env,
+                world_to_screen,
+                width if visualize_detour_compare else 0,
+                font,
+                "BaseMove Actor",
+                agent_trajs,
+                actor_panel_info,
+                step,
+                max_steps,
+                actor_lines,
+                scale,
+            )
+
+            if visualize_detour_compare:
+                detour_lines = [
+                    f"Entered: {int(np.count_nonzero(np.asarray(detour_info.get('in_sense_mask', np.zeros((initial_total_agents,), dtype=bool)), dtype=bool).reshape(-1)))}/{initial_total_agents}",
+                    f"Collisions: {int(detour_info.get('collision_total', 0))}",
+                    f"Agents: {len(detour_trajs)}",
+                ]
+                _draw_sim_panel(
+                    screen,
+                    env,
+                    world_to_screen,
+                    0,
+                    font,
+                    "Detour Only",
+                    detour_trajs,
+                    detour_info,
+                    step,
+                    max_steps,
+                    detour_lines,
+                    scale,
+                )
 
             pygame.display.flip()
             clock.tick(60)
@@ -412,7 +649,18 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
     return ep_ret, success, outcome, screen_bundle, metrics
 
 
-def run_multiple_evaluations(env, actor, episodes=10, max_steps=None, scale=0.03, visualize=True, visualize_every=1, auto_quit=True, save_last_csv=None):
+def run_multiple_evaluations(
+    env,
+    actor,
+    episodes=10,
+    max_steps=None,
+    scale=0.03,
+    visualize=True,
+    visualize_every=1,
+    auto_quit=True,
+    save_last_csv=None,
+    visualize_detour_compare=True,
+):
     returns = []
     successes = 0
     total_start_in_sense = 0
@@ -433,6 +681,7 @@ def run_multiple_evaluations(env, actor, episodes=10, max_steps=None, scale=0.03
             screen_bundle=screen_bundle if vis else None,
             visualize=vis,
             save_csv_path=save_csv,
+            visualize_detour_compare=visualize_detour_compare,
         )
         returns.append(ret)
         successes += int(succ)
@@ -478,6 +727,7 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--scale", type=float, default=0.03)
     ap.add_argument("--no-visualize", action="store_true", default=False)
+    ap.add_argument("--no-detour-compare", action="store_true", default=False)
     ap.add_argument("--move-step-size", type=float, default=120.0)
     ap.add_argument("--tactical-target-radius", type=float, default=600.0)
     ap.add_argument("--num-other-agents", type=int, default=4)
@@ -539,4 +789,5 @@ if __name__ == "__main__":
         visualize_every=1,
         auto_quit=True,
         save_last_csv=str(Path("last_eval_traj.csv").resolve()),
+        visualize_detour_compare=(not args.no_detour_compare),
     )

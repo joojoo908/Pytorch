@@ -33,7 +33,7 @@ def set_global_seed(seed: int):
 def main():
     ap = argparse.ArgumentParser(description="PyCharm-friendly training runner (no CMD args needed).")
     # Core
-    ap.add_argument("--episodes", type=int, default=10000)
+    ap.add_argument("--episodes", type=int, default=1000)
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=512)
     ap.add_argument("--seed", type=int, default=1)
@@ -61,6 +61,9 @@ def main():
     ap.add_argument("--best-min-episodes", type=int, default=50)
     ap.add_argument("--best-ckpt-path", type=str, default="sac_best.pth")
     ap.add_argument("--best-actor-path", type=str, default="sac_actor_best.pth")
+    ap.add_argument("--last-ckpt-path", type=str, default="sac_last.pth")
+    ap.add_argument("--last-actor-path", type=str, default="sac_actor_last.pth")
+    ap.add_argument("--save-last-every-episodes", type=int, default=10)
 
     # Dynamic horizon (ENV-side) — default ON for PyCharm convenience
     ap.add_argument("--dyn-horizon", action="store_true", default=True)
@@ -161,7 +164,11 @@ def main():
         f"resolve_agent_collisions={bool(args.resolve_agent_collisions)}"
     )
     print(f"[AGENT-COUNT] random total agents per episode: {env.random_agent_count_min}..{env.random_agent_count_max}")
-    print(f"[CKPT] in/out: {args.ckpt} | best_ckpt={args.best_ckpt_path} | best_actor={args.best_actor_path}")
+    print(
+        f"[CKPT] in/out: {args.ckpt} | best_ckpt={args.best_ckpt_path} | best_actor={args.best_actor_path} "
+        f"| last_ckpt={args.last_ckpt_path} | last_actor={args.last_actor_path} "
+        f"| save_last_every={args.save_last_every_episodes}"
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -189,6 +196,9 @@ def main():
         best_min_episodes=args.best_min_episodes,
         best_ckpt_path=args.best_ckpt_path,
         best_actor_path=args.best_actor_path,
+        last_ckpt_path=args.last_ckpt_path,
+        last_actor_path=args.last_actor_path,
+        save_last_every_episodes=args.save_last_every_episodes,
         device=device,
     )
 

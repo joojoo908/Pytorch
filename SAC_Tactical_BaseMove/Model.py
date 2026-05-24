@@ -378,6 +378,9 @@ def sac_train(
     best_min_episodes: int = 30,
     best_ckpt_path: str = "sac_best.pth",
     best_actor_path: str = "sac_actor_best.pth",
+    last_ckpt_path: str = "sac_last.pth",
+    last_actor_path: str = "sac_actor_last.pth",
+    save_last_every_episodes: int = 10,
     succ_min_dist: float = 0.20,
     **kwargs,
 ):
@@ -587,5 +590,25 @@ def sac_train(
                 save_actor_checkpoint(best_actor_path, base_bundle)
                 print(f"[BEST] ep={ep + 1} in_sense_end={recent_terminal_rate:.1f}% -> saved {best_actor_path}")
 
-    save_actor_checkpoint("sac_actor_last.pth", base_bundle)
+        if int(save_last_every_episodes) > 0 and ((ep + 1) % int(save_last_every_episodes) == 0):
+            last_snapshot = {
+                "episodes": ep + 1,
+                "recent_in_sense_end_rate": recent_terminal_rate,
+                "recent_in_sense_end": recent_terminal_in_sense,
+                "recent_total_agents": recent_terminal_agents,
+                "succ_buf_total": succ_buf_total,
+            }
+            save_sac_checkpoint(last_ckpt_path, base_bundle, extra=last_snapshot)
+            save_actor_checkpoint(last_actor_path, base_bundle)
+            print(f"[LAST] ep={ep + 1} -> saved {last_actor_path}")
+
+    last_snapshot = {
+        "episodes": episodes,
+        "recent_in_sense_end_rate": recent_terminal_rate if recent_terminal_counts else 0.0,
+        "recent_in_sense_end": recent_terminal_in_sense if recent_terminal_counts else 0,
+        "recent_total_agents": recent_terminal_agents if recent_terminal_counts else 0,
+        "succ_buf_total": len(base_bundle["succ_replay_buffer"]),
+    }
+    save_sac_checkpoint(last_ckpt_path, base_bundle, extra=last_snapshot)
+    save_actor_checkpoint(last_actor_path, base_bundle)
     return {"bundle": base_bundle}
