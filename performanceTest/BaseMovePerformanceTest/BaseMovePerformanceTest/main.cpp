@@ -35,7 +35,7 @@ struct Options {
     int warmup = 1000;
     int crowd_agents = 20;
     float crowd_dt = 1.0f / 60.0f;
-    int arrival_steps = 128;
+    int arrival_steps = 528;
     int arrival_runs = 10;
     float goal_radius = 120.0f;
     float step_size = 120.0f;

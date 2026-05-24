@@ -211,6 +211,7 @@ def _snapshot_env_sim_state(env):
         "agent_velocities": np.asarray(env.agent_velocities, dtype=np.float32).copy(),
         "current_detour_waypoints": np.asarray(env.current_detour_waypoints, dtype=np.float32).copy(),
         "current_detour_waypoint_heights": np.asarray(env.current_detour_waypoint_heights, dtype=np.float32).copy(),
+        "arrived_agents": np.asarray(getattr(env, "_arrived_agents", np.zeros((len(env.agent_positions),), dtype=bool)), dtype=bool).copy(),
         "agent_pos": np.asarray(env.agent_pos, dtype=np.float32).copy(),
         "agent_height": float(env.agent_height),
     }
@@ -222,6 +223,7 @@ def _apply_env_sim_state(env, state):
     env.agent_velocities = np.asarray(state["agent_velocities"], dtype=np.float32).copy()
     env.current_detour_waypoints = np.asarray(state["current_detour_waypoints"], dtype=np.float32).copy()
     env.current_detour_waypoint_heights = np.asarray(state["current_detour_waypoint_heights"], dtype=np.float32).copy()
+    env._arrived_agents = np.asarray(state["arrived_agents"], dtype=bool).copy()
     env.agent_pos = np.asarray(state["agent_pos"], dtype=np.float32).copy()
     env.agent_height = float(state["agent_height"])
 
@@ -233,6 +235,7 @@ def _init_detour_reference_state(env):
         "agent_velocities": np.zeros_like(np.asarray(env.agent_velocities, dtype=np.float32)),
         "current_detour_waypoints": np.full_like(np.asarray(env.current_detour_waypoints, dtype=np.float32), np.nan),
         "current_detour_waypoint_heights": np.full_like(np.asarray(env.current_detour_waypoint_heights, dtype=np.float32), np.nan),
+        "arrived_agents": (np.linalg.norm(np.asarray(env.goal_pos, dtype=np.float32)[None, :] - np.asarray(env.agent_positions, dtype=np.float32), axis=1) <= float(getattr(env, "success_radius", 0.0))),
         "agent_pos": np.asarray(env.agent_pos, dtype=np.float32).copy(),
         "agent_height": float(env.agent_height),
         "collision_total": 0,
@@ -258,6 +261,7 @@ def _step_detour_reference(env, ref_state):
         "agent_velocities": np.asarray(ref_state["agent_velocities"], dtype=np.float32).copy(),
         "current_detour_waypoints": np.asarray(ref_state["current_detour_waypoints"], dtype=np.float32).copy(),
         "current_detour_waypoint_heights": np.asarray(ref_state["current_detour_waypoint_heights"], dtype=np.float32).copy(),
+        "arrived_agents": np.asarray(ref_state["arrived_agents"], dtype=bool).copy(),
         "agent_pos": np.asarray(ref_state["agent_pos"], dtype=np.float32).copy(),
         "agent_height": float(ref_state["agent_height"]),
     }
@@ -265,11 +269,18 @@ def _step_detour_reference(env, ref_state):
 
     old_positions = env.agent_positions.copy()
     collisions = np.zeros((env.num_agents,), dtype=bool)
+    collision_detected = np.zeros((env.num_agents,), dtype=bool)
     tactical_targets = np.zeros_like(env.agent_positions)
     goal_targets = np.repeat(np.asarray(env.goal_pos, dtype=np.float32).reshape(1, 2), env.num_agents, axis=0)
 
     for idx in range(env.num_agents):
         old_pos = old_positions[idx]
+        if bool(env._arrived_agents[idx]):
+            env.agent_positions[idx] = old_pos
+            env.agent_velocities[idx] = np.zeros((2,), dtype=np.float32)
+            tactical_targets[idx] = np.asarray(env.goal_pos, dtype=np.float32)
+            collision_detected[idx] = False
+            continue
         waypoint = None
         waypoint_height = float("nan")
         if getattr(env, "_detour_enabled", False):
@@ -335,6 +346,11 @@ def _step_detour_reference(env, ref_state):
         env.agent_velocities[idx] = new_pos - old_pos
         tactical_targets[idx] = tactical_target
         collisions[idx] = collided
+        collision_detected[idx] = env._collides_with_other_agents(new_pos, ignore_index=idx)
+        if float(np.linalg.norm(np.asarray(env.goal_pos, dtype=np.float32) - new_pos)) <= float(getattr(env, "success_radius", 0.0)):
+            env._arrived_agents[idx] = True
+            collisions[idx] = False
+            collision_detected[idx] = False
 
         current_wp = env.current_detour_waypoints[idx]
         if np.all(np.isfinite(current_wp)):
@@ -352,15 +368,17 @@ def _step_detour_reference(env, ref_state):
     ref_state["agent_velocities"] = env.agent_velocities.copy()
     ref_state["current_detour_waypoints"] = env.current_detour_waypoints.copy()
     ref_state["current_detour_waypoint_heights"] = env.current_detour_waypoint_heights.copy()
+    ref_state["arrived_agents"] = np.asarray(env._arrived_agents, dtype=bool).copy()
     ref_state["agent_pos"] = env.agent_pos.copy()
     ref_state["agent_height"] = float(env.agent_height)
-    ref_state["collision_total"] = int(ref_state.get("collision_total", 0)) + int(np.count_nonzero(collisions))
+    ref_state["collision_total"] = int(ref_state.get("collision_total", 0)) + int(np.count_nonzero(collision_detected))
 
     info = {
         "agent_positions": env.agent_positions.copy(),
         "agent_heights": env.agent_heights.copy(),
         "agent_velocities": env.agent_velocities.copy(),
-        "collided": collisions.copy(),
+        "collided": collision_detected.copy(),
+        "collision_handled": collisions.copy(),
         "collision_total": int(ref_state["collision_total"]),
         "goal_pos": np.asarray(env.goal_pos, dtype=np.float32).copy(),
         "in_sense_mask": in_sense_mask.copy(),
@@ -383,6 +401,7 @@ def _draw_sim_panel(screen, env, world_to_screen, x_offset, font, title, trajs, 
     sense_px = max(1, int(round(float(getattr(env, "sense_radius", 0.0)) * float(scale))))
 
     positions = np.asarray(sim_info.get("agent_positions", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+    collided = np.asarray(sim_info.get("collided", np.zeros((len(positions),), dtype=bool)), dtype=bool).reshape(-1)
     role_ids = np.asarray(sim_info.get("role_ids", np.zeros((len(trajs),), dtype=np.int32)), dtype=np.int32).reshape(-1)
     tactical_target = np.asarray(sim_info.get("tactical_target", np.zeros_like(positions)), dtype=np.float32)
     role_targets = np.asarray(sim_info.get("role_targets", np.zeros_like(positions)), dtype=np.float32)
@@ -420,6 +439,8 @@ def _draw_sim_panel(screen, env, world_to_screen, x_offset, font, title, trajs, 
     for idx, other in enumerate(positions):
         role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
         color = ROLE_COLORS.get(role_id, (200, 140, 70))
+        if idx < len(collided) and bool(collided[idx]):
+            color = (235, 70, 70)
         sx, sy = panel_world_to_screen(other)
         pygame.draw.circle(screen, color, (sx, sy), 4)
         surf = font.render(f"A{idx}", True, color)

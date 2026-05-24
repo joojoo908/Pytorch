@@ -488,11 +488,15 @@ void build_base_move_observations(
             obs[base + 0] = (other[0] - pos[0]) / scale;
             obs[base + 1] = (other[2] - pos[2]) / scale;
             obs[base + 2] = candidate.dist / scale;
-            obs[base + 3] = 1.0f;
+            obs[base + 3] = 0.0f;
             ++sensed;
         }
 
-        obs[options.obs_dim - 1] = sensed == 0 ? 1.0f : 0.0f;
+        const float goal_dx = goal[0] - pos[0];
+        const float goal_dz = goal[2] - pos[2];
+        const float goal_dist = std::sqrt(goal_dx * goal_dx + goal_dz * goal_dz);
+        const bool goal_in_sense = goal_dist <= options.sense_radius;
+        obs[options.obs_dim - 1] = (sensed == 0 && !goal_in_sense) ? 1.0f : 0.0f;
     }
 }
 

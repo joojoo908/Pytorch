@@ -443,8 +443,13 @@ def sac_train(
             dist_values = np.asarray(info.get("dist_to_goal", np.full((obs_arr.shape[0],), -1.0, dtype=np.float32)), dtype=np.float32).reshape(-1)
             collided_arr = np.asarray(info.get("collided", np.zeros((obs_arr.shape[0],), dtype=bool)), dtype=bool).reshape(-1)
             ep_collision_total += int(np.count_nonzero(collided_arr))
+            arrived_mask_arr = None
+            if hasattr(env, "_arrived_agents"):
+                arrived_mask_arr = np.asarray(getattr(env, "_arrived_agents"), dtype=bool).reshape(-1)
 
             for agent_idx in range(obs_arr.shape[0]):
+                if arrived_mask_arr is not None and agent_idx < len(arrived_mask_arr) and bool(arrived_mask_arr[agent_idx]):
+                    continue
                 dist = None if agent_idx >= len(dist_values) else float(dist_values[agent_idx])
                 step_success = bool(agent_idx < len(success_mask_arr) and success_mask_arr[agent_idx])
                 base_bundle["replay_buffer"].push(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done)
