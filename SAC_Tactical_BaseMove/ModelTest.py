@@ -52,6 +52,18 @@ def maybe_sample_agent_role_rules(env):
     return chosen
 
 
+def _apply_agent_role_rules(env, chosen):
+    if chosen is None:
+        return
+    chosen = [str(x).strip().lower() for x in chosen]
+    if hasattr(env, "configure_agent_group") and callable(env.configure_agent_group):
+        env.configure_agent_group(chosen)
+    else:
+        env.agent_role_rules = list(chosen)
+    setattr(env, "_current_agent_role_rule_sample", list(chosen))
+    setattr(env, "_current_agent_role_rule_sample_index", None)
+
+
 def make_world_to_screen(bounds_min, bounds_max, scale, y_scale=1.0):
     min_x, min_z = float(bounds_min[0]), float(bounds_min[1])
     max_x, max_z = float(bounds_max[0]), float(bounds_max[1])
@@ -228,6 +240,36 @@ def _apply_env_sim_state(env, state):
     env.agent_height = float(state["agent_height"])
 
 
+def _copy_env_runtime_state(src_env, dst_env):
+    state = _snapshot_env_sim_state(src_env)
+    _apply_env_sim_state(dst_env, state)
+    attrs = [
+        "goal_pos",
+        "goal_height",
+        "steps",
+        "max_steps",
+        "agent_role_ids",
+        "role_targets",
+        "last_target_offsets",
+        "_prev_geo",
+        "_prev_success_mask",
+        "_prev_in_sense_mask",
+        "_stall_best",
+        "_stall_wait",
+        "_episode_success_rewarded",
+        "bounds_min",
+        "bounds_max",
+    ]
+    for name in attrs:
+        if hasattr(src_env, name):
+            value = getattr(src_env, name)
+            if isinstance(value, np.ndarray):
+                value = value.copy()
+            elif isinstance(value, list):
+                value = list(value)
+            setattr(dst_env, name, value)
+
+
 def _init_detour_reference_state(env):
     return {
         "agent_positions": np.asarray(env.agent_positions, dtype=np.float32).copy(),
@@ -254,7 +296,6 @@ def _compute_detour_preview_paths(env):
 
 
 def _step_detour_reference(env, ref_state):
-    saved = _snapshot_env_sim_state(env)
     working = {
         "agent_positions": np.asarray(ref_state["agent_positions"], dtype=np.float32).copy(),
         "agent_heights": np.asarray(ref_state["agent_heights"], dtype=np.float32).copy(),
@@ -386,8 +427,6 @@ def _step_detour_reference(env, ref_state):
         "tactical_target": tactical_targets.copy(),
         "role_targets": goal_targets.copy(),
     }
-
-    _apply_env_sim_state(env, saved)
     return info
 
 
@@ -463,8 +502,11 @@ def _draw_sim_panel(screen, env, world_to_screen, x_offset, font, title, trajs, 
         y += 18
 
 
-def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, visualize=True, save_csv_path=None, visualize_detour_compare=True):
+def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, visualize=True, save_csv_path=None, visualize_detour_compare=True, detour_env=None):
     obs, info = reset_env_compat(env)
+    if visualize_detour_compare and detour_env is not None:
+        reset_env_compat(detour_env)
+        _copy_env_runtime_state(env, detour_env)
     actor.eval()
 
     start_pos = np.array(env.agent_pos, dtype=np.float32).copy()
@@ -489,9 +531,9 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
             farthest_agent_geo_dist = float("nan")
 
     agent_trajs = [[np.array(pos, dtype=np.float32).copy()] for pos in np.asarray(env.agent_positions, dtype=np.float32)]
-    detour_ref_state = _init_detour_reference_state(env)
-    detour_trajs = [[np.array(pos, dtype=np.float32).copy()] for pos in np.asarray(env.agent_positions, dtype=np.float32)]
-    detour_preview_paths = _compute_detour_preview_paths(env)
+    detour_ref_state = _init_detour_reference_state(detour_env) if (visualize_detour_compare and detour_env is not None) else None
+    detour_trajs = [[np.array(pos, dtype=np.float32).copy()] for pos in np.asarray(detour_env.agent_positions if detour_env is not None else env.agent_positions, dtype=np.float32)]
+    detour_preview_paths = _compute_detour_preview_paths(detour_env if detour_env is not None else env)
     detour_info = {
         "agent_positions": np.asarray(env.agent_positions, dtype=np.float32).copy(),
         "goal_pos": np.asarray(env.goal_pos, dtype=np.float32).copy(),
@@ -542,8 +584,8 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
         obs, reward, env_terminated, env_truncated, final_info = env.step(action)
         ep_ret += float(np.mean(np.asarray(reward, dtype=np.float32)))
         total_collisions += int(np.count_nonzero(np.asarray(final_info.get("collided", False), dtype=bool)))
-        if visualize_detour_compare:
-            detour_info = _step_detour_reference(env, detour_ref_state)
+        if visualize_detour_compare and detour_env is not None and detour_ref_state is not None:
+            detour_info = _step_detour_reference(detour_env, detour_ref_state)
             detour_info["preview_paths"] = detour_preview_paths
             for idx, pos in enumerate(np.asarray(detour_info.get("agent_positions", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)):
                 if idx < len(detour_trajs):
@@ -672,6 +714,7 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
 
 def run_multiple_evaluations(
     env,
+    detour_env,
     actor,
     episodes=10,
     max_steps=None,
@@ -692,6 +735,7 @@ def run_multiple_evaluations(
 
     for ep in range(episodes):
         sampled_rules = maybe_sample_agent_role_rules(env)
+        _apply_agent_role_rules(detour_env, sampled_rules)
         vis = visualize and ((ep % visualize_every) == 0)
         save_csv = save_last_csv if ep == episodes - 1 else None
         ret, succ, outcome, screen_bundle, metrics = evaluate_once(
@@ -703,6 +747,7 @@ def run_multiple_evaluations(
             visualize=vis,
             save_csv_path=save_csv,
             visualize_detour_compare=visualize_detour_compare,
+            detour_env=detour_env,
         )
         returns.append(ret)
         successes += int(succ)
@@ -743,7 +788,7 @@ def run_multiple_evaluations(
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Evaluate shared-policy SAC on Majestro NavMesh.")
-    ap.add_argument("--actor-path", type=str, default="sac_actor_best.pth")
+    ap.add_argument("--actor-path", type=str, default="sac_actor_last.pth")
     ap.add_argument("--episodes", type=int, default=50)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--scale", type=float, default=0.03)
@@ -782,9 +827,28 @@ if __name__ == "__main__":
         agent_spawn_max_scale=args.agent_spawn_max_scale,
         role_rule="base_move_only",
         agent_role_rules=agent_role_rules,
+        dynamic_horizon_kappa=1.3,
     )
     env.random_agent_count_min = int(args.random_agent_count_min)
     env.random_agent_count_max = int(max(args.random_agent_count_min, args.random_agent_count_max))
+    detour_env = build_env(
+        seed=args.seed,
+        move_step_size=args.move_step_size,
+        tactical_target_radius=args.tactical_target_radius,
+        num_other_agents=args.num_other_agents,
+        observed_other_agents=args.observed_other_agents,
+        agent_radius=args.agent_radius,
+        sense_radius=args.sense_radius,
+        resolve_agent_collisions=args.resolve_agent_collisions,
+        goal_spawn_min_scale=args.goal_spawn_min_scale,
+        agent_spawn_min_scale=args.agent_spawn_min_scale,
+        agent_spawn_max_scale=args.agent_spawn_max_scale,
+        role_rule="base_move_only",
+        agent_role_rules=agent_role_rules,
+        dynamic_horizon_kappa=1.3,
+    )
+    detour_env.random_agent_count_min = env.random_agent_count_min
+    detour_env.random_agent_count_max = env.random_agent_count_max
     print(f"[AGENT-COUNT] random total agents per episode: {env.random_agent_count_min}..{env.random_agent_count_max}")
     print(f"[ENV] resolve_agent_collisions={bool(args.resolve_agent_collisions)}")
 
@@ -803,6 +867,7 @@ if __name__ == "__main__":
 
     run_multiple_evaluations(
         env,
+        detour_env,
         actor,
         episodes=args.episodes,
         scale=args.scale,

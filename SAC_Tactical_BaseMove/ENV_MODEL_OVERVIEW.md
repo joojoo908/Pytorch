@@ -23,6 +23,13 @@
 
 즉 성공은 상태 유지가 아니라 `밖 -> 안` 진입 이벤트다.
 
+별도로 agent 자체는 `goal` 중심에서 `success_radius` 안에 들어오면 `arrived` 상태가 된다.
+
+- `arrived` agent는 이후 이동하지 않는다.
+- `arrived` agent는 이후 충돌 처리 대상에서 제외된다.
+- `arrived` agent는 이후 추가 보상이나 패널티를 받지 않는다.
+- `arrived` agent는 이후 replay buffer에 적재되지 않는다.
+
 ### 현재 보상 구조
 
 - 매 step 기본 시간 패널티 `-time_penalty`
@@ -39,11 +46,21 @@
 초기부터 `sense_radius` 안에 있던 agent는 성공으로 세지지 않는다.
 다만 이후 밖으로 나갔다가 다시 안으로 들어오면 다시 성공 이벤트가 발생할 수 있다.
 
+`arrived` 상태가 된 이후에는 다음이 적용되지 않는다.
+
+- 시간 패널티
+- 충돌 패널티
+- 정체 패널티
+- sustain 보상
+- replay buffer 적재
+
 ### success buffer
 
 - 일반 replay buffer에는 `base_move` step이 계속 쌓인다.
 - success replay buffer에는 성공 순간만이 아니라, 성공 직전 최근 `base_move` 구간도 함께 적재된다.
 - 기본 최근 구간 길이는 `8 step`이다.
+
+단, `arrived` agent의 이후 step은 일반 replay와 success replay 모두에 쌓이지 않는다.
 
 ### 학습 로그 기준
 
@@ -55,6 +72,14 @@
 - `succ_buf`: success replay buffer에 쌓인 sample 수
 - `growth@N`: 최근 기록 창 기준 success buffer 증가량
 - `alpha`: 현재 SAC entropy coefficient
+- `collisions`: episode 동안 새로 집계된 충돌 수
+
+`best` 체크포인트 외에 최신 진행 상태도 저장한다.
+
+- `sac_last.pth`
+- `sac_actor_last.pth`
+
+기본적으로 `last`는 `10 episode`마다 저장하고, 학습 종료 시 한 번 더 저장한다.
 
 ### 기본 실행
 
