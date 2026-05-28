@@ -281,6 +281,7 @@ def _init_detour_reference_state(env):
         "agent_pos": np.asarray(env.agent_pos, dtype=np.float32).copy(),
         "agent_height": float(env.agent_height),
         "collision_total": 0,
+        "prev_collided": np.zeros((env.num_agents,), dtype=bool),
     }
 
 
@@ -412,7 +413,12 @@ def _step_detour_reference(env, ref_state):
     ref_state["arrived_agents"] = np.asarray(env._arrived_agents, dtype=bool).copy()
     ref_state["agent_pos"] = env.agent_pos.copy()
     ref_state["agent_height"] = float(env.agent_height)
-    ref_state["collision_total"] = int(ref_state.get("collision_total", 0)) + int(np.count_nonzero(collision_detected))
+    prev_collided = np.asarray(ref_state.get("prev_collided", np.zeros((env.num_agents,), dtype=bool)), dtype=bool).reshape(-1)
+    if prev_collided.shape != collision_detected.shape:
+        prev_collided = np.zeros_like(collision_detected, dtype=bool)
+    collision_starts = collision_detected & (~prev_collided)
+    ref_state["collision_total"] = int(ref_state.get("collision_total", 0)) + int(np.count_nonzero(collision_starts))
+    ref_state["prev_collided"] = collision_detected.copy()
 
     info = {
         "agent_positions": env.agent_positions.copy(),
@@ -502,6 +508,12 @@ def _draw_sim_panel(screen, env, world_to_screen, x_offset, font, title, trajs, 
         y += 18
 
 
+def _relative_rate_vs_detour(actor_count: int, detour_count: int) -> float:
+    if detour_count > 0:
+        return 100.0 * float(actor_count) / float(detour_count)
+    return 100.0 if int(actor_count) == 0 else 0.0
+
+
 def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, visualize=True, save_csv_path=None, visualize_detour_compare=True, detour_env=None):
     obs, info = reset_env_compat(env)
     if visualize_detour_compare and detour_env is not None:
@@ -564,6 +576,7 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
 
     ep_ret = 0.0
     total_collisions = 0
+    prev_collided = np.zeros((initial_total_agents,), dtype=bool)
     final_info = {}
     env_terminated = False
     env_truncated = False
@@ -583,7 +596,12 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
         action = policy_act(actor, obs)
         obs, reward, env_terminated, env_truncated, final_info = env.step(action)
         ep_ret += float(np.mean(np.asarray(reward, dtype=np.float32)))
-        total_collisions += int(np.count_nonzero(np.asarray(final_info.get("collided", False), dtype=bool)))
+        collided = np.asarray(final_info.get("collided", np.zeros((initial_total_agents,), dtype=bool)), dtype=bool).reshape(-1)
+        if prev_collided.shape != collided.shape:
+            prev_collided = np.zeros_like(collided, dtype=bool)
+        collision_starts = collided & (~prev_collided)
+        total_collisions += int(np.count_nonzero(collision_starts))
+        prev_collided = collided.copy()
         if visualize_detour_compare and detour_env is not None and detour_ref_state is not None:
             detour_info = _step_detour_reference(detour_env, detour_ref_state)
             detour_info["preview_paths"] = detour_preview_paths
@@ -603,6 +621,11 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
             else:
                 role_ids = np.asarray(role_ids).reshape(-1)
 
+            detour_entered = int(np.count_nonzero(np.asarray(detour_info.get('in_sense_mask', np.zeros((initial_total_agents,), dtype=bool)), dtype=bool).reshape(-1))) if visualize_detour_compare else 0
+            vs_detour_rate = _relative_rate_vs_detour(
+                int(np.count_nonzero(np.asarray(final_info.get('in_sense_mask', np.zeros((initial_total_agents,), dtype=bool)), dtype=bool).reshape(-1))),
+                detour_entered,
+            ) if visualize_detour_compare else 0.0
             actor_lines = [
                 f"Return: {ep_ret:.3f}",
                 f"Farthest: A{farthest_agent_idx}",
@@ -610,6 +633,8 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
                 f"Entered: {int(np.count_nonzero(np.asarray(final_info.get('in_sense_mask', np.zeros((initial_total_agents,), dtype=bool)), dtype=bool).reshape(-1)))}/{initial_total_agents}",
                 f"Collisions: {total_collisions}",
             ]
+            if visualize_detour_compare:
+                actor_lines.append(f"VsDetour: {vs_detour_rate:.1f}%")
             if role_ids is not None:
                 role_ids_arr = np.asarray(role_ids, dtype=np.int32).reshape(-1)
                 none_count = int(np.sum(role_ids_arr == -1))
@@ -643,7 +668,7 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
 
             if visualize_detour_compare:
                 detour_lines = [
-                    f"Entered: {int(np.count_nonzero(np.asarray(detour_info.get('in_sense_mask', np.zeros((initial_total_agents,), dtype=bool)), dtype=bool).reshape(-1)))}/{initial_total_agents}",
+                    f"Entered: {detour_entered}/{initial_total_agents}",
                     f"Collisions: {int(detour_info.get('collision_total', 0))}",
                     f"Agents: {len(detour_trajs)}",
                 ]
@@ -691,17 +716,28 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
     terminal_total_agents = int(len(terminal_mask)) if len(terminal_mask) > 0 else initial_total_agents
     terminal_in_sense = int(np.count_nonzero(terminal_mask))
     terminal_rate = 100.0 * terminal_in_sense / max(1, terminal_total_agents)
+    detour_terminal_mask = np.asarray(detour_info.get("in_sense_mask", np.zeros((0,), dtype=bool)), dtype=bool).reshape(-1) if visualize_detour_compare else np.zeros((0,), dtype=bool)
+    detour_terminal_in_sense = int(np.count_nonzero(detour_terminal_mask)) if len(detour_terminal_mask) > 0 else 0
+    vs_detour_rate = _relative_rate_vs_detour(terminal_in_sense, detour_terminal_in_sense) if visualize_detour_compare else 0.0
 
     print(
         f"[Eval] {outcome} | return={ep_ret:.3f} "
         f"| start_in_sense={initial_in_sense:3d}/{initial_total_agents:3d} "
         f"| farthest=A{farthest_agent_idx} straight={farthest_agent_dist:.1f} geo={farthest_agent_geo_dist:.1f} "
         f"| in_sense_end={terminal_in_sense:3d}/{terminal_total_agents:3d} ({terminal_rate:5.1f}%) "
-        f"| collisions={total_collisions}"
+        + (
+            f"| detour_end={detour_terminal_in_sense:3d}/{terminal_total_agents:3d} "
+            f"| vs_detour={vs_detour_rate:5.1f}% "
+            if visualize_detour_compare
+            else ""
+        )
+        + f"| collisions={total_collisions}"
     )
     metrics = {
         "start_in_sense": initial_in_sense,
         "end_in_sense": terminal_in_sense,
+        "detour_end_in_sense": detour_terminal_in_sense,
+        "vs_detour_rate": vs_detour_rate,
         "total_agents": terminal_total_agents,
         "end_rate": terminal_rate,
         "collisions": total_collisions,
@@ -729,6 +765,7 @@ def run_multiple_evaluations(
     successes = 0
     total_start_in_sense = 0
     total_end_in_sense = 0
+    total_detour_end_in_sense = 0
     total_collisions = 0
     total_agents = 0
     screen_bundle = None
@@ -753,19 +790,26 @@ def run_multiple_evaluations(
         successes += int(succ)
         total_start_in_sense += int(metrics["start_in_sense"])
         total_end_in_sense += int(metrics["end_in_sense"])
+        total_detour_end_in_sense += int(metrics.get("detour_end_in_sense", 0))
         total_collisions += int(metrics["collisions"])
         total_agents += int(metrics["total_agents"])
         rule_summary = "" if sampled_rules is None else f" agents={len(sampled_rules)}"
-        print(
+        episode_line = (
             f"[Episode {ep + 1}/{episodes}] return={ret:.3f} outcome={outcome}"
             f" start_in_sense={int(metrics['start_in_sense'])}/{int(metrics['total_agents'])}"
             f" farthest=A{int(metrics['farthest_agent_idx'])}"
             f" straight={float(metrics['farthest_agent_dist']):.1f}"
             f" geo={float(metrics['farthest_agent_geo_dist']):.1f}"
             f" in_sense_end={int(metrics['end_in_sense'])}/{int(metrics['total_agents'])}"
-            f" collisions={int(metrics['collisions'])}"
-            f" ({float(metrics['end_rate']):.1f}%){rule_summary}"
         )
+        if visualize_detour_compare:
+            episode_line += (
+                f" detour_end={int(metrics['detour_end_in_sense'])}/{int(metrics['total_agents'])}"
+                f" vs_detour={float(metrics['vs_detour_rate']):.1f}%"
+            )
+        episode_line += f" collisions={int(metrics['collisions'])}"
+        episode_line += f" ({float(metrics['end_rate']):.1f}%){rule_summary}"
+        print(episode_line)
 
         if outcome == "aborted":
             print("[Info] Evaluation stopped by user.")
@@ -776,19 +820,26 @@ def run_multiple_evaluations(
 
     avg_ret = float(np.mean(returns)) if returns else 0.0
     end_rate = 100.0 * total_end_in_sense / max(1, total_agents)
-    print(
+    vs_detour_rate = _relative_rate_vs_detour(total_end_in_sense, total_detour_end_in_sense) if visualize_detour_compare else 0.0
+    summary_line = (
         f"[Summary] episodes={len(returns)} success={successes} ({100.0 * successes / max(1, len(returns)):.1f}%) "
         f"start_in_sense={total_start_in_sense}/{total_agents} "
         f"in_sense_end={total_end_in_sense}/{total_agents} ({end_rate:.1f}%) "
-        f"collisions={total_collisions} "
-        f"avg_return={avg_ret:.3f}"
     )
+    if visualize_detour_compare:
+        summary_line += (
+            f"detour_end={total_detour_end_in_sense}/{total_agents} "
+            f"vs_detour={vs_detour_rate:.1f}% "
+        )
+    summary_line += f"collisions={total_collisions} "
+    summary_line += f"avg_return={avg_ret:.3f}"
+    print(summary_line)
     return returns
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Evaluate shared-policy SAC on Majestro NavMesh.")
-    ap.add_argument("--actor-path", type=str, default="sac_actor_last.pth")
+    ap.add_argument("--actor-path", type=str, default="sac_actor_best.pth")
     ap.add_argument("--episodes", type=int, default=50)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--scale", type=float, default=0.03)
