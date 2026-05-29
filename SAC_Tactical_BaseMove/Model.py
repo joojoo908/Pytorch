@@ -593,13 +593,21 @@ def sac_train(
 
     recent_terminal_counts: deque[Tuple[int, int]] = deque(maxlen=100)
     recent_detour_terminal_counts: deque[Tuple[int, int]] = deque(maxlen=100)
+    recent_collision_counts: deque[int] = deque(maxlen=100)
+    recent_detour_collision_counts: deque[int] = deque(maxlen=100)
     succ_buf_total_history: deque[int] = deque(maxlen=max(2, int(best_min_episodes)))
     best_score = -1.0
+    best_collision_score = math.inf
     alpha_frozen = False
     best_snapshot = None
     base_move_success_horizon = max(1, int(kwargs.get("base_move_success_horizon", 8)))
     detour_reward_shaping = bool(kwargs.get("detour_reward_shaping", True))
     detour_lead_bonus = float(kwargs.get("detour_lead_bonus", 0.02))
+    detour_collision_base_bonus = float(kwargs.get("detour_collision_base_bonus", 0.10))
+    detour_collision_bonus_100 = float(kwargs.get("detour_collision_bonus_100", 0.10))
+    detour_collision_bonus_50 = float(kwargs.get("detour_collision_bonus_50", 0.20))
+    detour_collision_bonus_10 = float(kwargs.get("detour_collision_bonus_10", 0.50))
+    detour_collision_bonus_0 = float(kwargs.get("detour_collision_bonus_0", 1.00))
 
     for ep in range(episodes):
         sampled_rules = maybe_sample_agent_role_rules(env)
@@ -610,7 +618,7 @@ def sac_train(
         ep_steps = 0
         ep_reward = 0.0
         ep_collision_total = 0
-        prev_collided_arr = None
+        ep_detour_collision_total = 0
         ep_initial_in_sense = 0
         ep_terminal_in_sense = 0
         ep_detour_terminal_in_sense = 0
@@ -649,24 +657,17 @@ def sac_train(
                 detour_arrived = int(np.count_nonzero(np.asarray(detour_ref_state.get("arrived_agents", np.zeros((obs_arr.shape[0],), dtype=bool)), dtype=bool)))
                 if actor_arrived > detour_arrived and detour_lead_bonus > 0.0:
                     reward_arr = reward_arr + np.float32(detour_lead_bonus * float(actor_arrived - detour_arrived))
+                detour_collided_arr = np.asarray(detour_final_info.get("collision_handled", np.zeros((obs_arr.shape[0],), dtype=bool)), dtype=bool).reshape(-1)
+                ep_detour_collision_total += int(np.count_nonzero(detour_collided_arr))
 
-            ep_reward += float(np.mean(reward_arr))
             final_info = info if isinstance(info, dict) else {}
             success_mask_arr = np.asarray(info.get("success_mask", np.zeros((obs_arr.shape[0],), dtype=bool)), dtype=bool).reshape(-1)
             dist_values = np.asarray(info.get("dist_to_goal", np.full((obs_arr.shape[0],), -1.0, dtype=np.float32)), dtype=np.float32).reshape(-1)
             collided_arr = np.asarray(info.get("collided", np.zeros((obs_arr.shape[0],), dtype=bool)), dtype=bool).reshape(-1)
-            if prev_collided_arr is None or prev_collided_arr.shape != collided_arr.shape:
-                prev_collided_arr = np.zeros_like(collided_arr, dtype=bool)
-            collision_starts = collided_arr & (~prev_collided_arr)
-            ep_collision_total += int(np.count_nonzero(collision_starts))
-            prev_collided_arr = collided_arr.copy()
-            arrived_mask_arr = None
-            if hasattr(env, "_arrived_agents"):
-                arrived_mask_arr = np.asarray(getattr(env, "_arrived_agents"), dtype=bool).reshape(-1)
+            ep_collision_total += int(np.count_nonzero(collided_arr))
+            ep_reward += float(np.mean(reward_arr))
 
             for agent_idx in range(obs_arr.shape[0]):
-                if arrived_mask_arr is not None and agent_idx < len(arrived_mask_arr) and bool(arrived_mask_arr[agent_idx]):
-                    continue
                 dist = None if agent_idx >= len(dist_values) else float(dist_values[agent_idx])
                 step_success = bool(agent_idx < len(success_mask_arr) and success_mask_arr[agent_idx])
                 base_bundle["replay_buffer"].push(obs_arr[agent_idx], act[agent_idx], reward_arr[agent_idx], next_obs_arr[agent_idx], done)
@@ -770,12 +771,39 @@ def sac_train(
         ep_terminal_in_sense = int(np.count_nonzero(terminal_mask))
         detour_terminal_mask = np.asarray(detour_final_info.get("in_sense_mask", np.zeros((0,), dtype=bool)), dtype=bool).reshape(-1)
         ep_detour_terminal_in_sense = int(np.count_nonzero(detour_terminal_mask))
+        episode_collision_bonus = 0.0
+        if detour_reward_shaping and ep_collision_total < ep_detour_collision_total:
+            episode_collision_bonus = detour_collision_base_bonus
+            if ep_collision_total == 0:
+                episode_collision_bonus += detour_collision_bonus_0
+            elif ep_collision_total <= 10:
+                episode_collision_bonus += detour_collision_bonus_10
+            elif ep_collision_total <= 50:
+                episode_collision_bonus += detour_collision_bonus_50
+            elif ep_collision_total <= 100:
+                episode_collision_bonus += detour_collision_bonus_100
+        if episode_collision_bonus > 0.0:
+            last_agent_count = int(getattr(obs_arr, "shape", [0])[0]) if 'obs_arr' in locals() else 0
+            for back_idx in range(1, last_agent_count + 1):
+                try:
+                    base_bundle["replay_buffer"].rew[-back_idx] = np.asarray(
+                        np.asarray(base_bundle["replay_buffer"].rew[-back_idx], dtype=np.float32) + np.float32(episode_collision_bonus),
+                        dtype=np.float32,
+                    )
+                except Exception:
+                    break
+            ep_reward += float(episode_collision_bonus)
         ep_terminal_rate = _relative_rate_vs_detour(ep_terminal_in_sense, ep_detour_terminal_in_sense)
         recent_terminal_counts.append((ep_terminal_in_sense, ep_total_agents))
         recent_detour_terminal_counts.append((ep_detour_terminal_in_sense, ep_total_agents))
+        recent_collision_counts.append(int(ep_collision_total))
+        recent_detour_collision_counts.append(int(ep_detour_collision_total))
         recent_terminal_in_sense = sum(s for s, _ in recent_terminal_counts)
         recent_terminal_agents = sum(a for _, a in recent_terminal_counts)
         recent_detour_terminal_in_sense = sum(s for s, _ in recent_detour_terminal_counts)
+        recent_collision_total = sum(recent_collision_counts)
+        recent_detour_collision_total = sum(recent_detour_collision_counts)
+        recent_absolute_terminal_rate = 100.0 * recent_terminal_in_sense / max(1, recent_terminal_agents)
         recent_terminal_rate = _relative_rate_vs_detour(recent_terminal_in_sense, recent_detour_terminal_in_sense)
         succ_buf_total = len(base_bundle["succ_replay_buffer"])
         succ_buf_total_history.append(succ_buf_total)
@@ -794,30 +822,38 @@ def sac_train(
                 f"| start_in_sense={ep_initial_in_sense:3d}/{ep_total_agents:3d} "
                 f"| in_sense_end={ep_terminal_in_sense:3d}/{ep_total_agents:3d} "
                 f"| detour_end={ep_detour_terminal_in_sense:3d}/{ep_total_agents:3d} ({ep_terminal_rate:5.1f}%) "
-                f"| collisions={ep_collision_total:4d} "
-                f"| recent100={recent_terminal_in_sense:4d}/{recent_terminal_agents:4d} "
+                f"| collisions={ep_collision_total:4d} detour_col={ep_detour_collision_total:4d} "
+                f"| recent100={recent_terminal_in_sense:4d}/{recent_terminal_agents:4d} ({recent_absolute_terminal_rate:5.1f}%) "
                 f"| detour100={recent_detour_terminal_in_sense:4d}/{recent_terminal_agents:4d} ({recent_terminal_rate:5.1f}%) "
-                f"| succ_buf={succ_buf_total} growth@{len(succ_buf_total_history)}={succ_buf_growth} "
+                f"| recent100_col={recent_collision_total:4d} detour100_col={recent_detour_collision_total:4d} "
+                f"| succ_buf={succ_buf_total} "
                 f"| alpha={base_bundle['alpha']:.3f}"
                 + (f" | agents={len(sampled_rules)}" if sampled_rules is not None else "")
             )
 
         if save_best_online and len(recent_terminal_counts) >= max(2, int(best_min_episodes)):
             min_rate_delta = float(best_delta)
-            if float(recent_terminal_rate) >= best_score + min_rate_delta:
-                best_score = float(recent_terminal_rate)
+            should_save_best = False
+            if float(recent_absolute_terminal_rate) >= best_score + min_rate_delta:
+                should_save_best = True
+            elif abs(float(recent_absolute_terminal_rate) - best_score) <= min_rate_delta and int(recent_collision_total) < int(best_collision_score):
+                should_save_best = True
+            if should_save_best:
+                best_score = float(recent_absolute_terminal_rate)
+                best_collision_score = int(recent_collision_total)
                 best_snapshot = {
                     "episodes": ep + 1,
                     "best_in_sense_end_rate": best_score,
-                    "recent_in_sense_end_rate": recent_terminal_rate,
+                    "recent_in_sense_end_rate": recent_absolute_terminal_rate,
                     "recent_in_sense_end": recent_terminal_in_sense,
                     "recent_detour_in_sense_end": recent_detour_terminal_in_sense,
                     "recent_total_agents": recent_terminal_agents,
+                    "recent_collision_total": int(recent_collision_total),
                     "succ_buf_total": succ_buf_total,
                 }
                 save_sac_checkpoint(best_ckpt_path, base_bundle, extra=best_snapshot)
                 save_actor_checkpoint(best_actor_path, base_bundle)
-                print(f"[BEST] ep={ep + 1} in_sense_end={recent_terminal_rate:.1f}% -> saved {best_actor_path}")
+                print(f"[BEST] ep={ep + 1} in_sense_end={recent_absolute_terminal_rate:.1f}% recent100_col={recent_collision_total} -> saved {best_actor_path}")
 
         if int(save_last_every_episodes) > 0 and ((ep + 1) % int(save_last_every_episodes) == 0):
             last_snapshot = {

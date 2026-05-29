@@ -27,20 +27,22 @@
 
 - `arrived` agent는 이후 이동하지 않는다.
 - `arrived` agent는 이후 충돌 처리 대상에서 제외된다.
-- `arrived` agent는 이후 추가 보상이나 패널티를 받지 않는다.
-- `arrived` agent는 이후 replay buffer에 적재되지 않는다.
+- `arrived` agent는 이후에도 `success_sustain` 보상을 계속 받는다.
+- `arrived` agent의 이후 step도 일반 replay buffer에는 계속 적재된다.
 
 ### 현재 보상 구조
 
 - 매 step 기본 시간 패널티 `-time_penalty`
 - 충돌 시 `-collision_penalty`
+  충돌 상태가 유지되면 매 tick 반복 적용된다.
 - 정체가 길어지면 `-stall_penalty`
 - role target 쪽으로 가까워지면 `role_progress` 보상
 - geodesic/path distance가 줄어들면 `path_progress` 보상
 - `sense_radius` 안으로 처음 진입하면 작은 진입 보너스
 - detour waypoint를 사용하면 작은 보너스
 - 이동 속도에 따른 작은 속도 보너스
-- 성공 진입 이벤트가 발생한 step에는 큰 성공 보상 `+20`
+- 성공 진입 이벤트가 발생한 step에는 `success_entry +8`
+- `sense_radius` 안에 계속 있으면 `success_sustain +2`가 매 tick 적용된다.
 - `sense_radius` 안에 있던 agent가 밖으로 나가면 강한 이탈 패널티 `-12`
 
 초기부터 `sense_radius` 안에 있던 agent는 성공으로 세지지 않는다.
@@ -48,31 +50,40 @@
 
 `arrived` 상태가 된 이후에는 다음이 적용되지 않는다.
 
-- 시간 패널티
-- 충돌 패널티
-- 정체 패널티
-- sustain 보상
-- replay buffer 적재
+- 추가 이동
+- 충돌 처리
+
+`arrived` 상태가 된 이후에도 `success_sustain` 보상은 계속 유지된다.
+
+### detour 비교 보상
+
+- 학습 중에는 `detour_only` 기준선을 함께 전진시킨다.
+- actor의 도착 수가 detour보다 많으면 작은 step 보너스를 준다.
+- episode 종료 시 actor 충돌 수가 detour보다 적으면 1회 보너스를 준다.
+- 충돌 종료 보너스는 actor 충돌 수가 낮을수록 단계적으로 더 커진다.
 
 ### success buffer
 
 - 일반 replay buffer에는 `base_move` step이 계속 쌓인다.
 - success replay buffer에는 성공 순간만이 아니라, 성공 직전 최근 `base_move` 구간도 함께 적재된다.
 - 기본 최근 구간 길이는 `8 step`이다.
-
-단, `arrived` agent의 이후 step은 일반 replay와 success replay 모두에 쌓이지 않는다.
+- `arrived` 상태의 반복 sustain step은 success replay를 과도하게 늘리지 않도록 일반 replay 위주로 반영된다.
 
 ### 학습 로그 기준
 
 학습 로그는 10 episode마다 다음 항목을 출력한다.
 
 - `start_in_sense`: episode 시작 시 이미 `sense_radius` 안에 있던 agent 수
-- `in_sense_end`: episode 종료 시 `sense_radius` 안에 남아 있던 agent 수와 비율
-- `recent100`: 최근 100 episode 누적 기준 종료 시 `sense_radius` 안에 있던 agent 비율
+- `in_sense_end`: episode 종료 시 actor가 `sense_radius` 안에 남긴 agent 수
+- `detour_end`: 같은 episode에서 detour-only가 `sense_radius` 안에 남긴 agent 수
+- 괄호 안 비율: `actor / detour`
+- `recent100`: 최근 100 episode 누적 actor 종료 수
+- `detour100`: 최근 100 episode 누적 detour 종료 수와 actor/detour 비율
 - `succ_buf`: success replay buffer에 쌓인 sample 수
 - `growth@N`: 최근 기록 창 기준 success buffer 증가량
 - `alpha`: 현재 SAC entropy coefficient
-- `collisions`: episode 동안 새로 집계된 충돌 수
+- `collisions`: episode 동안 tick 기준으로 누적된 actor 충돌 수
+- `detour_col`: episode 동안 tick 기준으로 누적된 detour 충돌 수
 
 `best` 체크포인트 외에 최신 진행 상태도 저장한다.
 

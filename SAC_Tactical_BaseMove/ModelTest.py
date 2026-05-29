@@ -23,6 +23,10 @@ ROLE_COLORS = {
 }
 
 DETOUR_PATH_COLOR = (150, 150, 150)
+BUTTON_BG = (44, 52, 60)
+BUTTON_ACTIVE = (74, 112, 74)
+BUTTON_TEXT = (235, 235, 235)
+BUTTON_BORDER = (110, 120, 130)
 
 
 def maybe_sample_agent_role_rules(env):
@@ -281,7 +285,6 @@ def _init_detour_reference_state(env):
         "agent_pos": np.asarray(env.agent_pos, dtype=np.float32).copy(),
         "agent_height": float(env.agent_height),
         "collision_total": 0,
-        "prev_collided": np.zeros((env.num_agents,), dtype=bool),
     }
 
 
@@ -413,12 +416,7 @@ def _step_detour_reference(env, ref_state):
     ref_state["arrived_agents"] = np.asarray(env._arrived_agents, dtype=bool).copy()
     ref_state["agent_pos"] = env.agent_pos.copy()
     ref_state["agent_height"] = float(env.agent_height)
-    prev_collided = np.asarray(ref_state.get("prev_collided", np.zeros((env.num_agents,), dtype=bool)), dtype=bool).reshape(-1)
-    if prev_collided.shape != collision_detected.shape:
-        prev_collided = np.zeros_like(collision_detected, dtype=bool)
-    collision_starts = collision_detected & (~prev_collided)
-    ref_state["collision_total"] = int(ref_state.get("collision_total", 0)) + int(np.count_nonzero(collision_starts))
-    ref_state["prev_collided"] = collision_detected.copy()
+    ref_state["collision_total"] = int(ref_state.get("collision_total", 0)) + int(np.count_nonzero(collision_detected))
 
     info = {
         "agent_positions": env.agent_positions.copy(),
@@ -514,6 +512,35 @@ def _relative_rate_vs_detour(actor_count: int, detour_count: int) -> float:
     return 100.0 if int(actor_count) == 0 else 0.0
 
 
+def _build_control_buttons(screen_width: int):
+    labels = ["Pause", "Fast"]
+    buttons = []
+    x = screen_width - 196
+    y = 8
+    w = 92
+    h = 28
+    gap = 8
+    for idx, label in enumerate(labels):
+        buttons.append({"label": label, "rect": pygame.Rect(x + idx * (w + gap), y, w, h)})
+    return buttons
+
+
+def _draw_control_buttons(screen, font, buttons, paused, fast_mode):
+    states = {
+        "Pause": "Paused" if paused else "Pause",
+        "Fast": "On" if fast_mode else "Fast",
+    }
+    for button in buttons:
+        label = button["label"]
+        rect = button["rect"]
+        active = (label == "Pause" and paused) or (label == "Fast" and fast_mode)
+        pygame.draw.rect(screen, BUTTON_ACTIVE if active else BUTTON_BG, rect, border_radius=6)
+        pygame.draw.rect(screen, BUTTON_BORDER, rect, width=1, border_radius=6)
+        surf = font.render(f"{label}:{states[label]}", True, BUTTON_TEXT)
+        text_rect = surf.get_rect(center=rect.center)
+        screen.blit(surf, text_rect)
+
+
 def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, visualize=True, save_csv_path=None, visualize_detour_compare=True, detour_env=None):
     obs, info = reset_env_compat(env)
     if visualize_detour_compare and detour_env is not None:
@@ -570,38 +597,60 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
             pygame.display.set_caption("ModelTest - Majestro NavMesh")
             clock = pygame.time.Clock()
             font = pygame.font.SysFont("consolas", 16)
-            screen_bundle = (screen, clock, font, world_to_screen, width, compare_enabled)
+            screen_bundle = (screen, clock, font, world_to_screen, width, compare_enabled, False)
         else:
-            screen, clock, font, world_to_screen, width, compare_enabled = screen_bundle
+            if len(screen_bundle) >= 7:
+                screen, clock, font, world_to_screen, width, compare_enabled, persisted_fast_mode = screen_bundle
+            else:
+                screen, clock, font, world_to_screen, width, compare_enabled = screen_bundle
+                persisted_fast_mode = False
 
     ep_ret = 0.0
     total_collisions = 0
-    prev_collided = np.zeros((initial_total_agents,), dtype=bool)
     final_info = {}
     env_terminated = False
     env_truncated = False
     user_aborted = False
+    paused = False
+    fast_mode = bool(persisted_fast_mode) if 'persisted_fast_mode' in locals() else False
+    controls = _build_control_buttons(screen.get_width()) if (visualize and HAS_PYGAME and screen is not None) else []
 
     for step in range(max_steps):
+        draw_enabled = visualize and (not fast_mode)
         if visualize and HAS_PYGAME and screen is not None:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     user_aborted = True
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     user_aborted = True
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+                    paused = not paused
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    for button in controls:
+                        if button["rect"].collidepoint(event.pos):
+                            label = button["label"]
+                            if label == "Pause":
+                                paused = not paused
+                            elif label == "Fast":
+                                fast_mode = not fast_mode
+                                if fast_mode:
+                                    paused = False
 
         if user_aborted:
             break
+
+        if paused:
+            if draw_enabled and HAS_PYGAME and screen is not None:
+                _draw_control_buttons(screen, font, controls, paused, fast_mode)
+                pygame.display.flip()
+                clock.tick(30)
+            continue
 
         action = policy_act(actor, obs)
         obs, reward, env_terminated, env_truncated, final_info = env.step(action)
         ep_ret += float(np.mean(np.asarray(reward, dtype=np.float32)))
         collided = np.asarray(final_info.get("collided", np.zeros((initial_total_agents,), dtype=bool)), dtype=bool).reshape(-1)
-        if prev_collided.shape != collided.shape:
-            prev_collided = np.zeros_like(collided, dtype=bool)
-        collision_starts = collided & (~prev_collided)
-        total_collisions += int(np.count_nonzero(collision_starts))
-        prev_collided = collided.copy()
+        total_collisions += int(np.count_nonzero(collided))
         if visualize_detour_compare and detour_env is not None and detour_ref_state is not None:
             detour_info = _step_detour_reference(detour_env, detour_ref_state)
             detour_info["preview_paths"] = detour_preview_paths
@@ -613,7 +662,7 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
             if idx < len(agent_trajs):
                 agent_trajs[idx].append(pos.copy())
 
-        if visualize and HAS_PYGAME and screen is not None:
+        if draw_enabled and HAS_PYGAME and screen is not None:
             screen.fill((14, 16, 20))
             role_ids = final_info.get("role_ids")
             if role_ids is None:
@@ -687,6 +736,7 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
                     scale,
                 )
 
+            _draw_control_buttons(screen, font, controls, paused, fast_mode)
             pygame.display.flip()
             clock.tick(60)
 
@@ -720,19 +770,6 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
     detour_terminal_in_sense = int(np.count_nonzero(detour_terminal_mask)) if len(detour_terminal_mask) > 0 else 0
     vs_detour_rate = _relative_rate_vs_detour(terminal_in_sense, detour_terminal_in_sense) if visualize_detour_compare else 0.0
 
-    print(
-        f"[Eval] {outcome} | return={ep_ret:.3f} "
-        f"| start_in_sense={initial_in_sense:3d}/{initial_total_agents:3d} "
-        f"| farthest=A{farthest_agent_idx} straight={farthest_agent_dist:.1f} geo={farthest_agent_geo_dist:.1f} "
-        f"| in_sense_end={terminal_in_sense:3d}/{terminal_total_agents:3d} ({terminal_rate:5.1f}%) "
-        + (
-            f"| detour_end={detour_terminal_in_sense:3d}/{terminal_total_agents:3d} "
-            f"| vs_detour={vs_detour_rate:5.1f}% "
-            if visualize_detour_compare
-            else ""
-        )
-        + f"| collisions={total_collisions}"
-    )
     metrics = {
         "start_in_sense": initial_in_sense,
         "end_in_sense": terminal_in_sense,
@@ -745,6 +782,8 @@ def evaluate_once(env, actor, max_steps=None, scale=0.03, screen_bundle=None, vi
         "farthest_agent_dist": farthest_agent_dist,
         "farthest_agent_geo_dist": farthest_agent_geo_dist,
     }
+    if visualize and HAS_PYGAME and screen is not None:
+        screen_bundle = (screen, clock, font, world_to_screen, width, compare_enabled, fast_mode)
     return ep_ret, success, outcome, screen_bundle, metrics
 
 
@@ -844,6 +883,7 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--scale", type=float, default=0.03)
     ap.add_argument("--no-visualize", action="store_true", default=False)
+    ap.add_argument("--no-draw", action="store_true", default=False)
     ap.add_argument("--no-detour-compare", action="store_true", default=False)
     ap.add_argument("--move-step-size", type=float, default=120.0)
     ap.add_argument("--tactical-target-radius", type=float, default=600.0)
@@ -922,7 +962,7 @@ if __name__ == "__main__":
         actor,
         episodes=args.episodes,
         scale=args.scale,
-        visualize=(HAS_PYGAME and (not args.no_visualize)),
+        visualize=(HAS_PYGAME and (not args.no_visualize) and (not args.no_draw)),
         visualize_every=1,
         auto_quit=True,
         save_last_csv=str(Path("last_eval_traj.csv").resolve()),

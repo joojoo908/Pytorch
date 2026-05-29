@@ -1566,9 +1566,10 @@ class MajestroNavMeshEnv(gym.Env):
             self.agent_role_ids[idx] = step_role_ids[idx]
             self.role_targets[idx] = old_role_targets[idx]
             if bool(self._arrived_agents[idx]):
-                rewards[idx] = 0.0
-                terms_list[idx] = {"arrived": 1.0}
-                success_mask[idx] = True
+                rewards[idx] += self._R_SUCCESS_SUSTAIN
+                terms_list[idx]["success_sustain"] = self._R_SUCCESS_SUSTAIN
+                terms_list[idx]["arrived"] = 1.0
+                success_mask[idx] = False
                 self._prev_geo[idx] = np.nan if new_geo is None else float(new_geo)
                 self._prev_success_mask[idx] = True
                 self._prev_in_sense_mask[idx] = True

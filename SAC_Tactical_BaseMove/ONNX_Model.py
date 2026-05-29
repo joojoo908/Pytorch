@@ -96,7 +96,7 @@ def export_role_actor(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export base_move SAC actor to ONNX.")
-    parser.add_argument("--actor-path", type=str, default="sac_actor_last.pth", help="Path to base_move_actor checkpoint.")
+    parser.add_argument("--actor-path", type=str, default="sac_actor_best.pth", help="Path to base_move_actor checkpoint.")
     parser.add_argument("--out-dir", type=str, default="onnx_roles", help="Directory to write ONNX file.")
     parser.add_argument("--opset", type=int, default=17)
     parser.add_argument("--obs-dim", type=int, default=None, help="Optional explicit observation dim. Must match checkpoint.")
