@@ -305,7 +305,7 @@ class MajestroNavMeshEnv(gym.Env):
     ):
         super().__init__()
         if navmesh_path is None:
-            navmesh_path = Path(__file__).resolve().parent / "Resources" / "NavMesh" / "all_tiles_navmesh.bin"
+            navmesh_path = Path(__file__).resolve().parent / "Resources" / "NavMesh" / "MapDesert_navmesh.bin"
         self.navmesh_path = str(navmesh_path)
         self._nav = MajestroNavMeshData(self.navmesh_path)
         self.triangles = self._nav.triangles

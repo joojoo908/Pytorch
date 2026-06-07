@@ -68,16 +68,20 @@ def _apply_agent_role_rules(env, chosen):
     setattr(env, "_current_agent_role_rule_sample_index", None)
 
 
-def make_world_to_screen(bounds_min, bounds_max, scale, y_scale=1.0):
+def make_world_to_screen(bounds_min, bounds_max, scale, y_scale=1.0, min_width=640, min_height=720):
     min_x, min_z = float(bounds_min[0]), float(bounds_min[1])
     max_x, max_z = float(bounds_max[0]), float(bounds_max[1])
-    width = max(1, int((max_x - min_x) * scale))
-    height = max(1, int((max_z - min_z) * scale * y_scale))
+    render_width = max(1, int((max_x - min_x) * scale))
+    render_height = max(1, int((max_z - min_z) * scale * y_scale))
+    width = max(int(min_width), render_width, 1)
+    height = max(int(min_height), render_height, 1)
+    pad_x = max(0, (width - render_width) // 2)
+    pad_y = max(0, (height - render_height) // 2)
 
     def world_to_screen(p):
         x, z = float(p[0]), float(p[1])
-        sx = int((x - min_x) * scale)
-        sy = int((max_z - z) * scale * y_scale)
+        sx = pad_x + int((x - min_x) * scale)
+        sy = pad_y + int((max_z - z) * scale * y_scale)
         return sx, sy
 
     return width, height, world_to_screen
