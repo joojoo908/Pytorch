@@ -294,9 +294,10 @@ class MajestroNavMeshEnv(gym.Env):
         ray_length: float = 600.0,
         sense_radius: float | None = None,
         collision_penalty: float = 0.35,
-        stall_penalty: float = 0.05,
+        stall_penalty: float = 0.12,
         stall_patience: int = 20,
         time_penalty: float = 0.01,
+        idle_penalty: float = 0.06,
         success_reward: float = 50.0,
         role_rule: str = "fixed",
         agent_role_rules: Optional[Sequence[str]] = None,
@@ -306,6 +307,9 @@ class MajestroNavMeshEnv(gym.Env):
         dynamic_horizon_Tmin: int = 96,
         dynamic_horizon_Tmax: int = 1024,
         dynamic_horizon_use_geodesic: bool = True,
+        moving_goal_enabled: bool = True,
+        moving_goal_speed_scale: float = (1.0 / 3.0),
+        spawn_agents_near_goal: bool = False,
     ):
         super().__init__()
         if navmesh_path is None:
@@ -333,12 +337,13 @@ class MajestroNavMeshEnv(gym.Env):
         self.stall_penalty = float(stall_penalty)
         self.stall_patience = int(stall_patience)
         self.time_penalty = float(time_penalty)
+        self.idle_penalty = float(idle_penalty)
         self._R_SUCCESS = float(success_reward)
         self._R_SUCCESS_ENTRY = 20.0
         self._R_SUCCESS_SUSTAIN = 2.0
         self._R_SUCCESS_DROP = 3.0
-        self._R_SENSE_ENTRY = 3.0
-        self._R_SENSE_SUSTAIN = 0.5
+        self._R_SENSE_ENTRY = 0.4
+        self._R_SENSE_SUSTAIN = 0.0
         self._R_SENSE_DROP = 1.5
         self.role_rule = str(role_rule).strip().lower()
         self.agent_role_rules = None if agent_role_rules is None else [str(x).strip().lower() for x in agent_role_rules]
@@ -349,6 +354,9 @@ class MajestroNavMeshEnv(gym.Env):
         self.dynamic_horizon_Tmin = int(dynamic_horizon_Tmin)
         self.dynamic_horizon_Tmax = int(dynamic_horizon_Tmax)
         self.dynamic_horizon_use_geodesic = bool(dynamic_horizon_use_geodesic)
+        self.moving_goal_enabled = bool(moving_goal_enabled)
+        self.moving_goal_speed_scale = float(max(0.0, moving_goal_speed_scale))
+        self.spawn_agents_near_goal = bool(spawn_agents_near_goal)
 
         self._seed_value = seed
         self.rng = random.Random(seed)
@@ -378,6 +386,9 @@ class MajestroNavMeshEnv(gym.Env):
         self.goal_pos = np.zeros(2, dtype=np.float32)
         self.agent_height = 0.0
         self.goal_height = 0.0
+        self.goal_destination = np.zeros(2, dtype=np.float32)
+        self.goal_destination_height = 0.0
+        self.goal_path: List[np.ndarray] = []
         self.num_agents = 1 + self.num_other_agents
         self.agent_positions = np.zeros((self.num_agents, 2), dtype=np.float32)
         self.agent_heights = np.zeros((self.num_agents,), dtype=np.float32)
@@ -694,33 +705,129 @@ class MajestroNavMeshEnv(gym.Env):
             self.agent_height = float(start_height)
 
         moved, moved_height, nav_collided = self._move_along_navmesh(start, target)
-        agent_blocked = False
-        if self._collides_with_other_agents(moved, ignore_index=ignore_index):
-            agent_blocked = True
-            direction = moved - start
-            dist = float(np.linalg.norm(direction))
-            if dist > 1e-6:
-                lo = start.copy()
-                hi = moved.copy()
-                best = start.copy()
-                best_height = float(start_height if start_height is not None else moved_height)
-                for _ in range(7):
-                    mid = (lo + hi) * 0.5
-                    mid_h = self._sample_height(mid)
-                    if mid_h is None or self._collides_with_other_agents(mid, ignore_index=ignore_index):
-                        hi = mid
-                    else:
-                        best = mid
-                        best_height = float(mid_h)
-                        lo = mid
-                moved = best.astype(np.float32)
-                moved_height = best_height
-            else:
-                moved = start.copy()
-                moved_height = float(start_height if start_height is not None else saved_height)
+        agent_blocked = self._collides_with_other_agents(moved, ignore_index=ignore_index)
 
         self.agent_height = saved_height
         return moved, float(moved_height), bool(nav_collided or agent_blocked)
+
+    def _sample_moving_goal_destination(self, anchor_pos: np.ndarray, max_tries: int = 64) -> np.ndarray:
+        anchor = np.asarray(anchor_pos, dtype=np.float32).reshape(-1)[:2]
+        sense_radius = max(1.0, float(self.sense_radius))
+        for _ in range(max(1, int(max_tries))):
+            theta = float(self.nprng.uniform(0.0, 2.0 * np.pi))
+            radius = float(sense_radius * np.sqrt(self.nprng.uniform(0.0, 1.0)))
+            cand = anchor + np.array([np.cos(theta) * radius, np.sin(theta) * radius], dtype=np.float32)
+            snapped = self._nearest_valid_point(cand, max_radius=8)
+            if snapped is None:
+                continue
+            snapped_pos = np.asarray(snapped[0], dtype=np.float32).copy()
+            if float(np.linalg.norm(snapped_pos - anchor)) >= max(8.0, self.agent_radius * 0.5):
+                return snapped_pos
+        return anchor.copy()
+
+    def _build_goal_detour_path(
+        self,
+        start_pos: np.ndarray,
+        target_pos: np.ndarray,
+        start_height: Optional[float] = None,
+        target_height: Optional[float] = None,
+        max_hops: int = 32,
+    ) -> List[np.ndarray]:
+        path = [np.asarray(start_pos, dtype=np.float32).reshape(-1)[:2].copy()]
+        cur = path[0].copy()
+        cur_height = float(self.goal_height if start_height is None else start_height)
+        tgt = np.asarray(target_pos, dtype=np.float32).reshape(-1)[:2].copy()
+        tgt_height = float(cur_height if target_height is None else target_height)
+        seen = set()
+        reach_tol = max(self._grid_cell_size * 0.75, 8.0)
+
+        for _ in range(max(1, int(max_hops))):
+            key = (round(float(cur[0]), 2), round(float(cur[1]), 2))
+            if key in seen:
+                break
+            seen.add(key)
+            waypoint = self._detour_next_waypoint_to_target(cur, tgt, height=cur_height, target_height=tgt_height)
+            if waypoint is None:
+                break
+            waypoint = np.asarray(waypoint, dtype=np.float32).reshape(-1)[:2]
+            if float(np.linalg.norm(waypoint - cur)) <= 1e-3:
+                break
+            path.append(waypoint.copy())
+            cur = waypoint
+            mid_h = self._sample_height(cur)
+            if mid_h is not None:
+                cur_height = float(mid_h)
+            if float(np.linalg.norm(tgt - cur)) <= reach_tol:
+                break
+
+        if float(np.linalg.norm(path[-1] - tgt)) > 1e-3:
+            path.append(tgt.copy())
+        return path
+
+    def _update_goal_geo(self) -> None:
+        goal_rc = self._world_to_grid_rc(self.goal_pos)
+        self._geo_goal_rc = goal_rc
+        self._geo_map = self._compute_geodesic_map(goal_rc)
+
+    def _advance_moving_goal(self) -> None:
+        if not self.moving_goal_enabled:
+            self.goal_destination = self.goal_pos.copy()
+            self.goal_destination_height = float(self.goal_height)
+            self.goal_path = [self.goal_pos.copy()]
+            return
+
+        current_goal = np.asarray(self.goal_pos, dtype=np.float32).reshape(-1)[:2].copy()
+        move_step = max(1.0, float(self.step_size) * float(self.moving_goal_speed_scale))
+        reach_tol = max(self._grid_cell_size * 0.75, move_step * 0.5, 8.0)
+        goal_destination = np.asarray(self.goal_destination, dtype=np.float32).reshape(-1)[:2].copy()
+        if (not np.all(np.isfinite(goal_destination))) or float(np.linalg.norm(goal_destination - current_goal)) <= reach_tol:
+            goal_destination = self._sample_moving_goal_destination(current_goal)
+            self.goal_destination = goal_destination.copy()
+            sampled_h = self._sample_height(goal_destination)
+            self.goal_destination_height = float(self.goal_height if sampled_h is None else sampled_h)
+
+        next_goal = current_goal.copy()
+        next_goal_height = float(self.goal_height)
+        detour_result = self._detour_next_waypoint_with_min_progress(
+            current_goal,
+            goal_destination,
+            min_progress=max(self._grid_cell_size * 0.75, move_step * 0.35),
+            height=float(self.goal_height),
+            target_height=float(self.goal_destination_height),
+        )
+        if detour_result is not None:
+            waypoint, waypoint_height = detour_result
+            waypoint = np.asarray(waypoint, dtype=np.float32).reshape(-1)[:2]
+            delta = waypoint - current_goal
+            dist = float(np.linalg.norm(delta))
+            if dist > 1e-6:
+                if dist > move_step:
+                    next_goal = current_goal + (delta / dist) * move_step
+                else:
+                    next_goal = waypoint
+                next_goal_height = float(waypoint_height)
+        else:
+            delta = goal_destination - current_goal
+            dist = float(np.linalg.norm(delta))
+            if dist > 1e-6:
+                if dist > move_step:
+                    next_goal = current_goal + (delta / dist) * move_step
+                else:
+                    next_goal = goal_destination.copy()
+                sampled_h = self._sample_height(next_goal)
+                if sampled_h is not None:
+                    next_goal_height = float(sampled_h)
+
+        self.goal_pos = np.asarray(next_goal, dtype=np.float32)
+        sampled_goal_h = self._sample_height(self.goal_pos)
+        self.goal_height = float(next_goal_height if sampled_goal_h is None else sampled_goal_h)
+        self.goal_path = self._build_goal_detour_path(
+            self.goal_pos,
+            self.goal_destination,
+            start_height=self.goal_height,
+            target_height=self.goal_destination_height,
+        )
+        self._update_goal_geo()
 
     def _compute_geodesic_map(self, goal_rc: Tuple[int, int]) -> np.ndarray:
         rows, cols = self._walkable.shape
@@ -1303,30 +1410,43 @@ class MajestroNavMeshEnv(gym.Env):
         side_dir = np.array([-goal_dir[1], goal_dir[0]], dtype=np.float32)
 
         if role_id == ROLE_FRONT:
+            front_success_radius = self.success_radius * 1.15
             directness = float(np.dot(self._normalize_vec(self.agent_velocities[agent_index]), goal_dir))
             direct_bonus = 0.12 * max(0.0, directness)
             bonus += direct_bonus
             terms["role_front"] = direct_bonus
-            tactical_success = bool(goal_dist <= self.success_radius * 1.15 and directness >= 0.45)
+            if goal_dist <= front_success_radius:
+                front_hold_bonus = 0.04
+                bonus += front_hold_bonus
+                terms["role_front_hold"] = front_hold_bonus
+            tactical_success = bool(goal_dist <= front_success_radius)
         elif role_id == ROLE_COVER:
             anchor = self._closest_cover_anchor(agent_index)
             cover_bonus = 0.0
-            cover_goal_cap = max(1.0, float(self.sense_radius))
+            cover_goal_min = max(0.0, float(self.sense_radius) - 300.0)
+            cover_goal_cap = max(cover_goal_min + 1.0, float(self.sense_radius))
             if anchor is not None:
                 anchor_to_goal = self.goal_pos - anchor
                 me_to_anchor = new_pos - anchor
                 behind_score = float(np.dot(self._normalize_vec(me_to_anchor), -self._normalize_vec(anchor_to_goal)))
-                distance_gate = max(0.0, 1.0 - goal_dist / max(cover_goal_cap, 1.0))
+                if cover_goal_min <= goal_dist <= cover_goal_cap:
+                    distance_gate = 1.0
+                elif goal_dist < cover_goal_min:
+                    distance_gate = max(0.0, 1.0 - (cover_goal_min - goal_dist) / max(self.success_radius * 4.0, 1.0))
+                else:
+                    distance_gate = max(0.0, 1.0 - (goal_dist - cover_goal_cap) / max(self.success_radius * 4.0, 1.0))
                 cover_bonus += 0.10 * max(0.0, behind_score) * distance_gate
                 line_gap = float(np.linalg.norm((new_pos - self.goal_pos) - anchor_to_goal))
                 cover_bonus -= 0.02 * min(line_gap / max(self.agent_radius * 4.0, 1.0), 1.5)
                 anchor_dist = float(np.linalg.norm(me_to_anchor))
                 if goal_dist > cover_goal_cap:
                     cover_bonus -= 0.08 * min((goal_dist - cover_goal_cap) / max(self.success_radius, 1.0), 2.0)
+                elif goal_dist < cover_goal_min:
+                    cover_bonus -= 0.08 * min((cover_goal_min - goal_dist) / max(self.success_radius, 1.0), 2.0)
                 tactical_success = bool(
                     behind_score >= 0.55
                     and anchor_dist <= self.agent_radius * 3.5
-                    and goal_dist <= cover_goal_cap
+                    and cover_goal_min <= goal_dist <= cover_goal_cap
                 )
             if goal_dist < self.success_radius * 0.6:
                 cover_bonus -= 0.05
@@ -1369,39 +1489,39 @@ class MajestroNavMeshEnv(gym.Env):
             my_dist, covered_rays, participant_count = self._surround_stats(agent_index, pos=new_pos)
             ring_error = abs(my_dist - surround_radius)
             surround_bonus = 0.10 * max(0.0, 1.0 - ring_error / max(surround_radius, 1.0))
-            target_rays = max(1, min(8, participant_count))
-            ray_coverage = float(covered_rays) / float(target_rays)
-            surround_bonus += 0.12 * min(ray_coverage, 1.0)
-            terms["role_surround_coverage"] = 0.12 * min(ray_coverage, 1.0)
-            if participant_count >= 3:
-                surround_bonus += 0.04
+            if collided:
+                surround_bonus -= 0.40
+                terms["role_surround_collision"] = -0.40
             bonus += surround_bonus
             terms["role_surround"] = surround_bonus
             tactical_success = bool(
-                participant_count >= 3
+                (not collided)
                 and ring_error <= self.agent_radius * 1.5
-                and covered_rays >= target_rays
             )
         else:
-            kiting_min_dist = max(0.0, float(self.sense_radius) - 100.0)
+            kiting_min_dist = max(0.0, float(self.sense_radius) - 300.0)
             kiting_max_dist = max(kiting_min_dist + 1.0, float(self.sense_radius))
             kiting_radius = 0.5 * (kiting_min_dist + kiting_max_dist)
             band_half_width = max(1.0, 0.5 * (kiting_max_dist - kiting_min_dist))
             ring_error = abs(goal_dist - kiting_radius)
             in_kiting_band = bool(kiting_min_dist <= goal_dist <= kiting_max_dist)
             velocity_dir = self._normalize_vec(self.agent_velocities[agent_index])
-            retreat_alignment = float(np.dot(velocity_dir, -goal_dir))
+            tangent_alignment = abs(float(np.dot(velocity_dir, side_dir)))
             kiting_bonus = 0.12 * max(0.0, 1.0 - ring_error / band_half_width)
             if in_kiting_band:
                 kiting_bonus += 0.08
-            kiting_bonus += 0.05 * max(0.0, retreat_alignment)
+                orbit_bonus = 0.06 * max(0.0, tangent_alignment)
+                kiting_bonus += orbit_bonus
+                terms["role_kiting_orbit"] = orbit_bonus
             if goal_dist < kiting_min_dist:
                 kiting_bonus -= 0.10 * min((kiting_min_dist - goal_dist) / max(self.success_radius, 1.0), 1.5)
+            if collided:
+                kiting_bonus -= 0.40
+                terms["role_kiting_collision"] = -0.40
             bonus += kiting_bonus
             terms["role_kiting"] = kiting_bonus
             tactical_success = bool(
                 in_kiting_band
-                and retreat_alignment >= 0.15
             )
 
         terms["tactical_success"] = 1.0 if tactical_success else 0.0
@@ -1512,6 +1632,7 @@ class MajestroNavMeshEnv(gym.Env):
 
         self.agent_positions[0] = self.agent_pos.copy()
         self.agent_heights[0] = self.agent_height
+        anchor_pos = self.goal_pos.copy() if self.spawn_agents_near_goal else self.agent_pos.copy()
         avoid = [self.agent_pos.copy(), self.goal_pos.copy()]
         min_dist = max(self.agent_radius * 1.0, self.success_radius * self.agent_spawn_min_scale)
         max_dist = max(min_dist, self.success_radius * self.agent_spawn_max_scale)
@@ -1519,7 +1640,7 @@ class MajestroNavMeshEnv(gym.Env):
             pos, height = self._sample_spawn_point(
                 avoid,
                 min_dist=min_dist,
-                anchor=self.agent_pos,
+                anchor=anchor_pos,
                 max_dist=max_dist,
             )
             self.agent_positions[idx] = pos
@@ -1586,6 +1707,28 @@ class MajestroNavMeshEnv(gym.Env):
             self._geo_map = best_geo
             self._geo_goal_rc = best_goal
 
+        if self.spawn_agents_near_goal:
+            spawn_min_dist = max(self.agent_radius * 1.0, self.success_radius * self.agent_spawn_min_scale)
+            spawn_max_dist = max(spawn_min_dist, self.success_radius * self.agent_spawn_max_scale)
+            spawn_pos, spawn_height = self._sample_spawn_point(
+                [self.goal_pos.copy()],
+                min_dist=spawn_min_dist,
+                anchor=self.goal_pos,
+                max_dist=spawn_max_dist,
+            )
+            self.agent_pos = spawn_pos.astype(np.float32)
+            self.agent_height = float(spawn_height)
+
+        self.goal_destination = self._sample_moving_goal_destination(self.goal_pos)
+        sampled_dest_h = self._sample_height(self.goal_destination)
+        self.goal_destination_height = float(self.goal_height if sampled_dest_h is None else sampled_dest_h)
+        self.goal_path = self._build_goal_detour_path(
+            self.goal_pos,
+            self.goal_destination,
+            start_height=self.goal_height,
+            target_height=self.goal_destination_height,
+        )
+
         self._reset_all_agents()
         self._assign_roles()
         self._update_role_targets()
@@ -1616,6 +1759,8 @@ class MajestroNavMeshEnv(gym.Env):
         if acts.shape != (self.num_agents, 2):
             acts = np.zeros((self.num_agents, 2), dtype=np.float32)
 
+        self._advance_moving_goal()
+
         old_positions = self.agent_positions.copy()
         step_role_ids = self.agent_role_ids.copy()
         old_geos = np.array([self._geo_distance(p) for p in old_positions], dtype=object)
@@ -1635,10 +1780,15 @@ class MajestroNavMeshEnv(gym.Env):
 
         for idx in range(self.num_agents):
             old_pos = old_positions[idx]
+            role_id = int(step_role_ids[idx]) if idx < len(step_role_ids) else ROLE_NONE
             _, fail_code = self._sense_local_space(idx, max(self.map_range, 1.0))
             sensor_fail_codes[idx] = fail_code
             target_offset = np.clip(acts[idx], -1.0, 1.0) * self.tactical_target_radius
-            if fail_code > 0.5:
+            if role_id == ROLE_BASE_MOVE:
+                desired_target = self.goal_pos.copy()
+                snapped_target = self.goal_pos.copy()
+                snapped_height = float(self.goal_height)
+            elif fail_code > 0.5:
                 desired_target = self.goal_pos.copy()
                 snapped_target = self.goal_pos.copy()
                 snapped_height = float(self.goal_height)
@@ -1654,6 +1804,26 @@ class MajestroNavMeshEnv(gym.Env):
                 waypoint = None
                 waypoint_height = float("nan")
                 reach_tol = max(self._grid_cell_size * 0.50, self.step_size * 0.35)
+                role_nav_target = old_role_targets[idx].astype(np.float32)
+                role_nav_height = self._sample_height(role_nav_target)
+                role_detour_target = role_nav_target
+                role_detour_height = float(snapped_height if snapped_height is not None else self.agent_heights[idx])
+                if role_nav_height is not None:
+                    role_detour_height = float(role_nav_height)
+                role_detour_result = None
+                if fail_code <= 0.5 and role_id != ROLE_NONE:
+                    role_detour_result = self._detour_next_waypoint_with_min_progress(
+                        old_pos,
+                        role_detour_target,
+                        min_progress=max(self._grid_cell_size * 0.50, self.step_size * 0.25),
+                        height=float(self.agent_heights[idx]),
+                        target_height=role_detour_height,
+                    )
+                    if role_detour_result is not None:
+                        snapped_target = role_detour_target
+                        snapped_height = role_detour_height
+                        desired_target = role_detour_target.copy()
+                        detour_targets[idx] = snapped_target
                 cached_waypoint = self.current_detour_waypoints[idx]
                 cached_waypoint_height = float(self.current_detour_waypoint_heights[idx])
                 if np.all(np.isfinite(cached_waypoint)):
@@ -1662,13 +1832,15 @@ class MajestroNavMeshEnv(gym.Env):
                         waypoint = cached_waypoint.astype(np.float32)
                         waypoint_height = cached_waypoint_height
                 if waypoint is None:
-                    detour_result = self._detour_next_waypoint_with_min_progress(
-                        old_pos,
-                        snapped_target,
-                        min_progress=max(self._grid_cell_size * 0.50, self.step_size * 0.25),
-                        height=float(self.agent_heights[idx]),
-                        target_height=snapped_height,
-                    )
+                    detour_result = role_detour_result
+                    if detour_result is None:
+                        detour_result = self._detour_next_waypoint_with_min_progress(
+                            old_pos,
+                            snapped_target,
+                            min_progress=max(self._grid_cell_size * 0.50, self.step_size * 0.25),
+                            height=float(self.agent_heights[idx]),
+                            target_height=snapped_height,
+                        )
                     if detour_result is not None:
                         waypoint, waypoint_height = detour_result
                         self.current_detour_waypoints[idx] = waypoint.astype(np.float32)
@@ -1735,6 +1907,9 @@ class MajestroNavMeshEnv(gym.Env):
             self.agent_positions[idx] = new_pos
             self.agent_heights[idx] = new_height
             self.agent_velocities[idx] = new_pos - old_pos
+            if moved_dist < max(self._grid_cell_size * 0.35, self.step_size * 0.08):
+                rewards[idx] -= self.idle_penalty
+                terms_list[idx]["idle_penalty"] = -self.idle_penalty
             current_wp = self.current_detour_waypoints[idx]
             if np.all(np.isfinite(current_wp)):
                 if float(np.linalg.norm(current_wp - new_pos)) <= max(self._grid_cell_size * 0.50, self.step_size * 0.20):
@@ -1805,12 +1980,9 @@ class MajestroNavMeshEnv(gym.Env):
             was_in_sense = bool(self._prev_in_sense_mask[idx])
             is_in_sense = bool(dists[idx] <= float(self.sense_radius))
             if role_id != ROLE_BASE_MOVE and role_id != ROLE_NONE:
-                if is_in_sense and not was_in_sense:
+                if is_in_sense and not was_in_sense and not bool(success_mask[idx]):
                     rewards[idx] += self._R_SENSE_ENTRY
                     terms_list[idx]["sense_entry"] = self._R_SENSE_ENTRY
-                elif is_in_sense:
-                    rewards[idx] += self._R_SENSE_SUSTAIN
-                    terms_list[idx]["sense_sustain"] = self._R_SENSE_SUSTAIN
                 elif was_in_sense:
                     rewards[idx] -= self._R_SENSE_DROP
                     terms_list[idx]["sense_drop"] = -self._R_SENSE_DROP
@@ -1827,6 +1999,10 @@ class MajestroNavMeshEnv(gym.Env):
                 rewards[idx] -= self._R_SUCCESS_DROP
                 terms_list[idx]["success_drop"] = -self._R_SUCCESS_DROP
 
+            if role_id == ROLE_SURROUND and bool(collisions[idx]) and rewards[idx] > 0.05:
+                terms_list[idx]["surround_collision_cap"] = float(0.05 - rewards[idx])
+                rewards[idx] = 0.05
+
         terminated = False
 
         self.agent_pos = self.agent_positions[0].copy()
@@ -1842,6 +2018,10 @@ class MajestroNavMeshEnv(gym.Env):
             "reward_terms": terms_list,
             "agent_heights": self.agent_heights.copy(),
             "goal_height": float(self.goal_height),
+            "goal_pos": self.goal_pos.copy(),
+            "goal_destination": self.goal_destination.copy(),
+            "goal_destination_height": float(self.goal_destination_height),
+            "goal_path": [pt.copy() for pt in self.goal_path],
             "tactical_target": tactical_targets.copy(),
             "requested_target": requested_targets.copy(),
             "agent_positions": self.agent_positions.copy(),

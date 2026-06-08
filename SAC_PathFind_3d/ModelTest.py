@@ -53,6 +53,14 @@ ROLE_COLORS = {
 }
 
 DETOUR_PATH_COLOR = (80, 255, 220)
+SURROUND_RING_COLOR = (64, 128, 255)
+RANDOM_TARGET_COLOR = (255, 230, 90)
+FRONT_RING_COLOR = (255, 96, 96)
+SIDEBAR_WIDTH = 540
+
+# Code-level defaults. Change these if you want to switch sources without CLI args.
+DEFAULT_ACTOR_PATH = "sac_actor_last.pth"
+DEFAULT_ACTOR_SOURCE = "single-best"  # "latest" | "single-best"
 
 
 def _normalize_rule_name(name: str) -> str:
@@ -104,10 +112,42 @@ def maybe_sample_agent_role_rules(env):
     return chosen
 
 
-def make_world_to_screen(bounds_min, bounds_max, scale):
+def apply_agent_role_rules(env, chosen_rules, chosen_index=None):
+    chosen = [str(x).strip().lower() for x in chosen_rules]
+    if hasattr(env, "configure_agent_group") and callable(env.configure_agent_group):
+        env.configure_agent_group(chosen)
+    else:
+        env.agent_role_rules = list(chosen)
+    setattr(env, "_current_agent_role_rule_sample", list(chosen))
+    setattr(env, "_current_agent_role_rule_sample_index", chosen_index)
+    return chosen
+
+
+def choose_agent_role_rules(env, selection_state=None):
+    pool = getattr(env, "agent_role_rule_pool", None)
+    if not pool:
+        return None
+    if selection_state is None:
+        return maybe_sample_agent_role_rules(env)
+    selected_index = selection_state.get("selected_index")
+    if selected_index is None:
+        chosen = maybe_sample_agent_role_rules(env)
+        selection_state["active_index"] = getattr(env, "_current_agent_role_rule_sample_index", None)
+        return chosen
+    idx = int(max(0, min(len(pool) - 1, int(selected_index))))
+    selection_state["active_index"] = idx
+    return apply_agent_role_rules(env, pool[idx], chosen_index=idx)
+
+
+def _format_rule_set_label(rules):
+    return ",".join(HEURISTIC_SHORT.get(str(rule), str(rule)[:4]) for rule in rules)
+
+
+def make_world_to_screen(bounds_min, bounds_max, scale, sidebar_width=0):
     min_x, min_z = float(bounds_min[0]), float(bounds_min[1])
     max_x, max_z = float(bounds_max[0]), float(bounds_max[1])
-    width = max(1, int((max_x - min_x) * scale))
+    map_width = max(1, int((max_x - min_x) * scale))
+    width = map_width + max(0, int(sidebar_width))
     height = max(1, int((max_z - min_z) * scale))
 
     def world_to_screen(p):
@@ -116,7 +156,7 @@ def make_world_to_screen(bounds_min, bounds_max, scale):
         sy = int((max_z - z) * scale)
         return sx, sy
 
-    return width, height, world_to_screen
+    return width, height, world_to_screen, map_width
 
 
 try:
@@ -124,6 +164,7 @@ try:
         GaussianPolicy,
         is_diverse_tactical_success,
         ROLE_IDS,
+        POLICY_ROLE_IDS,
         role_name,
         get_env_role_ids,
         role_policy_actions,
@@ -149,6 +190,7 @@ except Exception:
         return bool(front and cover and surround)
 
     ROLE_IDS = (0, 1, 2, 3, 4)
+    POLICY_ROLE_IDS = (0, 1, 3, 4)
 
     def role_name(role_id):
         return {-1: "none", 0: "front", 1: "cover", 2: "base_move", 3: "surround", 4: "kiting"}.get(int(role_id), f"role_{int(role_id)}")
@@ -167,6 +209,8 @@ except Exception:
         for role_id in ROLE_IDS:
             idxs = np.where((role_ids_arr == role_id) & sensor_ok)[0]
             if idxs.size == 0:
+                continue
+            if int(role_id) not in role_bundles:
                 continue
             actor = role_bundles[int(role_id)]["actor"]
             device = next(actor.parameters()).device
@@ -195,6 +239,43 @@ def build_env(**env_kwargs):
                 f"majestro_navmesh_env error: {majestro_exc}\n"
                 f"ENV error: {env_exc}"
             )
+
+
+def load_actor_state_map(actor_source: str, actor_path: str, role_ids) -> dict:
+    actor_source = str(actor_source).strip().lower()
+    if actor_source == "latest":
+        state_obj = torch.load(actor_path, map_location="cpu", weights_only=False)
+        if state_obj.get("format") != "multi_role_actor":
+            raise RuntimeError("Expected multi_role_actor checkpoint for actor_source='latest'.")
+        actors = state_obj.get("actors")
+        if not isinstance(actors, dict):
+            raise RuntimeError("Latest checkpoint is missing an 'actors' dict.")
+        return actors
+    if actor_source == "single-best":
+        actor_states = {}
+        actor_root = Path(actor_path)
+        for role_id in role_ids:
+            role_key = role_name(role_id)
+            role_actor_path = actor_root.with_name(f"{actor_root.stem}_{role_key}{actor_root.suffix or '.pth'}")
+            if not role_actor_path.exists():
+                fallback_root = actor_root.with_name(actor_root.name.replace("_last", "_best"))
+                fallback_role_actor_path = fallback_root.with_name(f"{fallback_root.stem}_{role_key}{fallback_root.suffix or '.pth'}")
+                if fallback_role_actor_path.exists():
+                    role_actor_path = fallback_role_actor_path
+                else:
+                    raise RuntimeError(
+                        f"Single-best actor checkpoint not found for role '{role_key}': "
+                        f"{role_actor_path} (fallback tried: {fallback_role_actor_path})"
+                    )
+            state_obj = torch.load(role_actor_path, map_location="cpu", weights_only=False)
+            if state_obj.get("format") != "single_role_actor":
+                raise RuntimeError(f"Expected single_role_actor checkpoint for role '{role_key}', got {state_obj.get('format')!r}")
+            actor_state = state_obj.get("actor")
+            if actor_state is None:
+                raise RuntimeError(f"Single-best checkpoint for role '{role_key}' is missing actor weights.")
+            actor_states[role_key] = actor_state
+        return actor_states
+    raise RuntimeError(f"Unsupported actor_source: {actor_source!r}")
 
 
 def reset_env_compat(env):
@@ -285,6 +366,171 @@ def policy_act(role_bundles, env, obs_np):
     return role_policy_actions(role_bundles, arr, role_ids_arr, deterministic=True)
 
 
+def _sample_random_detour_target(env, pos, rng, max_tries=64):
+    sense_radius = max(1.0, float(getattr(env, "sense_radius", 0.0)))
+    nearest_valid = getattr(env, "_nearest_valid_point", None)
+    if not callable(nearest_valid):
+        return np.asarray(pos, dtype=np.float32).copy()
+    for _ in range(max(1, int(max_tries))):
+        theta = float(rng.uniform(0.0, 2.0 * np.pi))
+        radius = float(sense_radius * np.sqrt(rng.uniform(0.0, 1.0)))
+        cand = np.asarray(pos, dtype=np.float32) + np.array(
+            [np.cos(theta) * radius, np.sin(theta) * radius],
+            dtype=np.float32,
+        )
+        snapped = nearest_valid(cand, max_radius=8)
+        if snapped is None:
+            continue
+        snapped_pos = np.asarray(snapped[0], dtype=np.float32).copy()
+        if float(np.linalg.norm(snapped_pos - pos)) >= max(8.0, float(getattr(env, "agent_radius", 0.0)) * 0.5):
+            return snapped_pos
+    return np.asarray(pos, dtype=np.float32).copy()
+
+
+def _build_detour_path_to_target(env, start_pos, target_pos, start_height=None, target_height=None, max_hops=32):
+    path = [np.asarray(start_pos, dtype=np.float32).reshape(-1)[:2].copy()]
+    detour_to_target = getattr(env, "_detour_next_waypoint_to_target", None)
+    sample_height = getattr(env, "_sample_height", None)
+    if not callable(detour_to_target):
+        path.append(np.asarray(target_pos, dtype=np.float32).reshape(-1)[:2].copy())
+        return path
+
+    cur = path[0].copy()
+    cur_height = float(getattr(env, "goal_height", 0.0) if start_height is None else start_height)
+    tgt = np.asarray(target_pos, dtype=np.float32).reshape(-1)[:2].copy()
+    tgt_height = float(cur_height if target_height is None else target_height)
+    seen = set()
+    reach_tol = max(float(getattr(env, "_grid_cell_size", 1.0)) * 0.75, 8.0)
+
+    for _ in range(max(1, int(max_hops))):
+        key = (round(float(cur[0]), 2), round(float(cur[1]), 2))
+        if key in seen:
+            break
+        seen.add(key)
+        waypoint = detour_to_target(cur, tgt, height=cur_height, target_height=tgt_height)
+        if waypoint is None:
+            break
+        waypoint = np.asarray(waypoint, dtype=np.float32).reshape(-1)[:2]
+        if float(np.linalg.norm(waypoint - cur)) <= 1e-3:
+            break
+        path.append(waypoint.copy())
+        cur = waypoint
+        if callable(sample_height):
+            h = sample_height(cur)
+            if h is not None:
+                cur_height = float(h)
+        if float(np.linalg.norm(tgt - cur)) <= reach_tol:
+            break
+
+    if float(np.linalg.norm(path[-1] - tgt)) > 1e-3:
+        path.append(tgt.copy())
+    return path
+
+
+def update_random_moving_goal(env, rng, target_state):
+    current_goal = np.asarray(getattr(env, "goal_pos", np.zeros((2,), dtype=np.float32)), dtype=np.float32).reshape(-1)[:2]
+
+    sample_height = getattr(env, "_sample_height", None)
+    world_to_grid = getattr(env, "_world_to_grid_rc", None)
+    compute_geo = getattr(env, "_compute_geodesic_map", None)
+    detour_with_progress = getattr(env, "_detour_next_waypoint_with_min_progress", None)
+
+    goal_height = float(getattr(env, "goal_height", 0.0))
+    move_step = max(1.0, float(getattr(env, "step_size", 1.0)))
+    min_progress = max(float(getattr(env, "_grid_cell_size", 1.0)) * 0.75, move_step * 0.35)
+    reach_tol = max(float(getattr(env, "_grid_cell_size", 1.0)) * 0.75, move_step * 0.5, 8.0)
+    goal_destination = target_state.get("goal_destination")
+    if goal_destination is not None:
+        goal_destination = np.asarray(goal_destination, dtype=np.float32).reshape(-1)[:2]
+        if float(np.linalg.norm(goal_destination - current_goal)) <= reach_tol:
+            goal_destination = None
+    if goal_destination is None:
+        goal_destination = _sample_random_detour_target(env, current_goal, rng)
+        target_state["goal_destination"] = goal_destination.copy()
+
+    dest_height = goal_height
+    if callable(sample_height):
+        dest_sample_h = sample_height(goal_destination)
+        if dest_sample_h is not None:
+            dest_height = float(dest_sample_h)
+    target_state["goal_destination_height"] = float(dest_height)
+
+    next_goal = current_goal.copy()
+    next_goal_height = goal_height
+    fallback_direct = False
+    if callable(detour_with_progress):
+        detour_result = detour_with_progress(
+            current_goal,
+            goal_destination,
+            min_progress=min_progress,
+            height=float(goal_height),
+            target_height=dest_height,
+        )
+        if detour_result is not None:
+            waypoint, waypoint_height = detour_result
+            waypoint = np.asarray(waypoint, dtype=np.float32).reshape(-1)[:2]
+            delta = waypoint - current_goal
+            dist = float(np.linalg.norm(delta))
+            if dist > 1e-6:
+                if dist > move_step:
+                    next_goal = current_goal + (delta / dist) * move_step
+                else:
+                    next_goal = waypoint
+                next_goal_height = float(waypoint_height)
+        else:
+            delta = goal_destination - current_goal
+            dist = float(np.linalg.norm(delta))
+            if dist > 1e-6:
+                if dist > move_step:
+                    next_goal = current_goal + (delta / dist) * move_step
+                else:
+                    next_goal = goal_destination.copy()
+                if callable(sample_height):
+                    step_h = sample_height(next_goal)
+                    if step_h is not None:
+                        next_goal_height = float(step_h)
+    else:
+        fallback_direct = True
+
+    if fallback_direct:
+        delta = goal_destination - current_goal
+        dist = float(np.linalg.norm(delta))
+        if dist > 1e-6:
+            if dist > move_step:
+                next_goal = current_goal + (delta / dist) * move_step
+            else:
+                next_goal = goal_destination.copy()
+            if callable(sample_height):
+                step_h = sample_height(next_goal)
+                if step_h is not None:
+                    next_goal_height = float(step_h)
+
+    env.goal_pos = np.asarray(next_goal, dtype=np.float32)
+    env.goal_height = float(next_goal_height)
+    target_state["goal"] = env.goal_pos.copy()
+    target_state["goal_path"] = _build_detour_path_to_target(
+        env,
+        env.goal_pos,
+        goal_destination,
+        start_height=env.goal_height,
+        target_height=dest_height,
+    )
+    if callable(sample_height):
+        h = sample_height(env.goal_pos)
+        if h is not None:
+            env.goal_height = float(h)
+    if callable(world_to_grid) and callable(compute_geo):
+        goal_rc = world_to_grid(env.goal_pos)
+        env._geo_goal_rc = goal_rc
+        env._geo_map = compute_geo(goal_rc)
+    if hasattr(env, "_update_role_targets") and callable(env._update_role_targets):
+        env._update_role_targets()
+    if hasattr(env, "current_detour_waypoints"):
+        env.current_detour_waypoints[:] = np.nan
+    if hasattr(env, "current_detour_waypoint_heights"):
+        env.current_detour_waypoint_heights[:] = np.nan
+
+
 def draw_navmesh_overlay(screen, env, world_to_screen):
     walkable = getattr(env, "_walkable", None)
     rc_to_world = getattr(env, "_grid_rc_to_world", None)
@@ -307,13 +553,13 @@ def draw_navmesh_overlay(screen, env, world_to_screen):
             pygame.draw.circle(screen, color, (sx, sy), step)
 
 
-def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=None, visualize=True, save_csv_path=None):
+def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=None, visualize=True, save_csv_path=None,
+                  random_detour_mode=False, random_target_state=None, selection_state=None):
     obs, info = reset_env_compat(env)
     for bundle in role_bundles.values():
         bundle["actor"].eval()
 
     start_pos = np.array(env.agent_pos, dtype=np.float32).copy()
-    goal_pos = np.array(env.goal_pos, dtype=np.float32).copy()
     max_steps = int(max_steps or getattr(env, "max_steps", 300))
 
     agent_trajs = [[np.array(pos, dtype=np.float32).copy()] for pos in np.asarray(env.agent_positions, dtype=np.float32)]
@@ -323,21 +569,26 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
 
     if visualize and HAS_PYGAME:
         if screen_bundle is None:
+            os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "120,160")
             pygame.init()
-            width, height, world_to_screen = make_world_to_screen(env.bounds_min, env.bounds_max, scale)
+            sidebar_width = SIDEBAR_WIDTH if selection_state is not None and selection_state.get("pool") else 0
+            width, height, world_to_screen, map_width = make_world_to_screen(env.bounds_min, env.bounds_max, scale, sidebar_width=sidebar_width)
             screen = pygame.display.set_mode((width, height))
             pygame.display.set_caption("ModelTest - Majestro NavMesh")
             clock = pygame.time.Clock()
             font = pygame.font.SysFont("consolas", 16)
-            screen_bundle = (screen, clock, font, world_to_screen)
+            screen_bundle = (screen, clock, font, world_to_screen, map_width)
         else:
-            screen, clock, font, world_to_screen = screen_bundle
+            screen, clock, font, world_to_screen, map_width = screen_bundle
+    else:
+        map_width = None
 
     ep_ret = 0.0
     final_info = {}
     env_terminated = False
     env_truncated = False
     user_aborted = False
+    restart_requested = False
 
     for step in range(max_steps):
         if visualize and HAS_PYGAME and screen is not None:
@@ -346,11 +597,27 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
                     user_aborted = True
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     user_aborted = True
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and selection_state is not None:
+                    mouse_pos = getattr(event, "pos", None)
+                    if mouse_pos is not None:
+                        for button in selection_state.get("buttons", []):
+                            rect = button.get("rect")
+                            if rect is not None and rect.collidepoint(mouse_pos):
+                                selected_index = button.get("index")
+                                selection_state["selected_index"] = selected_index
+                                selection_state["restart_requested"] = True
+                                restart_requested = True
+                                break
 
-        if user_aborted:
+        if user_aborted or restart_requested:
             break
 
-        action = policy_act(role_bundles, env, obs)
+        if random_detour_mode:
+            action = np.zeros((len(np.asarray(getattr(env, "agent_positions", [env.agent_pos]))), 2), dtype=np.float32)
+            if action.shape[0] == 1:
+                action = action.reshape(-1)
+        else:
+            action = policy_act(role_bundles, env, obs)
         obs, reward, env_terminated, env_truncated, final_info = env.step(action)
         ep_ret += float(np.mean(np.asarray(reward, dtype=np.float32)))
         traj.append(np.array(env.agent_pos, dtype=np.float32).copy())
@@ -361,6 +628,9 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
         if visualize and HAS_PYGAME and screen is not None:
             screen.fill((14, 16, 20))
             draw_navmesh_overlay(screen, env, world_to_screen)
+            current_goal_pos = np.asarray(final_info.get("goal_pos", getattr(env, "goal_pos", np.zeros((2,), dtype=np.float32))), dtype=np.float32).reshape(-1)[:2]
+            current_goal_destination = np.asarray(final_info.get("goal_destination", getattr(env, "goal_destination", current_goal_pos)), dtype=np.float32).reshape(-1)[:2]
+            current_goal_path = final_info.get("goal_path", getattr(env, "goal_path", []))
 
             role_ids = final_info.get("role_ids")
             if role_ids is None:
@@ -375,6 +645,20 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
                     role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
                     color = ROLE_COLORS.get(role_id, (160, 160, 160))
                     pygame.draw.circle(screen, color, world_to_screen(pos), sense_px, 1)
+
+            surround_ring_px = None
+            front_ring_px = None
+            front_mask = np.asarray(role_ids, dtype=np.int32).reshape(-1) == 0
+            if np.any(front_mask):
+                front_radius = float(getattr(env, "success_radius", 0.0)) * 1.15
+                front_ring_px = max(10, int(round(front_radius * scale)))
+            surround_mask = np.asarray(role_ids, dtype=np.int32).reshape(-1) == 3
+            if np.any(surround_mask):
+                surround_radius = max(
+                    float(getattr(env, "success_radius", 0.0)) * 1.6,
+                    float(getattr(env, "agent_radius", 0.0)) * 2.2,
+                )
+                surround_ring_px = max(12, int(round(surround_radius * scale)))
 
             sensor_fail_codes = final_info.get("sensor_fail_code")
             fail_arr = None if sensor_fail_codes is None else np.asarray(sensor_fail_codes, dtype=np.float32).reshape(-1)
@@ -412,6 +696,15 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
                     for other_target in tactical_target[1:]:
                         pygame.draw.circle(screen, (110, 110, 170), world_to_screen(other_target), 3)
 
+            if np.all(np.isfinite(current_goal_pos)):
+                pygame.draw.circle(screen, RANDOM_TARGET_COLOR, world_to_screen(current_goal_pos), 7, 2)
+            if np.all(np.isfinite(current_goal_destination)):
+                pygame.draw.circle(screen, (120, 255, 120), world_to_screen(current_goal_destination), 6, 2)
+            if current_goal_path:
+                goal_path = [world_to_screen(p) for p in current_goal_path if np.all(np.isfinite(np.asarray(p, dtype=np.float32)))]
+                if len(goal_path) >= 2:
+                    pygame.draw.lines(screen, (120, 255, 120), False, goal_path, 2)
+
             role_targets = final_info.get("role_targets")
             if role_targets is not None:
                 for idx, role_target in enumerate(np.asarray(role_targets, dtype=np.float32)):
@@ -433,8 +726,12 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
                     surf = font.render(label, True, color)
                     screen.blit(surf, (sx + 6, sy - 10))
 
-            pygame.draw.circle(screen, (230, 90, 90), world_to_screen(goal_pos), 6)
+            if front_ring_px is not None:
+                pygame.draw.circle(screen, FRONT_RING_COLOR, world_to_screen(current_goal_pos), front_ring_px, 2)
+            if surround_ring_px is not None:
+                pygame.draw.circle(screen, SURROUND_RING_COLOR, world_to_screen(current_goal_pos), surround_ring_px, 3)
             pygame.draw.circle(screen, (255, 255, 255), world_to_screen(env.agent_pos), 5, 1)
+            pygame.draw.circle(screen, (230, 90, 90), world_to_screen(current_goal_pos), 6)
 
             dist = float(np.linalg.norm(env.goal_pos - env.agent_pos))
             lines = [
@@ -443,6 +740,8 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
                 f"Dist: {dist:.2f}",
                 f"Pos: ({env.agent_pos[0]:.1f}, {env.agent_height:.1f}, {env.agent_pos[1]:.1f})",
             ]
+            lines.append(f"Goal: ({current_goal_pos[0]:.1f}, {current_goal_pos[1]:.1f})")
+            lines.append(f"GoalDest: ({current_goal_destination[0]:.1f}, {current_goal_destination[1]:.1f})")
             if role_ids is not None:
                 role_labels = [ROLE_NAMES.get(int(r), str(int(r))) for r in role_ids]
                 lines.append(f"Roles: {', '.join(role_labels)}")
@@ -451,6 +750,38 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
                 surf = font.render(line, True, (220, 220, 220))
                 screen.blit(surf, (8, y))
                 y += 18
+
+            if selection_state is not None and selection_state.get("pool"):
+                buttons = []
+                panel_w = max(280, SIDEBAR_WIDTH - 20)
+                panel_x = (map_width if map_width is not None else screen.get_width() - SIDEBAR_WIDTH) + 10
+                panel_y = 12
+                panel_h = 28 + 24 * (1 + len(selection_state["pool"]))
+                pygame.draw.rect(screen, (24, 28, 36), pygame.Rect(panel_x, panel_y, panel_w, panel_h))
+                pygame.draw.rect(screen, (70, 78, 92), pygame.Rect(panel_x, panel_y, panel_w, panel_h), 1)
+                title = font.render("Rule presets: click to restart with selected preset", True, (220, 220, 220))
+                screen.blit(title, (panel_x + 8, panel_y + 6))
+                active_index = selection_state.get("active_index")
+                selected_index = selection_state.get("selected_index")
+                button_y = panel_y + 28
+                button_specs = [(None, "RND random")] + [
+                    (idx, f"{idx + 1}. {_format_rule_set_label(rules)}")
+                    for idx, rules in enumerate(selection_state["pool"])
+                ]
+                for button_index, (preset_index, label) in enumerate(button_specs):
+                    rect = pygame.Rect(panel_x + 8, button_y + 24 * button_index, panel_w - 16, 20)
+                    is_selected = selected_index == preset_index
+                    is_active = active_index == preset_index
+                    fill = (48, 60, 82) if is_selected else (34, 38, 46)
+                    border = (110, 180, 255) if is_active else (82, 88, 98)
+                    text_color = (230, 240, 255) if is_selected or is_active else (205, 205, 205)
+                    pygame.draw.rect(screen, fill, rect)
+                    pygame.draw.rect(screen, border, rect, 1)
+                    label_prefix = "* " if is_active else "  "
+                    surf = font.render(f"{label_prefix}{label}", True, text_color)
+                    screen.blit(surf, (rect.x + 6, rect.y + 2))
+                    buttons.append({"rect": rect, "index": preset_index})
+                selection_state["buttons"] = buttons
 
             pygame.display.flip()
             clock.tick(60)
@@ -468,6 +799,10 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
     success = bool(is_diverse_tactical_success(final_info))
     if user_aborted:
         outcome = "aborted"
+    elif restart_requested or bool(selection_state is not None and selection_state.get("restart_requested")):
+        if selection_state is not None:
+            selection_state["restart_requested"] = False
+        outcome = "rerun"
     elif success:
         outcome = "success"
     elif env_truncated:
@@ -481,13 +816,25 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
     return ep_ret, success, outcome, screen_bundle
 
 
-def run_multiple_evaluations(env, role_bundles, episodes=10, max_steps=None, scale=0.03, visualize=True, visualize_every=1, auto_quit=True, save_last_csv=None):
+def run_multiple_evaluations(env, role_bundles, episodes=10, max_steps=None, scale=0.03, visualize=True, visualize_every=1,
+                             auto_quit=True, save_last_csv=None, random_detour_mode=False):
     returns = []
     successes = 0
     screen_bundle = None
+    pool = getattr(env, "agent_role_rule_pool", None)
+    selection_state = None
+    if pool:
+        selection_state = {
+            "pool": [list(rules) for rules in pool],
+            "selected_index": 0,
+            "active_index": None,
+            "buttons": [],
+            "restart_requested": False,
+        }
 
-    for ep in range(episodes):
-        sampled_rules = maybe_sample_agent_role_rules(env)
+    ep = 0
+    while ep < episodes:
+        sampled_rules = choose_agent_role_rules(env, selection_state=selection_state)
         vis = visualize and ((ep % visualize_every) == 0)
         save_csv = save_last_csv if ep == episodes - 1 else None
         ret, succ, outcome, screen_bundle = evaluate_once(
@@ -498,7 +845,12 @@ def run_multiple_evaluations(env, role_bundles, episodes=10, max_steps=None, sca
             screen_bundle=screen_bundle if vis else None,
             visualize=vis,
             save_csv_path=save_csv,
+            random_detour_mode=random_detour_mode,
+            selection_state=selection_state,
         )
+        if outcome == "rerun":
+            print("[Info] Restarting episode with selected rule preset.")
+            continue
         returns.append(ret)
         successes += int(succ)
         rule_summary = "" if sampled_rules is None else f" agents={len(sampled_rules)} rules={','.join(sampled_rules)}"
@@ -507,6 +859,7 @@ def run_multiple_evaluations(env, role_bundles, episodes=10, max_steps=None, sca
         if outcome == "aborted":
             print("[Info] Evaluation stopped by user.")
             break
+        ep += 1
 
     if visualize and HAS_PYGAME and screen_bundle and auto_quit:
         pygame.quit()
@@ -518,7 +871,8 @@ def run_multiple_evaluations(env, role_bundles, episodes=10, max_steps=None, sca
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Evaluate shared-policy SAC on Majestro NavMesh.")
-    ap.add_argument("--actor-path", type=str, default="sac_actor_best.pth")
+    ap.add_argument("--actor-path", type=str, default=DEFAULT_ACTOR_PATH)
+    ap.add_argument("--actor-source", type=str, default=DEFAULT_ACTOR_SOURCE, choices=["latest", "single-best"])
     ap.add_argument("--episodes", type=int, default=50)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--scale", type=float, default=0.03)
@@ -532,6 +886,11 @@ if __name__ == "__main__":
     ap.add_argument("--goal-spawn-min-scale", type=float, default=4.0)
     ap.add_argument("--agent-spawn-min-scale", type=float, default=2.0)
     ap.add_argument("--agent-spawn-max-scale", type=float, default=3.0)
+    ap.add_argument("--moving-goal", action="store_true", default=True)
+    ap.add_argument("--moving-goal-speed-scale", type=float, default=(1.0 / 3.0))
+    ap.add_argument("--spawn-agents-near-goal", action="store_true", default=True)
+    ap.add_argument("--random-detour-mode", action="store_true", default=False,
+                    help="Ignore policy actors and repeatedly move toward random targets sampled inside sense radius via Detour.")
     ap.add_argument("--role-rule", type=str, default="fixed", choices=["fixed", "melee_dps", "ranged_dps"])
     ap.add_argument("--agent-role-rules", type=str, default="melee_dps,melee_dps,melee_dps,ranged_dps,ranged_dps",
                     help="Comma-separated per-agent heuristic list. Length must be 1 or num_agents. Example: fixed,melee_dps,ranged_dps,fixed,fixed")
@@ -560,6 +919,9 @@ if __name__ == "__main__":
         goal_spawn_min_scale=args.goal_spawn_min_scale,
         agent_spawn_min_scale=args.agent_spawn_min_scale,
         agent_spawn_max_scale=args.agent_spawn_max_scale,
+        moving_goal_enabled=bool(args.moving_goal),
+        moving_goal_speed_scale=args.moving_goal_speed_scale,
+        spawn_agents_near_goal=bool(args.spawn_agents_near_goal),
         role_rule=args.role_rule,
         agent_role_rules=agent_role_rules,
     )
@@ -568,21 +930,26 @@ if __name__ == "__main__":
         pool_summary = " ; ".join(",".join(rules) for rules in agent_role_rule_pool)
         print(f"[ROLE-POOL] {len(agent_role_rule_pool)} sets | {pool_summary}")
 
-    if not os.path.exists(actor_path):
-        print(f"[WARN] {actor_path} not found. Train with Test.py first.")
-        sys.exit(0)
+    if not args.random_detour_mode:
+        if args.actor_source == "latest" and (not os.path.exists(actor_path)):
+            print(f"[WARN] {actor_path} not found. Train with Test.py first.")
+            sys.exit(0)
 
     obs_dim = int(getattr(env, "single_agent_obs_dim", env.observation_space.shape[-1]))
     act_dim = int(getattr(env, "single_agent_act_dim", env.action_space.shape[-1]))
-    state_obj = torch.load(actor_path, map_location=device, weights_only=False)
-    if state_obj.get("format") != "multi_role_actor":
-        raise RuntimeError("Expected multi_role_actor checkpoint.")
     role_bundles = {}
-    for role_id in ROLE_IDS:
-        actor = GaussianPolicy(obs_dim, act_dim).to(device)
-        actor.load_state_dict(state_obj["actors"][role_name(role_id)])
-        actor.eval()
-        role_bundles[int(role_id)] = {"actor": actor}
+    if not args.random_detour_mode:
+        actor_states = load_actor_state_map(args.actor_source, actor_path, POLICY_ROLE_IDS)
+        for role_id in POLICY_ROLE_IDS:
+            actor = GaussianPolicy(obs_dim, act_dim).to(device)
+            state_dict = actor_states.get(role_name(role_id))
+            if state_dict is None:
+                raise RuntimeError(f"Checkpoint is missing actor for role '{role_name(role_id)}'.")
+            actor.load_state_dict(state_dict)
+            actor.eval()
+            role_bundles[int(role_id)] = {"actor": actor}
+    else:
+        print("[MODE] random-detour-mode enabled")
 
     run_multiple_evaluations(
         env,
@@ -593,4 +960,5 @@ if __name__ == "__main__":
         visualize_every=1,
         auto_quit=True,
         save_last_csv=str(Path("last_eval_traj.csv").resolve()),
+        random_detour_mode=bool(args.random_detour_mode),
     )

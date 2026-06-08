@@ -17,6 +17,11 @@ if str(SCRIPT_DIR) not in sys.path:
 import Model
 
 
+# Code-level defaults. Change these if you want to switch sources without CLI args.
+DEFAULT_ACTOR_PATH = "sac_actor_last.pth"
+DEFAULT_ACTOR_SOURCE = "latest"  # "latest" | "single-best"
+
+
 class ActorDeterministic(nn.Module):
     def __init__(self, base_actor: nn.Module):
         super().__init__()
@@ -54,6 +59,42 @@ def load_multi_role_actor(path: Path) -> Dict[str, Dict[str, torch.Tensor]]:
     if not isinstance(actors, dict):
         raise RuntimeError("Checkpoint is missing an 'actors' dict.")
     return actors
+
+
+def load_single_role_actor(path: Path) -> Dict[str, torch.Tensor]:
+    obj = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(obj, dict):
+        raise RuntimeError(f"Expected checkpoint dict, got {type(obj).__name__}")
+    if obj.get("format") != "single_role_actor":
+        raise RuntimeError(f"Expected format='single_role_actor', got {obj.get('format')!r}")
+    actor = obj.get("actor")
+    if not isinstance(actor, dict):
+        raise RuntimeError("Checkpoint is missing an 'actor' state_dict.")
+    return actor
+
+
+def load_actor_state_map(actor_source: str, actor_path: Path) -> Dict[str, Dict[str, torch.Tensor]]:
+    actor_source = str(actor_source).strip().lower()
+    if actor_source == "latest":
+        return load_multi_role_actor(actor_path)
+    if actor_source == "single-best":
+        actor_states: Dict[str, Dict[str, torch.Tensor]] = {}
+        for role_id in Model.POLICY_ROLE_IDS:
+            rname = Model.role_name(role_id)
+            role_actor_path = actor_path.with_name(f"{actor_path.stem}_{rname}{actor_path.suffix or '.pth'}")
+            if not role_actor_path.exists():
+                fallback_root = actor_path.with_name(actor_path.name.replace("_last", "_best"))
+                fallback_role_actor_path = fallback_root.with_name(f"{fallback_root.stem}_{rname}{fallback_root.suffix or '.pth'}")
+                if fallback_role_actor_path.exists():
+                    role_actor_path = fallback_role_actor_path
+                else:
+                    raise RuntimeError(
+                        f"Single-best actor checkpoint not found for role '{rname}': "
+                        f"{role_actor_path} (fallback tried: {fallback_role_actor_path})"
+                    )
+            actor_states[rname] = load_single_role_actor(role_actor_path)
+        return actor_states
+    raise RuntimeError(f"Unsupported actor_source: {actor_source!r}")
 
 
 def export_role_actor(
@@ -95,8 +136,9 @@ def export_role_actor(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Export multi-role SAC actors to role-specific ONNX files.")
-    parser.add_argument("--actor-path", type=str, default="sac_actor_best.pth", help="Path to multi_role_actor checkpoint.")
+    parser = argparse.ArgumentParser(description="Export role actors to ONNX from latest multi-role or single-best checkpoints.")
+    parser.add_argument("--actor-path", type=str, default=DEFAULT_ACTOR_PATH, help="Path to latest multi_role_actor or root path for single-best actors.")
+    parser.add_argument("--actor-source", type=str, default=DEFAULT_ACTOR_SOURCE, choices=["latest", "single-best"])
     parser.add_argument("--out-dir", type=str, default="onnx_roles", help="Directory to write role ONNX files.")
     parser.add_argument("--opset", type=int, default=17)
     parser.add_argument("--obs-dim", type=int, default=None, help="Optional explicit observation dim. Must match checkpoint.")
@@ -106,18 +148,18 @@ def main() -> None:
     actor_path = Path(args.actor_path)
     if not actor_path.is_absolute():
         actor_path = SCRIPT_DIR / actor_path
-    if not actor_path.exists():
+    if args.actor_source == "latest" and not actor_path.exists():
         raise SystemExit(f"Actor checkpoint not found: {actor_path}")
 
     out_dir = Path(args.out_dir)
     if not out_dir.is_absolute():
         out_dir = SCRIPT_DIR / out_dir
 
-    actors = load_multi_role_actor(actor_path)
+    actors = load_actor_state_map(args.actor_source, actor_path)
     exported = []
     missing_roles = []
 
-    for role_id in Model.ROLE_IDS:
+    for role_id in Model.POLICY_ROLE_IDS:
         role_name = Model.role_name(role_id)
         state_dict = actors.get(role_name)
         if state_dict is None:
@@ -142,7 +184,7 @@ def main() -> None:
     print(f"out_dir: {out_dir}")
     for role_name, out_path, obs_dim, act_dim in exported:
         print(f"- {role_name}: {out_path.name}  input=float32[batch,{obs_dim}] output=float32[batch,{act_dim}]")
-    print("none(-1) is not exported; handle it as fallback/no-model in C++.")
+    print("base_move(2) and none(-1) are not exported; handle them as deterministic fallback roles in C++.")
 
 
 if __name__ == "__main__":

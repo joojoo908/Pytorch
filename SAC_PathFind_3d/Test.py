@@ -129,17 +129,16 @@ def main():
     ap.add_argument("--goal-spawn-min-scale", type=float, default=4.0)
     ap.add_argument("--agent-spawn-min-scale", type=float, default=2.0)
     ap.add_argument("--agent-spawn-max-scale", type=float, default=3.0)
+    ap.add_argument("--moving-goal", action="store_true", default=False)
+    ap.add_argument("--moving-goal-speed-scale", type=float, default=(1.0 / 3.0))
+    ap.add_argument("--spawn-agents-near-goal", action="store_true", default=True)
     ap.add_argument("--role-rule", type=str, default="fixed", choices=["fixed", "melee_dps", "ranged_dps"])
     ap.add_argument("--agent-role-rules", type=str, default="melee_dps,melee_dps,melee_dps,ranged_dps,ranged_dps",
                     help="Comma-separated per-agent heuristic list. Length must be 1 or num_agents. Example: fixed,melee_dps,ranged_dps")
     ap.add_argument(
         "--agent-role-rule-pool",
         type=str,
-        default="melee_dps,melee_dps,melee_dps,ranged_dps,ranged_dps;"
-                "rdps,rdps,rdps;"
-                "mdps,mdps,mdps,mdps;"
-                "mdps;"
-                "rdps,rdps,mdps,mdps,mdps",
+        default="melee_dps,melee_dps,melee_dps,ranged_dps,ranged_dps;rdps,rdps,rdps;mdps,mdps,mdps,mdps",
         help="Semicolon-separated pool of per-episode heuristic sets. Each set is comma-separated. Shorter sets are expanded by repeating the last rule.",
     )
 
@@ -167,6 +166,9 @@ def main():
         goal_spawn_min_scale=args.goal_spawn_min_scale,
         agent_spawn_min_scale=args.agent_spawn_min_scale,
         agent_spawn_max_scale=args.agent_spawn_max_scale,
+        moving_goal_enabled=bool(args.moving_goal),
+        moving_goal_speed_scale=args.moving_goal_speed_scale,
+        spawn_agents_near_goal=bool(args.spawn_agents_near_goal),
         role_rule=args.role_rule,
         agent_role_rules=agent_role_rules,
     )
