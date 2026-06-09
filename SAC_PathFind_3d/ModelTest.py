@@ -60,7 +60,7 @@ SIDEBAR_WIDTH = 540
 
 # Code-level defaults. Change these if you want to switch sources without CLI args.
 DEFAULT_ACTOR_PATH = "sac_actor_last.pth"
-DEFAULT_ACTOR_SOURCE = "single-best"  # "latest" | "single-best"
+DEFAULT_ACTOR_SOURCE = "latest"  # "latest" | "single-best"
 
 
 def _normalize_rule_name(name: str) -> str:
@@ -571,7 +571,7 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
         if screen_bundle is None:
             os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "120,160")
             pygame.init()
-            sidebar_width = SIDEBAR_WIDTH if selection_state is not None and selection_state.get("pool") else 0
+            sidebar_width = SIDEBAR_WIDTH if selection_state is not None else 0
             width, height, world_to_screen, map_width = make_world_to_screen(env.bounds_min, env.bounds_max, scale, sidebar_width=sidebar_width)
             screen = pygame.display.set_mode((width, height))
             pygame.display.set_caption("ModelTest - Majestro NavMesh")
@@ -603,10 +603,16 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
                         for button in selection_state.get("buttons", []):
                             rect = button.get("rect")
                             if rect is not None and rect.collidepoint(mouse_pos):
-                                selected_index = button.get("index")
-                                selection_state["selected_index"] = selected_index
-                                selection_state["restart_requested"] = True
-                                restart_requested = True
+                                kind = button.get("kind", "preset")
+                                if kind == "toggle_moving_goal":
+                                    new_state = not bool(getattr(env, "moving_goal_enabled", False))
+                                    env.moving_goal_enabled = new_state
+                                    selection_state["moving_goal_enabled"] = new_state
+                                else:
+                                    selected_index = button.get("index")
+                                    selection_state["selected_index"] = selected_index
+                                    selection_state["restart_requested"] = True
+                                    restart_requested = True
                                 break
 
         if user_aborted or restart_requested:
@@ -751,22 +757,35 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
                 screen.blit(surf, (8, y))
                 y += 18
 
-            if selection_state is not None and selection_state.get("pool"):
+            if selection_state is not None:
                 buttons = []
                 panel_w = max(280, SIDEBAR_WIDTH - 20)
                 panel_x = (map_width if map_width is not None else screen.get_width() - SIDEBAR_WIDTH) + 10
                 panel_y = 12
-                panel_h = 28 + 24 * (1 + len(selection_state["pool"]))
+                preset_count = 1 + len(selection_state.get("pool", []))
+                panel_h = 56 + 24 * preset_count
                 pygame.draw.rect(screen, (24, 28, 36), pygame.Rect(panel_x, panel_y, panel_w, panel_h))
                 pygame.draw.rect(screen, (70, 78, 92), pygame.Rect(panel_x, panel_y, panel_w, panel_h), 1)
-                title = font.render("Rule presets: click to restart with selected preset", True, (220, 220, 220))
+                title = font.render("Viewer controls", True, (220, 220, 220))
                 screen.blit(title, (panel_x + 8, panel_y + 6))
+                toggle_rect = pygame.Rect(panel_x + 8, panel_y + 28, panel_w - 16, 20)
+                moving_goal_enabled = bool(getattr(env, "moving_goal_enabled", False))
+                selection_state["moving_goal_enabled"] = moving_goal_enabled
+                toggle_fill = (52, 88, 62) if moving_goal_enabled else (72, 44, 44)
+                toggle_text = "Moving Goal: ON" if moving_goal_enabled else "Moving Goal: OFF"
+                pygame.draw.rect(screen, toggle_fill, toggle_rect)
+                pygame.draw.rect(screen, (92, 96, 108), toggle_rect, 1)
+                toggle_surf = font.render(toggle_text, True, (235, 235, 235))
+                screen.blit(toggle_surf, (toggle_rect.x + 6, toggle_rect.y + 2))
+                buttons.append({"rect": toggle_rect, "kind": "toggle_moving_goal"})
+                subtitle = font.render("Rule presets: click to restart with selected preset", True, (220, 220, 220))
+                screen.blit(subtitle, (panel_x + 8, panel_y + 54))
                 active_index = selection_state.get("active_index")
                 selected_index = selection_state.get("selected_index")
-                button_y = panel_y + 28
+                button_y = panel_y + 76
                 button_specs = [(None, "RND random")] + [
                     (idx, f"{idx + 1}. {_format_rule_set_label(rules)}")
-                    for idx, rules in enumerate(selection_state["pool"])
+                    for idx, rules in enumerate(selection_state.get("pool", []))
                 ]
                 for button_index, (preset_index, label) in enumerate(button_specs):
                     rect = pygame.Rect(panel_x + 8, button_y + 24 * button_index, panel_w - 16, 20)
@@ -780,7 +799,7 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
                     label_prefix = "* " if is_active else "  "
                     surf = font.render(f"{label_prefix}{label}", True, text_color)
                     screen.blit(surf, (rect.x + 6, rect.y + 2))
-                    buttons.append({"rect": rect, "index": preset_index})
+                    buttons.append({"rect": rect, "index": preset_index, "kind": "preset"})
                 selection_state["buttons"] = buttons
 
             pygame.display.flip()
@@ -822,15 +841,14 @@ def run_multiple_evaluations(env, role_bundles, episodes=10, max_steps=None, sca
     successes = 0
     screen_bundle = None
     pool = getattr(env, "agent_role_rule_pool", None)
-    selection_state = None
-    if pool:
-        selection_state = {
-            "pool": [list(rules) for rules in pool],
-            "selected_index": 0,
-            "active_index": None,
-            "buttons": [],
-            "restart_requested": False,
-        }
+    selection_state = {
+        "pool": [list(rules) for rules in pool] if pool else [],
+        "selected_index": 0 if pool else None,
+        "active_index": None,
+        "buttons": [],
+        "restart_requested": False,
+        "moving_goal_enabled": bool(getattr(env, "moving_goal_enabled", False)),
+    }
 
     ep = 0
     while ep < episodes:

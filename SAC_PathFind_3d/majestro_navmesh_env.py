@@ -339,8 +339,8 @@ class MajestroNavMeshEnv(gym.Env):
         self.time_penalty = float(time_penalty)
         self.idle_penalty = float(idle_penalty)
         self._R_SUCCESS = float(success_reward)
-        self._R_SUCCESS_ENTRY = 20.0
-        self._R_SUCCESS_SUSTAIN = 2.0
+        self._R_SUCCESS_ENTRY = 5.0
+        self._R_SUCCESS_SUSTAIN = 0.0
         self._R_SUCCESS_DROP = 3.0
         self._R_SENSE_ENTRY = 0.4
         self._R_SENSE_SUSTAIN = 0.0

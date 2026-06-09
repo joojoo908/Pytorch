@@ -825,37 +825,38 @@ def sac_train(env,
             )
             print(f"[LATEST] ep={ep+1} -> saved {latest_actor_path}")
 
-        min_role_delta = max(0.0, float(best_delta))
-        for role_id in POLICY_ROLE_IDS:
-            succ_count, attempt_count = role_step_counts[role_id]
-            if attempt_count <= 0:
-                continue
-            role_rate = float(role_step_rates[role_id])
-            if role_rate >= best_role_step_rates[role_id] + min_role_delta:
-                best_role_step_rates[role_id] = role_rate
-                role_snapshot = _snapshot_role_bundle(role_bundles[role_id])
-                role_ckpt_path = best_role_ckpt_root.with_name(
-                    f"{best_role_ckpt_root.stem}_{role_name(role_id)}{best_role_ckpt_root.suffix or '.pth'}"
-                )
-                role_actor_path = best_role_actor_root.with_name(
-                    f"{best_role_actor_root.stem}_{role_name(role_id)}{best_role_actor_root.suffix or '.pth'}"
-                )
-                _save_single_role_snapshot(
-                    str(role_ckpt_path),
-                    str(role_actor_path),
-                    role_id,
-                    role_snapshot,
-                    extra={
-                        "best_role_step_rate": role_rate,
-                        "episodes": ep + 1,
-                        "success_count_window": int(succ_count),
-                        "attempt_count_window": int(attempt_count),
-                    },
-                )
-                print(
-                    f"[BEST-{role_name(role_id)}] ep={ep+1} role_step={role_rate:.1f}% "
-                    f"(best={best_role_step_rates[role_id]:.1f}%) -> saved {role_actor_path.name}"
-                )
+        if (ep + 1) >= 100:
+            min_role_delta = max(0.0, float(best_delta))
+            for role_id in POLICY_ROLE_IDS:
+                succ_count, attempt_count = role_step_counts[role_id]
+                if attempt_count <= 0:
+                    continue
+                role_rate = float(role_step_rates[role_id])
+                if role_rate >= best_role_step_rates[role_id] + min_role_delta:
+                    best_role_step_rates[role_id] = role_rate
+                    role_snapshot = _snapshot_role_bundle(role_bundles[role_id])
+                    role_ckpt_path = best_role_ckpt_root.with_name(
+                        f"{best_role_ckpt_root.stem}_{role_name(role_id)}{best_role_ckpt_root.suffix or '.pth'}"
+                    )
+                    role_actor_path = best_role_actor_root.with_name(
+                        f"{best_role_actor_root.stem}_{role_name(role_id)}{best_role_actor_root.suffix or '.pth'}"
+                    )
+                    _save_single_role_snapshot(
+                        str(role_ckpt_path),
+                        str(role_actor_path),
+                        role_id,
+                        role_snapshot,
+                        extra={
+                            "best_role_step_rate": role_rate,
+                            "episodes": ep + 1,
+                            "success_count_window": int(succ_count),
+                            "attempt_count_window": int(attempt_count),
+                        },
+                    )
+                    print(
+                        f"[BEST-{role_name(role_id)}] ep={ep+1} role_step={role_rate:.1f}% "
+                        f"(best={best_role_step_rates[role_id]:.1f}%) -> saved {role_actor_path.name}"
+                    )
 
     save_sac_checkpoint(latest_ckpt_path, role_bundles, extra={"episodes": episodes})
     save_multi_role_actor_checkpoint(latest_actor_path, role_bundles, extra={"episodes": episodes})

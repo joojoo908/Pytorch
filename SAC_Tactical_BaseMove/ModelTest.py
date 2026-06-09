@@ -883,7 +883,7 @@ def run_multiple_evaluations(
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Evaluate shared-policy SAC on Majestro NavMesh.")
     ap.add_argument("--actor-path", type=str, default="sac_actor_best.pth")
-    ap.add_argument("--episodes", type=int, default=50)
+    ap.add_argument("--episodes", type=int, default=100)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--scale", type=float, default=0.03)
     ap.add_argument("--no-visualize", action="store_true", default=False)
