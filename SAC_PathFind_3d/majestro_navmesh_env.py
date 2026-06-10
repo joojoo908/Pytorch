@@ -710,6 +710,76 @@ class MajestroNavMeshEnv(gym.Env):
         self.agent_height = saved_height
         return moved, float(moved_height), bool(nav_collided or agent_blocked)
 
+    def _resolve_agent_overlaps(self, iterations: int = 2, delta_time: float = (1.0 / 60.0)) -> None:
+        if self.agent_positions.shape[0] <= 1:
+            return
+        dt = max(float(delta_time), 1e-6)
+        min_dist = float(self.agent_radius) * 2.0
+        if min_dist <= 1e-6:
+            return
+
+        penetration_slop = 0.01
+        beta = 0.20
+        max_push_per_pair = max(1.0, self.agent_radius * 0.25)
+        move_eps_sq = 1e-6
+
+        for _ in range(max(1, int(iterations))):
+            any_resolved = False
+            for a_idx in range(self.num_agents - 1):
+                pos_a = self.agent_positions[a_idx]
+                for b_idx in range(a_idx + 1, self.num_agents):
+                    pos_b = self.agent_positions[b_idx]
+                    delta = pos_b - pos_a
+                    len_sq = float(np.dot(delta, delta))
+                    if len_sq < 1e-6:
+                        delta = np.array([1.0, 0.0], dtype=np.float32)
+                        len_sq = 1.0
+                    center_distance = math.sqrt(len_sq)
+                    penetration = min_dist - center_distance
+                    if penetration <= 0.0:
+                        continue
+
+                    inv_len = 1.0 / max(center_distance, 1e-6)
+                    normal = delta * inv_len
+                    effective_penetration = max(0.0, penetration - penetration_slop)
+                    push_magnitude = min(effective_penetration * (beta / dt), max_push_per_pair)
+                    if push_magnitude <= 0.0:
+                        continue
+
+                    vel_a = self.agent_velocities[a_idx]
+                    vel_b = self.agent_velocities[b_idx]
+                    moving_a = float(np.dot(vel_a, vel_a)) > move_eps_sq
+                    moving_b = float(np.dot(vel_b, vel_b)) > move_eps_sq
+
+                    correction_a = np.zeros((2,), dtype=np.float32)
+                    correction_b = np.zeros((2,), dtype=np.float32)
+                    if moving_a and moving_b:
+                        half = push_magnitude * 0.5
+                        correction_a = -normal * half
+                        correction_b = normal * half
+                    elif moving_a:
+                        correction_a = -normal * push_magnitude
+                    elif moving_b:
+                        correction_b = normal * push_magnitude
+                    else:
+                        half = push_magnitude * 0.5
+                        correction_a = -normal * half
+                        correction_b = normal * half
+
+                    if np.any(correction_a):
+                        self.agent_positions[a_idx] = (self.agent_positions[a_idx] + correction_a).astype(np.float32)
+                        sampled_h = self._sample_height(self.agent_positions[a_idx])
+                        if sampled_h is not None:
+                            self.agent_heights[a_idx] = float(sampled_h)
+                    if np.any(correction_b):
+                        self.agent_positions[b_idx] = (self.agent_positions[b_idx] + correction_b).astype(np.float32)
+                        sampled_h = self._sample_height(self.agent_positions[b_idx])
+                        if sampled_h is not None:
+                            self.agent_heights[b_idx] = float(sampled_h)
+                    any_resolved = True
+            if not any_resolved:
+                break
+
     def _sample_moving_goal_destination(self, anchor_pos: np.ndarray, max_tries: int = 64) -> np.ndarray:
         anchor = np.asarray(anchor_pos, dtype=np.float32).reshape(-1)[:2]
         sense_radius = max(1.0, float(self.sense_radius))
@@ -1257,6 +1327,43 @@ class MajestroNavMeshEnv(gym.Env):
         covered_rays = sum(1 for flag in occupied if flag)
         return my_dist, covered_rays, participant_count
 
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        return ((float(angle) + math.pi) % (2.0 * math.pi)) - math.pi
+
+    def _surround_slot_state(self, agent_index: int, pos: Optional[np.ndarray] = None) -> Tuple[int, float, float, float, bool]:
+        surround_indices = [idx for idx in range(self.num_agents) if int(self.agent_role_ids[idx]) == ROLE_SURROUND]
+        if not surround_indices:
+            return 1, 0.0, math.pi, math.pi, False
+
+        center = self.goal_pos
+        slot_count = max(1, len(surround_indices))
+        slot_step = (2.0 * math.pi) / float(slot_count)
+        slot_half_width = 0.5 * slot_step
+        claimants: Dict[int, list] = {}
+        my_slot_idx = 0
+        my_slot_angle = 0.0
+        my_angle_error = math.pi
+
+        for idx in surround_indices:
+            other_pos = self.agent_positions[idx]
+            if idx == agent_index and pos is not None:
+                other_pos = np.asarray(pos, dtype=np.float32)
+            rel = np.asarray(other_pos, dtype=np.float32) - center
+            angle = 0.0 if float(np.linalg.norm(rel)) <= 1e-6 else math.atan2(float(rel[1]), float(rel[0]))
+            slot_idx = int(math.floor(((angle + math.pi) / slot_step) + 0.5)) % slot_count
+            slot_angle = self._wrap_angle(-math.pi + slot_idx * slot_step)
+            angle_error = abs(self._wrap_angle(angle - slot_angle))
+            claimants.setdefault(slot_idx, []).append((idx, angle_error))
+            if idx == agent_index:
+                my_slot_idx = slot_idx
+                my_slot_angle = slot_angle
+                my_angle_error = angle_error
+
+        slot_claimants = claimants.get(my_slot_idx, [])
+        winner_idx = min(slot_claimants, key=lambda item: (item[1], item[0]))[0] if slot_claimants else -1
+        return slot_count, my_slot_angle, slot_half_width, my_angle_error, bool(winner_idx == agent_index)
+
     def _role_target_for(self, agent_index: int) -> np.ndarray:
         role_id = int(self.agent_role_ids[agent_index])
         my_pos = self.agent_positions[agent_index]
@@ -1281,11 +1388,11 @@ class MajestroNavMeshEnv(gym.Env):
             target = self.goal_pos.copy()
         elif role_id == ROLE_SURROUND:
             surround_radius = max(self.success_radius * 1.6, self.agent_radius * 2.2)
-            rel = my_pos - self.goal_pos
-            rel_dir = self._normalize_vec(rel)
-            if float(np.linalg.norm(rel_dir)) <= 1e-6:
-                rel_dir = side_dir
-            target = self.goal_pos + rel_dir * surround_radius
+            _, slot_angle, _, _, _ = self._surround_slot_state(agent_index)
+            slot_dir = np.array([math.cos(slot_angle), math.sin(slot_angle)], dtype=np.float32)
+            if float(np.linalg.norm(slot_dir)) <= 1e-6:
+                slot_dir = side_dir
+            target = self.goal_pos + slot_dir * surround_radius
         else:
             kiting_radius = max(1.0, float(self.sense_radius) - 50.0)
             rel = my_pos - self.goal_pos
@@ -1488,15 +1595,22 @@ class MajestroNavMeshEnv(gym.Env):
             surround_radius = max(self.success_radius * 1.6, self.agent_radius * 2.2)
             my_dist, covered_rays, participant_count = self._surround_stats(agent_index, pos=new_pos)
             ring_error = abs(my_dist - surround_radius)
-            surround_bonus = 0.10 * max(0.0, 1.0 - ring_error / max(surround_radius, 1.0))
+            _, slot_angle, slot_half_width, slot_angle_error, slot_owner = self._surround_slot_state(agent_index, pos=new_pos)
+            slot_score = max(0.0, 1.0 - slot_angle_error / max(slot_half_width, 1e-6)) if slot_owner else 0.0
+            ring_score = max(0.0, 1.0 - ring_error / max(surround_radius, 1.0))
+            surround_bonus = 0.10 * ring_score * slot_score
             if collided:
                 surround_bonus -= 0.40
                 terms["role_surround_collision"] = -0.40
+            terms["role_surround_slot_owner"] = 1.0 if slot_owner else 0.0
+            terms["role_surround_slot_score"] = slot_score
             bonus += surround_bonus
             terms["role_surround"] = surround_bonus
             tactical_success = bool(
                 (not collided)
+                and slot_owner
                 and ring_error <= self.agent_radius * 1.5
+                and slot_angle_error <= slot_half_width * 0.6
             )
         else:
             kiting_min_dist = max(0.0, float(self.sense_radius) - 300.0)
@@ -1507,14 +1621,20 @@ class MajestroNavMeshEnv(gym.Env):
             in_kiting_band = bool(kiting_min_dist <= goal_dist <= kiting_max_dist)
             velocity_dir = self._normalize_vec(self.agent_velocities[agent_index])
             tangent_alignment = abs(float(np.dot(velocity_dir, side_dir)))
+            moved_dist = float(np.linalg.norm(new_pos - old_pos))
             kiting_bonus = 0.12 * max(0.0, 1.0 - ring_error / band_half_width)
             if in_kiting_band:
                 kiting_bonus += 0.08
-                orbit_bonus = 0.06 * max(0.0, tangent_alignment)
+            orbit_gate = max(0.0, 1.0 - max(0.0, ring_error - band_half_width) / band_half_width)
+            orbit_bonus = 0.06 * max(0.0, tangent_alignment) * orbit_gate
+            if orbit_bonus > 0.0:
                 kiting_bonus += orbit_bonus
                 terms["role_kiting_orbit"] = orbit_bonus
             if goal_dist < kiting_min_dist:
                 kiting_bonus -= 0.10 * min((kiting_min_dist - goal_dist) / max(self.success_radius, 1.0), 1.5)
+            if moved_dist < max(self._grid_cell_size * 0.35, self.step_size * 0.12):
+                kiting_bonus -= 0.12
+                terms["role_kiting_idle"] = -0.12
             if collided:
                 kiting_bonus -= 0.40
                 terms["role_kiting_collision"] = -0.40
@@ -1919,6 +2039,15 @@ class MajestroNavMeshEnv(gym.Env):
             tactical_targets[idx] = tactical_target
             requested_targets[idx] = desired_target
             collisions[idx] = collided
+
+        pushed_before = self.agent_positions.copy()
+        self._resolve_agent_overlaps(iterations=2)
+        if not np.allclose(self.agent_positions, pushed_before):
+            for idx in range(self.num_agents):
+                sampled_height = self._sample_height(self.agent_positions[idx])
+                if sampled_height is not None:
+                    self.agent_heights[idx] = float(sampled_height)
+        self.agent_velocities = (self.agent_positions - old_positions).astype(np.float32)
 
         self.agent_pos = self.agent_positions[0].copy()
         self.agent_height = float(self.agent_heights[0])

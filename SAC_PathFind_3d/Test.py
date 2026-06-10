@@ -129,7 +129,7 @@ def main():
     ap.add_argument("--goal-spawn-min-scale", type=float, default=4.0)
     ap.add_argument("--agent-spawn-min-scale", type=float, default=2.0)
     ap.add_argument("--agent-spawn-max-scale", type=float, default=3.0)
-    ap.add_argument("--moving-goal", action="store_true", default=False)
+    ap.add_argument("--moving-goal", action="store_true", default=True)
     ap.add_argument("--moving-goal-speed-scale", type=float, default=(1.0 / 3.0))
     ap.add_argument("--spawn-agents-near-goal", action="store_true", default=True)
     ap.add_argument("--role-rule", type=str, default="fixed", choices=["fixed", "melee_dps", "ranged_dps"])
