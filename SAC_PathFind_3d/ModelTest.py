@@ -56,6 +56,7 @@ DETOUR_PATH_COLOR = (80, 255, 220)
 SURROUND_RING_COLOR = (64, 128, 255)
 RANDOM_TARGET_COLOR = (255, 230, 90)
 FRONT_RING_COLOR = (255, 96, 96)
+KITING_RING_COLOR = (255, 170, 64)
 SIDEBAR_WIDTH = 540
 
 # Code-level defaults. Change these if you want to switch sources without CLI args.
@@ -654,9 +655,10 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
 
             surround_ring_px = None
             front_ring_px = None
+            kiting_ring_px = None
             front_mask = np.asarray(role_ids, dtype=np.int32).reshape(-1) == 0
             if np.any(front_mask):
-                front_radius = float(getattr(env, "success_radius", 0.0)) * 1.15
+                front_radius = float(getattr(env, "front_success_radius", getattr(env, "success_radius", 0.0) * 1.15))
                 front_ring_px = max(10, int(round(front_radius * scale)))
             surround_mask = np.asarray(role_ids, dtype=np.int32).reshape(-1) == 3
             if np.any(surround_mask):
@@ -665,6 +667,9 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
                     float(getattr(env, "agent_radius", 0.0)) * 2.2,
                 )
                 surround_ring_px = max(12, int(round(surround_radius * scale)))
+            kiting_mask = np.asarray(role_ids, dtype=np.int32).reshape(-1) == 4
+            if np.any(kiting_mask):
+                kiting_ring_px = max(12, int(round(700.0 * scale)))
 
             sensor_fail_codes = final_info.get("sensor_fail_code")
             fail_arr = None if sensor_fail_codes is None else np.asarray(sensor_fail_codes, dtype=np.float32).reshape(-1)
@@ -696,11 +701,22 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
             if tactical_target is not None:
                 tactical_target = np.asarray(tactical_target, dtype=np.float32)
                 if tactical_target.ndim == 1:
-                    pygame.draw.circle(screen, (120, 120, 240), world_to_screen(tactical_target), 4)
+                    tx, ty = world_to_screen(tactical_target)
+                    pygame.draw.circle(screen, (120, 120, 240), (tx, ty), 4)
+                    surf = font.render("T", True, (120, 120, 240))
+                    screen.blit(surf, (tx + 5, ty - 10))
                 else:
-                    pygame.draw.circle(screen, (120, 120, 240), world_to_screen(tactical_target[0]), 4)
-                    for other_target in tactical_target[1:]:
-                        pygame.draw.circle(screen, (110, 110, 170), world_to_screen(other_target), 3)
+                    for idx, target in enumerate(tactical_target):
+                        tx, ty = world_to_screen(target)
+                        role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
+                        if role_id == 4:
+                            pygame.draw.circle(screen, (120, 120, 240), (tx, ty), 4)
+                            surf = font.render("T", True, (120, 120, 240))
+                            screen.blit(surf, (tx + 5, ty - 10))
+                        else:
+                            color = (120, 120, 240) if idx == 0 else (110, 110, 170)
+                            radius = 4 if idx == 0 else 3
+                            pygame.draw.circle(screen, color, (tx, ty), radius)
 
             if np.all(np.isfinite(current_goal_pos)):
                 pygame.draw.circle(screen, RANDOM_TARGET_COLOR, world_to_screen(current_goal_pos), 7, 2)
@@ -716,7 +732,20 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
                 for idx, role_target in enumerate(np.asarray(role_targets, dtype=np.float32)):
                     role_id = int(role_ids[idx]) if idx < len(role_ids) else 0
                     color = ROLE_COLORS.get(role_id, (170, 110, 110))
-                    pygame.draw.circle(screen, color, world_to_screen(role_target), 3, 1)
+                    rx, ry = world_to_screen(role_target)
+                    pygame.draw.circle(screen, color, (rx, ry), 3, 1)
+                    if role_id == 4:
+                        surf = font.render("K", True, color)
+                        screen.blit(surf, (rx + 5, ry + 2))
+
+            if front_ring_px is not None:
+                pygame.draw.circle(screen, FRONT_RING_COLOR, world_to_screen(current_goal_pos), front_ring_px, 2)
+            if surround_ring_px is not None:
+                pygame.draw.circle(screen, SURROUND_RING_COLOR, world_to_screen(current_goal_pos), surround_ring_px, 3)
+            if kiting_ring_px is not None:
+                pygame.draw.circle(screen, KITING_RING_COLOR, world_to_screen(current_goal_pos), kiting_ring_px, 2)
+            pygame.draw.circle(screen, (255, 255, 255), world_to_screen(env.agent_pos), 5, 1)
+            pygame.draw.circle(screen, (230, 90, 90), world_to_screen(current_goal_pos), 6)
 
             agent_positions = final_info.get("agent_positions")
             if agent_positions is not None:
@@ -731,13 +760,6 @@ def evaluate_once(env, role_bundles, max_steps=None, scale=0.03, screen_bundle=N
                     label = f"{rule_short}->{role_label}"
                     surf = font.render(label, True, color)
                     screen.blit(surf, (sx + 6, sy - 10))
-
-            if front_ring_px is not None:
-                pygame.draw.circle(screen, FRONT_RING_COLOR, world_to_screen(current_goal_pos), front_ring_px, 2)
-            if surround_ring_px is not None:
-                pygame.draw.circle(screen, SURROUND_RING_COLOR, world_to_screen(current_goal_pos), surround_ring_px, 3)
-            pygame.draw.circle(screen, (255, 255, 255), world_to_screen(env.agent_pos), 5, 1)
-            pygame.draw.circle(screen, (230, 90, 90), world_to_screen(current_goal_pos), 6)
 
             dist = float(np.linalg.norm(env.goal_pos - env.agent_pos))
             lines = [

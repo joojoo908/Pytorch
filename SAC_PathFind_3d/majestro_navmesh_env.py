@@ -284,9 +284,11 @@ class MajestroNavMeshEnv(gym.Env):
         observed_other_agents: int = 3,
         agent_radius: float = 90.0,
         success_radius: float = 120.0,
+        front_success_radius: float = 10.0,
         goal_spawn_min_scale: float = 0.001,
         agent_spawn_min_scale: float = 0.00001,
         agent_spawn_max_scale: float = 0.0001,
+        agent_spawn_radius: float = 1000.0,
         max_steps: int = 512,
         seed: int = 1,
         grid_resolution: int = 256,
@@ -324,9 +326,11 @@ class MajestroNavMeshEnv(gym.Env):
         self.observed_other_agents = int(max(0, observed_other_agents))
         self.agent_radius = float(agent_radius)
         self.success_radius = float(success_radius)
+        self.front_success_radius = float(front_success_radius)
         self.goal_spawn_min_scale = float(goal_spawn_min_scale)
         self.agent_spawn_min_scale = float(agent_spawn_min_scale)
         self.agent_spawn_max_scale = float(max(agent_spawn_max_scale, self.agent_spawn_min_scale))
+        self.agent_spawn_radius = float(max(1.0, agent_spawn_radius))
         self.max_steps = int(max_steps)
         self.base_max_steps = int(max_steps)
         self.grid_resolution = int(grid_resolution)
@@ -1394,12 +1398,33 @@ class MajestroNavMeshEnv(gym.Env):
                 slot_dir = side_dir
             target = self.goal_pos + slot_dir * surround_radius
         else:
-            kiting_radius = max(1.0, float(self.sense_radius) - 50.0)
+            kiting_min_dist = max(0.0, float(self.sense_radius) - 300.0)
+            kiting_max_dist = max(kiting_min_dist + 1.0, float(self.sense_radius))
+            kiting_radius = 0.5 * (kiting_min_dist + kiting_max_dist)
+            band_half_width = max(1.0, 0.5 * (kiting_max_dist - kiting_min_dist))
+            tangential_sign = 1.0 if ((agent_index % 2) == 0) else -1.0
             rel = my_pos - self.goal_pos
             rel_dir = self._normalize_vec(rel)
             if float(np.linalg.norm(rel_dir)) <= 1e-6:
                 rel_dir = -goal_dir
-            target = self.goal_pos + rel_dir * kiting_radius
+            tangent_dir = np.array([-rel_dir[1], rel_dir[0]], dtype=np.float32) * tangential_sign
+            tangent_dir = self._normalize_vec(tangent_dir)
+            if float(np.linalg.norm(tangent_dir)) <= 1e-6:
+                tangent_dir = side_dir
+            dist_to_goal = float(np.linalg.norm(rel))
+            # 수정 이유: 기존 kiting target은 goal 기준 반경점으로 다시 투영되어, moving goal과
+            # detour cache가 겹치면 target이 급격히 흔들리고 안쪽으로 파고드는 경로가 쉽게 선택됐다.
+            # 따라서 현재 위치 기준의 국소 접선 이동을 우선하고, 반경 오차는 작은 방사 보정으로만 반영한다.
+            lead_dist = max(self.step_size * 1.35, self.agent_radius * 2.0)
+            radial_error = dist_to_goal - kiting_radius
+            if dist_to_goal < kiting_min_dist:
+                radial_correction = rel_dir * max(self.step_size * 0.95, self.agent_radius * 1.4)
+            elif dist_to_goal > kiting_max_dist:
+                weak_inward = -rel_dir * min(self.step_size * 0.22, max(0.0, dist_to_goal - kiting_radius))
+                radial_correction = weak_inward
+            else:
+                radial_correction = rel_dir * (-0.30 * np.clip(radial_error / band_half_width, -1.0, 1.0) * self.step_size)
+            target = my_pos + tangent_dir * lead_dist + radial_correction
 
         snapped = self._nearest_valid_point(target, max_radius=8)
         if snapped is not None:
@@ -1507,9 +1532,6 @@ class MajestroNavMeshEnv(gym.Env):
         tactical_success = False
 
         role_progress = self._role_progress_delta(old_pos, new_pos, target)
-        role_progress_reward = 0.03 * role_progress
-        bonus += role_progress_reward
-        terms["role_progress"] = role_progress_reward
 
         to_goal = self.goal_pos - new_pos
         goal_dist = float(np.linalg.norm(to_goal))
@@ -1517,7 +1539,10 @@ class MajestroNavMeshEnv(gym.Env):
         side_dir = np.array([-goal_dir[1], goal_dir[0]], dtype=np.float32)
 
         if role_id == ROLE_FRONT:
-            front_success_radius = self.success_radius * 1.15
+            front_success_radius = float(self.front_success_radius)
+            front_progress_bonus = 0.05 * max(0.0, role_progress)
+            bonus += front_progress_bonus
+            terms["role_front_progress"] = front_progress_bonus
             directness = float(np.dot(self._normalize_vec(self.agent_velocities[agent_index]), goal_dir))
             direct_bonus = 0.12 * max(0.0, directness)
             bonus += direct_bonus
@@ -1621,17 +1646,37 @@ class MajestroNavMeshEnv(gym.Env):
             in_kiting_band = bool(kiting_min_dist <= goal_dist <= kiting_max_dist)
             velocity_dir = self._normalize_vec(self.agent_velocities[agent_index])
             tangent_alignment = abs(float(np.dot(velocity_dir, side_dir)))
+            approach_alignment = float(np.dot(velocity_dir, goal_dir))
             moved_dist = float(np.linalg.norm(new_pos - old_pos))
-            kiting_bonus = 0.12 * max(0.0, 1.0 - ring_error / band_half_width)
+            target_progress = max(0.0, role_progress) / max(self.step_size, 1.0)
+            kiting_bonus = 0.06 * max(0.0, 1.0 - ring_error / band_half_width)
+            terms["role_kiting_ring"] = kiting_bonus
             if in_kiting_band:
-                kiting_bonus += 0.08
+                band_bonus = 0.05 * (0.35 + 0.65 * tangent_alignment)
+                kiting_bonus += band_bonus
+                terms["role_kiting_band_hold"] = band_bonus
             orbit_gate = max(0.0, 1.0 - max(0.0, ring_error - band_half_width) / band_half_width)
             orbit_bonus = 0.06 * max(0.0, tangent_alignment) * orbit_gate
             if orbit_bonus > 0.0:
                 kiting_bonus += orbit_bonus
                 terms["role_kiting_orbit"] = orbit_bonus
+            target_progress_bonus = 0.05 * min(target_progress, 1.25)
+            if target_progress_bonus > 0.0:
+                kiting_bonus += target_progress_bonus
+                terms["role_kiting_target_progress"] = target_progress_bonus
+            # 수정 이유: hard clamp 없이도 ONNX 정책이 최소 거리 안쪽 진입과
+            # 플레이어 방향 돌진을 회피하도록, 거리 위반과 접근 속도 성분을 reward에서 직접 강하게 벌준다.
+            danger_band = max(self.success_radius * 2.0, self.agent_radius * 3.0)
+            danger_ratio = max(0.0, 1.0 - max(0.0, goal_dist - kiting_min_dist) / max(danger_band, 1.0))
+            approach_penalty = (0.20 + 0.60 * danger_ratio) * max(0.0, approach_alignment)
+            if approach_penalty > 0.0:
+                kiting_bonus -= approach_penalty
+                terms["role_kiting_approach_penalty"] = -approach_penalty
             if goal_dist < kiting_min_dist:
-                kiting_bonus -= 0.10 * min((kiting_min_dist - goal_dist) / max(self.success_radius, 1.0), 1.5)
+                inside_ratio = (kiting_min_dist - goal_dist) / max(self.success_radius, 1.0)
+                inside_penalty = 0.60 * min(inside_ratio, 3.0)
+                kiting_bonus -= inside_penalty
+                terms["role_kiting_inside_min_dist"] = -inside_penalty
             if moved_dist < max(self._grid_cell_size * 0.35, self.step_size * 0.12):
                 kiting_bonus -= 0.12
                 terms["role_kiting_idle"] = -0.12
@@ -1642,6 +1687,8 @@ class MajestroNavMeshEnv(gym.Env):
             terms["role_kiting"] = kiting_bonus
             tactical_success = bool(
                 in_kiting_band
+                and approach_alignment <= 0.15
+                and (tangent_alignment >= 0.20 or moved_dist < max(self._grid_cell_size * 0.35, self.step_size * 0.12))
             )
 
         terms["tactical_success"] = 1.0 if tactical_success else 0.0
@@ -1660,6 +1707,15 @@ class MajestroNavMeshEnv(gym.Env):
         goal_norm = (goal_pos3 - center3) / scale
         delta_norm = delta3 / scale
         vel_norm = self.agent_velocities[agent_index] / max(self.step_size, 1.0)
+        goal_dist_2d = float(np.linalg.norm(self.goal_pos - pos2))
+        kiting_min_dist = max(0.0, float(self.sense_radius) - 300.0)
+        goal_dir_2d = self._normalize_vec(self.goal_pos - pos2)
+        kiting_margin_norm = float((goal_dist_2d - kiting_min_dist) / max(self.success_radius, 1.0))
+        approach_speed_norm = float(np.dot(vel_norm, goal_dir_2d))
+        # 수정 이유: 관측 크기를 바꾸지 않고도 ONNX 정책이 최소 거리 여유와
+        # 플레이어 방향 접근 속도 성분을 직접 보도록, 높이 축 슬롯 2개를 재사용한다.
+        goal_norm[1] = np.float32(kiting_margin_norm)
+        delta_norm[1] = np.float32(approach_speed_norm)
 
         other_obs, fail_code = self._sense_local_space(agent_index, scale)
         obs = np.concatenate(
@@ -1752,10 +1808,10 @@ class MajestroNavMeshEnv(gym.Env):
 
         self.agent_positions[0] = self.agent_pos.copy()
         self.agent_heights[0] = self.agent_height
-        anchor_pos = self.goal_pos.copy() if self.spawn_agents_near_goal else self.agent_pos.copy()
+        anchor_pos = self.goal_pos.copy()
         avoid = [self.agent_pos.copy(), self.goal_pos.copy()]
         min_dist = max(self.agent_radius * 1.0, self.success_radius * self.agent_spawn_min_scale)
-        max_dist = max(min_dist, self.success_radius * self.agent_spawn_max_scale)
+        max_dist = max(min_dist, self.agent_spawn_radius)
         for idx in range(1, self.num_agents):
             pos, height = self._sample_spawn_point(
                 avoid,
@@ -1774,70 +1830,23 @@ class MajestroNavMeshEnv(gym.Env):
             self.rng = random.Random(seed)
             self.nprng = np.random.default_rng(seed)
 
-        start_idx = int(self.rng.randrange(len(self._free_cells)))
-        start_rc = tuple(int(x) for x in self._free_cells[start_idx])
-        self.agent_pos = self._grid_rc_to_world(start_rc[0], start_rc[1])
-        self.agent_height = float(self._height_map[start_rc[0], start_rc[1]])
+        goal_idx = int(self.rng.randrange(len(self._free_cells)))
+        goal_rc = tuple(int(x) for x in self._free_cells[goal_idx])
+        self.goal_pos = self._grid_rc_to_world(goal_rc[0], goal_rc[1])
+        self.goal_height = float(self._height_map[goal_rc[0], goal_rc[1]])
+        self._geo_goal_rc = goal_rc
+        self._geo_map = self._compute_geodesic_map(goal_rc)
 
-        self._geo_map = None
-        self.goal_pos = self.agent_pos.copy()
-        self.goal_height = self.agent_height
-
-        min_goal_dist = max(self.step_size * 2.0, self.success_radius * self.goal_spawn_min_scale)
-        for _ in range(128):
-            goal_idx = int(self.rng.randrange(len(self._free_cells)))
-            goal_rc = tuple(int(x) for x in self._free_cells[goal_idx])
-            goal_pos = self._grid_rc_to_world(goal_rc[0], goal_rc[1])
-            if float(np.linalg.norm(goal_pos - self.agent_pos)) < min_goal_dist:
-                continue
-            geo_map = self._compute_geodesic_map(goal_rc)
-            if not math.isfinite(float(geo_map[start_rc[0], start_rc[1]])):
-                continue
-            self.goal_pos = goal_pos
-            self.goal_height = float(self._height_map[goal_rc[0], goal_rc[1]])
-            self._geo_map = geo_map
-            self._geo_goal_rc = goal_rc
-            break
-
-        if self._geo_map is None:
-            candidate_indices = list(range(len(self._free_cells)))
-            self.rng.shuffle(candidate_indices)
-            best_goal = None
-            best_geo = None
-            best_goal_dist = -1.0
-            for idx in candidate_indices:
-                goal_rc = tuple(int(x) for x in self._free_cells[idx])
-                goal_pos = self._grid_rc_to_world(goal_rc[0], goal_rc[1])
-                goal_dist = float(np.linalg.norm(goal_pos - self.agent_pos))
-                if goal_dist < min_goal_dist:
-                    continue
-                geo_map = self._compute_geodesic_map(goal_rc)
-                start_geo = float(geo_map[start_rc[0], start_rc[1]])
-                if not math.isfinite(start_geo):
-                    continue
-                if goal_dist > best_goal_dist:
-                    best_goal = goal_rc
-                    best_geo = geo_map
-                    best_goal_dist = goal_dist
-            if best_goal is None:
-                best_goal = start_rc
-                best_geo = self._compute_geodesic_map(best_goal)
-            self.goal_pos = self._grid_rc_to_world(best_goal[0], best_goal[1])
-            self.goal_height = float(self._height_map[best_goal[0], best_goal[1]])
-            self._geo_map = best_geo
-            self._geo_goal_rc = best_goal
-
-        if self.spawn_agents_near_goal:
-            spawn_min_dist = max(self.agent_radius * 1.0, self.success_radius * self.agent_spawn_min_scale)
-            spawn_max_dist = max(spawn_min_dist, self.success_radius * self.agent_spawn_max_scale)
-            spawn_pos, spawn_height = self._sample_spawn_point(
-                [self.goal_pos.copy()],
-                min_dist=spawn_min_dist,
-                anchor=self.goal_pos,
-                max_dist=spawn_max_dist,
-            )
-            self.agent_pos = spawn_pos.astype(np.float32)
-            self.agent_height = float(spawn_height)
+        spawn_min_dist = max(self.agent_radius * 1.0, self.success_radius * self.agent_spawn_min_scale)
+        spawn_max_dist = max(spawn_min_dist, self.agent_spawn_radius)
+        spawn_pos, spawn_height = self._sample_spawn_point(
+            [self.goal_pos.copy()],
+            min_dist=spawn_min_dist,
+            anchor=self.goal_pos,
+            max_dist=spawn_max_dist,
+        )
+        self.agent_pos = spawn_pos.astype(np.float32)
+        self.agent_height = float(spawn_height)
 
         self.goal_destination = self._sample_moving_goal_destination(self.goal_pos)
         sampled_dest_h = self._sample_height(self.goal_destination)
@@ -1880,6 +1889,11 @@ class MajestroNavMeshEnv(gym.Env):
             acts = np.zeros((self.num_agents, 2), dtype=np.float32)
 
         self._advance_moving_goal()
+        # 수정 이유: moving goal이 먼저 바뀌는데 role/target은 이전 프레임 값을 유지하면
+        # kiting이 stale target과 stale waypoint를 따라가며 안쪽으로 돌진하는 진동이 생긴다.
+        # 현재 프레임 goal 기준으로 역할과 role target을 먼저 갱신해 detour가 최신 target을 보게 한다.
+        self._assign_roles()
+        self._update_role_targets()
 
         old_positions = self.agent_positions.copy()
         step_role_ids = self.agent_role_ids.copy()
@@ -1946,7 +1960,8 @@ class MajestroNavMeshEnv(gym.Env):
                         detour_targets[idx] = snapped_target
                 cached_waypoint = self.current_detour_waypoints[idx]
                 cached_waypoint_height = float(self.current_detour_waypoint_heights[idx])
-                if np.all(np.isfinite(cached_waypoint)):
+                reuse_cached_waypoint = bool(role_id != ROLE_KITING)
+                if reuse_cached_waypoint and np.all(np.isfinite(cached_waypoint)):
                     cached_dist = float(np.linalg.norm(cached_waypoint - old_pos))
                     if cached_dist > reach_tol and math.isfinite(cached_waypoint_height):
                         waypoint = cached_waypoint.astype(np.float32)

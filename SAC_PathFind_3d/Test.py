@@ -138,7 +138,7 @@ def main():
     ap.add_argument(
         "--agent-role-rule-pool",
         type=str,
-        default="melee_dps,melee_dps,melee_dps,ranged_dps,ranged_dps;rdps,rdps,rdps;mdps,mdps,mdps,mdps",
+        default="melee_dps,melee_dps,melee_dps,ranged_dps,ranged_dps;rdps,rdps,rdps;mdps,mdps,mdps,mdps;mdps",
         help="Semicolon-separated pool of per-episode heuristic sets. Each set is comma-separated. Shorter sets are expanded by repeating the last rule.",
     )
 
