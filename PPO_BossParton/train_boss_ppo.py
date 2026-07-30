@@ -23,9 +23,9 @@ class TrainConfig:
     critic_lr: float = 3e-4
     entropy_coef: float = 0.02
     conditional_balance_coef: float = 1.00
-    conditional_uniform_kl_coef: float = 0.20
-    conditional_skill_floor: float = 0.10
-    conditional_skill_cap: float = 0.55
+    conditional_uniform_kl_coef: float = 0.50
+    conditional_skill_floor: float = 0.15
+    conditional_skill_cap: float = 0.40
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     save_every: int = 50

@@ -8,13 +8,14 @@ from boss_pattern_env import BossEnvConfig, BossPatternEnv
 from ppo_model import TargetedCategoricalPolicyPPO
 
 
-CHECKPOINT_DIR = "checkpoints_conditional_20d"
+CHECKPOINT_DIR = os.environ.get("PPO_CHECKPOINT_DIR", "checkpoints_bounded_20d")
+CHECKPOINT_UPDATE = os.environ.get("PPO_CHECKPOINT_UPDATE", "0400")
 SAMPLES_PER_MASK = 4000
 
 
 def load_actor(boss_kind):
     path = os.path.join(
-        CHECKPOINT_DIR, f"{boss_kind}_targeted_ppo_0400.pth"
+        CHECKPOINT_DIR, f"{boss_kind}_targeted_ppo_{CHECKPOINT_UPDATE}.pth"
     )
     checkpoint = torch.load(path, map_location="cpu")
     state = checkpoint["actor"]
@@ -63,6 +64,24 @@ def normalized(values):
     return [round(float(value / total), 4) for value in values]
 
 
+def bounded_server_probabilities(choice_logits, last_choice):
+    logits = np.asarray(choice_logits[1:5], dtype=np.float64).copy()
+    if 1 <= last_choice <= 4:
+        logits[last_choice - 1] -= 0.75
+    logits -= np.max(logits)
+    raw = np.exp(logits)
+    raw /= np.sum(raw)
+
+    policy_weight = 1.0
+    for probability in raw:
+        if probability > 0.25:
+            policy_weight = min(policy_weight, 0.15 / (probability - 0.25))
+        elif probability < 0.25:
+            policy_weight = min(policy_weight, 0.10 / (0.25 - probability))
+    bounded = policy_weight * raw + (1.0 - policy_weight) * 0.25
+    return bounded
+
+
 def evaluate_boss(boss_kind):
     actor, obs_dim, target_dim, choice_dim, finite = load_actor(boss_kind)
     all_results = {}
@@ -94,12 +113,9 @@ def evaluate_boss(boss_kind):
         logits_np = choice_logits.numpy().copy()
         last_choices = np.rint(obs[:, 3] * 4.0).astype(np.int64)
         for row, last_choice in zip(logits_np, last_choices):
-            adjusted = row.copy()
-            if 1 <= last_choice <= 4:
-                adjusted[last_choice] = -np.inf
-            order = np.argsort(adjusted)
-            server_counts[order[-1]] += 0.75
-            server_counts[order[-2]] += 0.25
+            server_counts[1:5] += bounded_server_probabilities(
+                row, int(last_choice)
+            )
 
         raw_counts = np.bincount(raw_choices, minlength=choice_dim)
         target_counts = np.bincount(targets, minlength=target_dim)
@@ -121,17 +137,13 @@ def evaluate_boss(boss_kind):
         }
         for idx, target in enumerate(targets):
             role = role_names[int(target)]
-            adjusted = logits_np[idx].copy()
-            last_choice = last_choices[idx]
-            if 1 <= last_choice <= 4:
-                adjusted[last_choice] = -np.inf
-            order = np.argsort(adjusted)
-            target_conditioned[role][order[-1]] += 0.75
-            target_conditioned[role][order[-2]] += 0.25
+            target_conditioned[role][1:5] += bounded_server_probabilities(
+                logits_np[idx], int(last_choices[idx])
+            )
             target_conditioned_counts[role] += 1
 
     return {
-        "checkpoint": f"{boss_kind}_targeted_ppo_0400.pth",
+        "checkpoint": f"{boss_kind}_targeted_ppo_{CHECKPOINT_UPDATE}.pth",
         "obs_dim": obs_dim,
         "target_dim": target_dim,
         "choice_dim": choice_dim,
